@@ -1,0 +1,53 @@
+{
+  "execution_report": {
+    "avg_px": "0",
+    "cash_margin": "1",
+    "cl_ord_id": "ORDER0012",
+    "comm_type": "3",
+    "commission": null,
+    "commission_currency": "BTC",
+    "cum_qty": "0",
+    "exec_id": "6142909911300388017",
+    "exec_inst": null,
+    "exec_ref_id": "1764582525032876758",
+    "exec_type": "0",
+    "last_liquidity_ind": null,
+    "last_px": "0",
+    "last_qty": "0",
+    "leaves_qty": "0.001",
+    "match_count": null,
+    "match_index": null,
+    "ord_status": "0",
+    "order_create_time": "20251201-09:48:45.031973540",
+    "order_id": "6142909911300388017",
+    "order_qty": "0.001",
+    "orig_cl_ord_id": null,
+    "price": "90000",
+    "rejection_reason_code": null,
+    "rejection_reason_text": null,
+    "side": "1",
+    "symbol": "BTC_USDT",
+    "trade_transact_time": null,
+    "transact_time": "20251201-09:48:45.032904984",
+    "trd_match_id": null,
+    "working_indicator": "Y"
+  },
+  "order": {
+    "cl_ord_id": "ORDER0012",
+    "price": 90000.0,
+    "qty": 0.001,
+    "side": "1",
+    "symbol": "BTC_USDT"
+  },
+  "timing": {
+    "channel_send_us": 22,
+    "execution_report_timestamp": 1764582525034,
+    "execution_report_us": 4044,
+    "file_read_timestamp": 1764582525030,
+    "file_read_us": 33,
+    "fix_encode_us": 7,
+    "fix_send_us": 11,
+    "json_parse_us": 10,
+    "total_us": 4000
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "execution_report": {
+    "exec_status": "8",
+    "last_px": null,
+    "last_qty": null,
+    "leaves_qty": "0",
+    "order_id": "0",
+    "rejection_reason_code": null,
+    "rejection_reason_text": "REQUEST_TIMEOUT",
+    "side": null,
+    "symbol": "NONE"
+  },
+  "order": {
+    "cl_ord_id": "ORDER_004",
+    "price": 95000.0,
+    "qty": 0.001,
+    "side": "1",
+    "symbol": "BTC_USDT"
+  },
+  "timing": {
+    "channel_send_us": 22,
+    "execution_report_timestamp": 1764521212532,
+    "execution_report_us": 65192967,
+    "file_read_timestamp": 1764521147339,
+    "file_read_us": 40,
+    "fix_encode_us": 8,
+    "fix_send_us": 10,
+    "json_parse_us": 3,
+    "total_us": 65193000
+  }
+}

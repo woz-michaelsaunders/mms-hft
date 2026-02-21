@@ -1,0 +1,17 @@
+[Unit]
+Description=kdb+ Server for FIX Server Order Book Data
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/fix_server
+ExecStart=/home/ubuntu/q/l64/q kdb/start_kdb_server.q
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/fix_server/kdb_server.log
+StandardError=append:/home/ubuntu/fix_server/kdb_server.log
+
+[Install]
+WantedBy=multi-user.target
+

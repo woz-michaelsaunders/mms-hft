@@ -1,0 +1,20 @@
+{
+  "cl_ord_id": "ORDER_001",
+  "symbol": "BTC_USDT",
+  "side": "1",
+  "qty": 0.001,
+  "price": 45000.0,
+  "ord_type": "2",
+  "time_in_force": "1",
+  "currency": null,
+  "exec_inst": null,
+  "quote_id": null,
+  "cash_order_qty": null,
+  "cash_margin": null,
+  "trigger_price_type": null,
+  "self_match_prevention_scope": null,
+  "self_match_prevention_instruction": null,
+  "self_match_prevention_id": null,
+  "broker_id": null,
+  "receive_window": null
+}
