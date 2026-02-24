@@ -31,6 +31,26 @@ use axum::{
 };
 use tower_http::cors::CorsLayer;
 
+// #region agent log
+const DEBUG_LOG_PATH: &str = "/home/ubuntu/fix_server/.cursor/debug.log";
+fn debug_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id: &str) {
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
+    let id = format!("log_{}_{}", ts, hypothesis_id);
+    let line = serde_json::json!({
+        "id": id,
+        "timestamp": ts as u64,
+        "location": location,
+        "message": message,
+        "data": data,
+        "hypothesisId": hypothesis_id
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(DEBUG_LOG_PATH) {
+        let _ = writeln!(f, "{}", line.to_string());
+        let _ = f.sync_all();
+    }
+}
+// #endregion
+
 // Configuration structure
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Config {
@@ -365,10 +385,16 @@ impl FIXSession {
 
                     *self.stream.lock().await = Some(stream);
                     *self.connection_state.lock().await = ConnectionState::Connected;
+                    // #region agent log
+                    debug_log("main.rs:connect_with_retry", "connect_success", serde_json::json!({ "attempt": attempt, "gateway_url": gateway_url }), "H4");
+                    // #endregion
                     info!("✅ Connected successfully to FIX gateway at attempt {}", attempt);
                     return Ok(());
                 }
                 Ok(Err(e)) => {
+                    // #region agent log
+                    debug_log("main.rs:connect_with_retry", "connect_fail", serde_json::json!({ "attempt": attempt, "err": e.to_string(), "gateway_url": gateway_url }), "H4");
+                    // #endregion
                     error!("Connection attempt {} failed: {}", attempt, e);
 
                     if attempt >= max_attempts {
@@ -385,6 +411,9 @@ impl FIXSession {
                     backoff = std::cmp::min(backoff * 2, 30_000);
                 }
                 Err(_) => {
+                    // #region agent log
+                    debug_log("main.rs:connect_with_retry", "connect_timeout", serde_json::json!({ "attempt": attempt, "gateway_url": gateway_url }), "H4");
+                    // #endregion
                     error!("Connection attempt {} timeout (30s)", attempt);
 
                     if attempt >= max_attempts {
@@ -2279,6 +2308,14 @@ async fn message_loop(
                             }
                         }
                         Err(e) => {
+                            // #region agent log
+                            debug_log(
+                                "main.rs:message_loop",
+                                "receive_message_err",
+                                serde_json::json!({ "err": e.to_string(), "loop_type": "order_management", "gateway_url": gateway_url }),
+                                "H2_H3",
+                            );
+                            // #endregion
                             warn!("⚠️  Connection closed: {}", e);
                             connection_active = false;
                         }
@@ -2288,6 +2325,9 @@ async fn message_loop(
         }
 
         // Wait before reconnecting
+        // #region agent log
+        debug_log("main.rs:message_loop", "connection_loop_exited", serde_json::json!({ "loop_type": "order_management" }), "H2_H3");
+        // #endregion
         info!("Reconnecting in 5 seconds...");
         sleep(Duration::from_secs(5)).await;
     }
@@ -2494,6 +2534,14 @@ async fn market_data_loop(
                         info!("📦 Waiting for complete FIX message: {}", err_str);
                         continue;
                     } else {
+                        // #region agent log
+                        debug_log(
+                            "main.rs:market_data_loop",
+                            "receive_message_err",
+                            serde_json::json!({ "err": err_str, "loop_type": "market_data", "gateway_url": gateway_url }),
+                            "H2_H3",
+                        );
+                        // #endregion
                         warn!("⚠️  Market Data connection closed: {}", e);
                         connection_active = false;
                     }
@@ -2520,10 +2568,23 @@ async fn heartbeat_loop(session: Arc<FIXSession>, heartbeat_interval: u64) -> Re
 
         // Only send heartbeat if session is ready (logon ACK received)
         if session.is_ready().await {
-            if let Err(e) = session.heartbeat().await {
-                warn!("Heartbeat error: {}", e);
+            match session.heartbeat().await {
+                Ok(()) => {
+                    // #region agent log
+                    debug_log("main.rs:heartbeat_loop", "heartbeat_sent", serde_json::json!({}), "H1");
+                    // #endregion
+                }
+                Err(e) => {
+                    // #region agent log
+                    debug_log("main.rs:heartbeat_loop", "heartbeat_error", serde_json::json!({ "err": e.to_string() }), "H1");
+                    // #endregion
+                    warn!("Heartbeat error: {}", e);
+                }
             }
         } else {
+            // #region agent log
+            debug_log("main.rs:heartbeat_loop", "heartbeat_skipped", serde_json::json!({ "reason": "session_not_ready" }), "H1");
+            // #endregion
             // Session not ready yet - skip this heartbeat
             // This prevents sending heartbeats before logon ACK is received
         }
