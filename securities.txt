@@ -14,13 +14,13 @@ Total Securities: 26
 
 2. Symbol: LINK_BTC
    Attributes:
-     Tag 871: 1012
      Tag 872: true
+     Tag 871: 1012
 
 3. Symbol: FET_BTC
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 4. Symbol: BTC_USD
    Attributes:
@@ -34,23 +34,23 @@ Total Securities: 26
 
 6. Symbol: SOL_BTC
    Attributes:
-     Tag 871: 1012
      Tag 872: true
+     Tag 871: 1012
 
 7. Symbol: XRP_BTC
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 8. Symbol: BTCUSD-PERP
    Attributes:
-     Tag 872: false
      Tag 871: 1012
+     Tag 872: false
 
 9. Symbol: BTC_PYUSD
    Attributes:
-     Tag 871: 1012
      Tag 872: true
+     Tag 871: 1012
 
 10. Symbol: ADA_BTC
    Attributes:
@@ -59,13 +59,13 @@ Total Securities: 26
 
 11. Symbol: SUI_BTC
    Attributes:
-     Tag 871: 1012
      Tag 872: true
+     Tag 871: 1012
 
 12. Symbol: TRUMP_BTC
    Attributes:
-     Tag 872: false
      Tag 871: 1012
+     Tag 872: false
 
 13. Symbol: WBTC_BTC
    Attributes:
@@ -79,18 +79,18 @@ Total Securities: 26
 
 15. Symbol: CRO_BTC
    Attributes:
-     Tag 872: false
      Tag 871: 1012
+     Tag 872: false
 
 16. Symbol: MDT_BTC
    Attributes:
-     Tag 872: false
      Tag 871: 1012
+     Tag 872: false
 
 17. Symbol: BTC_USDT
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 18. Symbol: POL_BTC
    Attributes:
@@ -99,13 +99,13 @@ Total Securities: 26
 
 19. Symbol: LTC_BTC
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 20. Symbol: WBTC_USD
    Attributes:
-     Tag 872: false
      Tag 871: 1012
+     Tag 872: false
 
 21. Symbol: MASK_BTC
    Attributes:
@@ -114,8 +114,8 @@ Total Securities: 26
 
 22. Symbol: DOGE_BTC
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 23. Symbol: BTC_HKD
    Attributes:
@@ -134,8 +134,8 @@ Total Securities: 26
 
 26. Symbol: ATOM_BTC
    Attributes:
-     Tag 871: 1012
      Tag 872: true
+     Tag 871: 1012
 
 ─────────────────────────────────────────────────────────────────────────────────
 End of Security List

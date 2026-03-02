@@ -2,6 +2,7 @@ mod fix_protocol;
 mod order_book;
 mod order_book_buffer;
 mod kdb_integration;
+pub mod algo;
 
 use anyhow::{anyhow, Result};
 use fix_protocol::{FIXMessage, tags};
@@ -24,12 +25,14 @@ use arc_swap::ArcSwap;
 use kdb_integration::KdbWriter;
 use axum::{
     extract::Path as AxumPath,
-    http::StatusCode,
+    http::{header::{CACHE_CONTROL, HeaderValue}, StatusCode},
     response::{Html, Json},
     routing::{get, post},
     Router,
 };
 use tower_http::cors::CorsLayer;
+
+const MAX_TICK_BUFFER: usize = 10_000;
 
 // #region agent log
 const DEBUG_LOG_PATH: &str = "/home/ubuntu/fix_server/.cursor/debug.log";
@@ -234,6 +237,148 @@ impl OpenOrdersStore {
     }
 }
 
+/// Aggregated position for a single symbol, updated on every execution fill.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Position {
+    pub symbol: String,
+    /// Net quantity: positive = long, negative = short
+    pub net_qty: f64,
+    /// Volume-weighted average entry price of the current open position
+    pub avg_entry_px: f64,
+    /// Cumulative realized P&L (closed legs only)
+    pub realized_pnl: f64,
+    /// Unrealized P&L vs latest mid price (updated on read via order book)
+    pub unrealized_pnl: f64,
+    /// Most recent mid price used for unrealized P&L calculation
+    pub last_mid_px: f64,
+    /// Total number of fill events counted
+    pub trade_count: u32,
+}
+
+impl Position {
+    fn new(symbol: String) -> Self {
+        Position {
+            symbol,
+            net_qty: 0.0,
+            avg_entry_px: 0.0,
+            realized_pnl: 0.0,
+            unrealized_pnl: 0.0,
+            last_mid_px: 0.0,
+            trade_count: 0,
+        }
+    }
+
+    /// Apply a fill: side "1"=buy, "2"=sell.  Returns updated self.
+    fn apply_fill(&mut self, side: &str, last_qty: f64, last_px: f64) {
+        if last_qty <= 0.0 || last_px <= 0.0 {
+            return;
+        }
+        let signed_qty = if side == "1" { last_qty } else { -last_qty };
+        let prev_net = self.net_qty;
+        let new_net = prev_net + signed_qty;
+
+        if prev_net == 0.0 {
+            // Opening a new position
+            self.avg_entry_px = last_px;
+        } else if prev_net > 0.0 && signed_qty > 0.0 {
+            // Adding to long
+            let total_cost = self.avg_entry_px * prev_net + last_px * last_qty;
+            self.avg_entry_px = total_cost / new_net;
+        } else if prev_net < 0.0 && signed_qty < 0.0 {
+            // Adding to short
+            let total_cost = self.avg_entry_px * prev_net.abs() + last_px * last_qty;
+            self.avg_entry_px = total_cost / new_net.abs();
+        } else {
+            // Closing / reversing
+            let closing_qty = last_qty.min(prev_net.abs());
+            if prev_net > 0.0 {
+                // Long being reduced by a sell
+                self.realized_pnl += closing_qty * (last_px - self.avg_entry_px);
+            } else {
+                // Short being reduced by a buy
+                self.realized_pnl += closing_qty * (self.avg_entry_px - last_px);
+            }
+            if new_net.abs() < 1e-10 {
+                self.avg_entry_px = 0.0;
+            } else if new_net.signum() != prev_net.signum() {
+                // Position reversed
+                self.avg_entry_px = last_px;
+            }
+        }
+
+        self.net_qty = new_net;
+        self.trade_count += 1;
+    }
+
+    /// Refresh unrealized P&L using a live mid price.
+    pub fn refresh_unrealized(&mut self, mid_px: f64) {
+        if mid_px > 0.0 && self.net_qty.abs() > 1e-10 && self.avg_entry_px > 0.0 {
+            self.unrealized_pnl = self.net_qty * (mid_px - self.avg_entry_px);
+            self.last_mid_px = mid_px;
+        } else {
+            self.unrealized_pnl = 0.0;
+        }
+    }
+}
+
+/// Thread-safe, lock-free store for live positions using ArcSwap.
+pub struct PositionsStore {
+    store: ArcSwap<HashMap<String, Position>>,
+}
+
+impl PositionsStore {
+    pub fn new() -> Self {
+        Self {
+            store: ArcSwap::from_pointee(HashMap::new()),
+        }
+    }
+
+    /// Apply a fill event for a symbol (side "1"=buy / "2"=sell).
+    pub fn apply_fill(&self, symbol: &str, side: &str, last_qty: f64, last_px: f64) {
+        let current = self.store.load();
+        let mut new_map = (**current).clone();
+        let pos = new_map
+            .entry(symbol.to_string())
+            .or_insert_with(|| Position::new(symbol.to_string()));
+        pos.apply_fill(side, last_qty, last_px);
+        self.store.store(Arc::new(new_map));
+    }
+
+    /// Return a snapshot of all positions as a Vec.
+    pub fn snapshot(&self) -> Vec<Position> {
+        self.store.load().values().cloned().collect()
+    }
+
+    /// Replay fills from data/trades.csv to rebuild positions after a restart.
+    /// CSV columns: timestamp_ns,cl_ord_id,order_id,symbol,side,exec_type,last_qty,last_px,avg_px
+    pub fn load_from_trades_csv(&self) {
+        use std::io::BufRead;
+        let file = match std::fs::File::open("data/trades.csv") {
+            Ok(f) => f,
+            Err(_) => return, // no file yet — first run
+        };
+        let mut replayed = 0u32;
+        let mut first = true;
+        for line in std::io::BufReader::new(file).lines().flatten() {
+            if first { first = false; continue; } // skip header
+            let cols: Vec<&str> = line.splitn(9, ',').collect();
+            if cols.len() < 9 { continue; }
+            // cols: ts, cl_ord_id, order_id, symbol, side, exec_type, last_qty, last_px, avg_px
+            let symbol   = cols[3];
+            let side     = cols[4]; // "1" or "2"
+            let last_qty: f64 = cols[6].parse().unwrap_or(0.0);
+            let last_px:  f64 = cols[7].parse().unwrap_or(0.0);
+            if last_qty > 0.0 && last_px > 0.0 {
+                self.apply_fill(symbol, side, last_qty, last_px);
+                replayed += 1;
+            }
+        }
+        if replayed > 0 {
+            info!("📂 Restored positions from data/trades.csv ({} fills replayed)", replayed);
+        }
+    }
+}
+
 /// Order processing timing metrics
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OrderTiming {
@@ -299,6 +444,8 @@ pub struct FIXSession {
     order_books: Arc<Mutex<HashMap<String, DoubleBufferedOrderBook>>>,
     // Lock-free open orders store using ArcSwap for zero-lock snapshots
     open_orders: Arc<OpenOrdersStore>,
+    // Lock-free positions store — aggregated fills per symbol
+    positions: Arc<PositionsStore>,
     // Event-driven update channels (optional, set after creation)
     order_update_tx: Arc<Mutex<Option<broadcast::Sender<()>>>>,
     order_book_update_tx: Arc<Mutex<Option<broadcast::Sender<String>>>>,
@@ -351,6 +498,11 @@ impl FIXSession {
             tick_data: Arc::new(Mutex::new(Vec::new())),
             order_books: Arc::new(Mutex::new(HashMap::new())),
             open_orders: Arc::new(OpenOrdersStore::new()),
+            positions: {
+                let ps = Arc::new(PositionsStore::new());
+                ps.load_from_trades_csv();
+                ps
+            },
             order_update_tx: Arc::new(Mutex::new(None)),
             order_book_update_tx: Arc::new(Mutex::new(None)),
             kdb_writer,
@@ -1232,7 +1384,54 @@ impl FIXSession {
                     if leaves_qty == 0.0 || ord_status == "8" || ord_status == "4" || ord_status == "2" || exec_type == "8" {
                         self.open_orders.remove_order(&cl_ord_id_owned);
                     }
-                    
+
+                    // On every fill (partial or full), persist to kdb+ own_trades and update positions.
+                    // ExecType "F" = partial fill, "2" = full fill, "1" = partial fill (some venues).
+                    if exec_type == "F" || exec_type == "2" || exec_type == "1" {
+                        let fill_symbol = msg.get_field(tags::SYMBOL).unwrap_or_default();
+                        let fill_side   = msg.get_field(tags::SIDE).unwrap_or_default();
+                        let last_px: f64 = msg.get_field(tags::LAST_PX)
+                            .and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let last_qty: f64 = msg.get_field(tags::LAST_QTY)
+                            .and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let avg_px: f64 = msg.get_field(6)
+                            .and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                        let fill_order_id = msg.get_field(tags::ORDER_ID).unwrap_or_default();
+                        let exec_type_char = exec_type.chars().next().unwrap_or('?');
+                        let side_char = fill_side.chars().next().unwrap_or('?');
+
+                        // Write fill to kdb+ own_trades table
+                        let _ = self.kdb_writer.write_own_trade(
+                            fill_symbol,
+                            side_char,
+                            last_px,
+                            last_qty,
+                            avg_px,
+                            &cl_ord_id_owned,
+                            fill_order_id,
+                            exec_type_char,
+                        ).await;
+
+                        // Durably persist this fill to data/trades.csv immediately.
+                        // This file survives KDB+ and server restarts.
+                        append_trade_to_csv(
+                            &cl_ord_id_owned,
+                            fill_order_id,
+                            fill_symbol,
+                            side_char,
+                            exec_type_char,
+                            last_qty,
+                            last_px,
+                            avg_px,
+                        );
+
+                        // Update in-memory positions store
+                        if last_qty > 0.0 && last_px > 0.0 {
+                            self.positions.apply_fill(fill_symbol, fill_side, last_qty, last_px);
+                            info!("📈 Position updated: symbol={} side={} qty={} px={}", fill_symbol, fill_side, last_qty, last_px);
+                        }
+                    }
+
                     // Signal CSV update (event-driven, immediate)
                     if let Some(tx) = self.order_update_tx.lock().await.as_ref() {
                         let _ = tx.send(());
@@ -1674,9 +1873,10 @@ impl FIXSession {
                     // CRITICAL: Swap snapshot after snapshot processing to make updates visible
                     book.swap_snapshot();
 
-                    // Write snapshot to kdb+
+                    // Write snapshot to kdb+ and persist to CSV for backtest fallback
                     let _ = self.kdb_writer.write_snapshot(&symbol, best_bid, best_ask, 
                         best_bid_size, best_ask_size, spread).await;
+                    append_snapshot_to_csv(&symbol, best_bid, best_ask);
 
                     // Only add tick if we have at least bid or ask data
                     if combined_tick.bid > 0.0 || combined_tick.ask > 0.0 || combined_tick.last_price > 0.0 {
@@ -1877,10 +2077,10 @@ impl FIXSession {
 
                     info!("  📊 Order Book: Bid={:.2}, Ask={:.2}, Spread={:.2}", best_bid, best_ask, spread);
                     
-                    // Write snapshot to kdb+ (periodically, not every update to reduce I/O)
-                    // Only write if best bid/ask changed significantly or every N updates
+                    // Write snapshot to kdb+ and persist to CSV for backtest fallback
                     let _ = self.kdb_writer.write_snapshot(&symbol, best_bid, best_ask, 
                         best_bid_size, best_ask_size, spread).await;
+                    append_snapshot_to_csv(&symbol, best_bid, best_ask);
                     
                     // Signal ZeroMQ update ONCE per incremental refresh (after all entries processed)
                     if let Some(tx) = self.order_book_update_tx.lock().await.as_ref() {
@@ -1998,31 +2198,41 @@ impl FIXSession {
         Ok(())
     }
 
-    /// Save tick data to CSV file (compatible with Parquet tools)
+    /// Save tick data to CSV file (compatible with Parquet tools).
+    ///
+    /// Uses append mode so multiple calls accumulate data across sessions.
+    /// The CSV header is only written when the file is first created.
     pub async fn save_ticks_to_parquet(&self, filename: &str) -> Result<()> {
         let mut ticks = self.tick_data.lock().await;
         let tick_count = ticks.len();
 
         if tick_count == 0 {
-            info!("No tick data to save");
             return Ok(());
         }
 
-        // Clone ticks and clear buffer to avoid duplicates on next save
-        let ticks_clone = ticks.clone();
-        ticks.clear(); // Clear buffer after cloning so next save only has new ticks
-        drop(ticks); // Release lock before async operations
-        
+        // Drain the buffer so next call only writes new ticks.
+        let ticks_clone: Vec<TickData> = ticks.drain(..).collect();
+        drop(ticks);
+
         let filename_owned = filename.to_string();
 
         std::thread::spawn(move || {
             match (|| -> Result<()> {
-                let mut file = File::create(&filename_owned)?;
+                // Ensure parent directory exists.
+                if let Some(parent) = Path::new(&filename_owned).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
 
-                // Write CSV header
-                writeln!(file, "timestamp,symbol,bid,ask,bid_size,ask_size,last_price,last_size")?;
+                let file_is_new = !Path::new(&filename_owned).exists();
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&filename_owned)?;
 
-                // Write tick data rows
+                if file_is_new {
+                    writeln!(file, "timestamp,symbol,bid,ask,bid_size,ask_size,last_price,last_size")?;
+                }
+
                 for tick in &ticks_clone {
                     writeln!(file, "{},{},{},{},{},{},{},{}",
                         tick.timestamp,
@@ -2039,7 +2249,7 @@ impl FIXSession {
                 Ok(())
             })() {
                 Ok(_) => {
-                    info!("✅ Saved {} ticks to {} (CSV format)", tick_count, filename_owned);
+                    info!("✅ Appended {} ticks to {}", tick_count, filename_owned);
                 }
                 Err(e) => {
                     error!("❌ Failed to write tick data file: {}", e);
@@ -2053,15 +2263,11 @@ impl FIXSession {
     /// Add a tick to the tick buffer
     pub async fn add_tick(&self, tick: TickData) {
         let mut ticks = self.tick_data.lock().await;
-        let symbol = tick.symbol.clone();
         ticks.push(tick);
-        let tick_count = ticks.len();
-        
-        if tick_count % 100 == 0 {
-            info!("📊 Buffered {} ticks for {}", tick_count, symbol);
+        let len = ticks.len();
+        if len > MAX_TICK_BUFFER {
+            ticks.drain(..len - MAX_TICK_BUFFER);
         }
-        
-        // Auto-save disabled - only order_book_current.csv is updated
     }
 
     // Private helper methods
@@ -2592,6 +2798,54 @@ async fn heartbeat_loop(session: Arc<FIXSession>, heartbeat_interval: u64) -> Re
 }
 
 /// Generate CSV summary from OpenOrdersStore snapshot (lock-free)
+/// Append a single fill to data/trades.csv.
+/// Called on every execution report with ExecType F/2/1 (partial or full fill).
+/// Uses append mode so the file accumulates fills across server restarts.
+fn append_trade_to_csv(
+    cl_ord_id: &str,
+    order_id: &str,
+    symbol: &str,
+    side: char,
+    exec_type: char,
+    last_qty: f64,
+    last_px: f64,
+    avg_px: f64,
+) {
+    let _ = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all("data")?;
+        let path = Path::new("data/trades.csv");
+        let file_is_new = !path.exists();
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        if file_is_new {
+            writeln!(file, "timestamp_ns,cl_ord_id,order_id,symbol,side,exec_type,last_qty,last_px,avg_px")?;
+        }
+        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        writeln!(file, "{},{},{},{},{},{},{},{},{}",
+            ts, cl_ord_id, order_id, symbol, side, exec_type,
+            last_qty, last_px, avg_px
+        )
+    })();
+}
+
+/// Append a best-bid/ask snapshot to data/snapshots.csv for backtest persistence.
+/// Called on every 35=W and 35=X message where both best_bid and best_ask are available.
+fn append_snapshot_to_csv(symbol: &str, best_bid: f64, best_ask: f64) {
+    if best_bid <= 0.0 || best_ask <= 0.0 || best_ask <= best_bid {
+        return;
+    }
+    let _ = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all("data")?;
+        let path = Path::new("data/snapshots.csv");
+        let file_is_new = !path.exists();
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        if file_is_new {
+            writeln!(file, "timestamp_ms,symbol,best_bid,best_ask")?;
+        }
+        let ts_ms = chrono::Utc::now().timestamp_millis();
+        writeln!(file, "{},{},{},{}", ts_ms, symbol, best_bid, best_ask)
+    })();
+}
+
 fn generate_open_orders_csv(open_orders: &[OpenOrder]) -> Result<String> {
     let mut csv_content = String::from("ClOrdID,OrderID,ExecID,Symbol,Side,OrderQty,Price,OrdStatus,ExecType,CumQty,LeavesQty,LastPx,LastQty,AvgPx,TransactTime,OrderCreateTime,RejectionReason\n");
     
@@ -3191,9 +3445,10 @@ async fn order_book_web_server(
     order_session: Arc<FIXSession>,  // Order management session (has open_orders)
     market_data_session: Arc<FIXSession>,  // Market data session (has order books for web display)
     market_data_sessions: Vec<(Arc<FIXSession>, String, u16)>,  // All market data sessions for status API
+    kdb_writer: Arc<KdbWriter>,  // kdb+ connection for historical queries
+    algo: Arc<algo::TradingAlgo>,  // Trading algorithm
     bind_addr: &str,
 ) -> Result<()> {
-    use axum::extract::Query;
     use serde::Deserialize;
     
     #[derive(Deserialize)]
@@ -3208,23 +3463,27 @@ async fn order_book_web_server(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Order Book Viewer</title>
+    <title>Wozinga Trading Platform</title>
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
     <style>
         * {
             margin: 0;
             padding: 0;
             box-sizing: border-box;
         }
+        html {
+            height: 100%;
+            overflow: hidden;
+        }
         body {
             font-family: 'Rajdhani', 'Segoe UI', sans-serif;
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
             background-attachment: fixed;
             color: #e5e7eb;
-            padding: 20px;
-            min-height: 100vh;
+            height: 100vh;
+            overflow: hidden;
             position: relative;
-            overflow-x: hidden;
         }
         body::before {
             content: '';
@@ -3240,16 +3499,12 @@ async fn order_book_web_server(
             z-index: 0;
         }
         .container {
-            max-width: 1400px;
-            margin: 0 auto;
+            width: 100%;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
             background: rgba(255, 255, 255, 0.03);
             backdrop-filter: blur(10px);
-            border-radius: 20px;
-            border: 1px solid rgba(255, 107, 53, 0.2);
-            box-shadow: 
-                0 8px 32px rgba(0, 0, 0, 0.3),
-                0 0 0 1px rgba(255, 107, 53, 0.1),
-                inset 0 1px 0 rgba(255, 255, 255, 0.1);
             overflow: hidden;
             position: relative;
             z-index: 1;
@@ -3259,8 +3514,8 @@ async fn order_book_web_server(
             background-size: 200% 200%;
             animation: gradientShift 8s ease infinite;
             color: white;
-            padding: 25px 30px;
-            text-align: center;
+            padding: 4px 16px;
+            flex-shrink: 0;
             position: relative;
             overflow: hidden;
         }
@@ -3282,95 +3537,78 @@ async fn order_book_web_server(
             0% { transform: translateX(-100%) translateY(-100%) rotate(45deg); }
             100% { transform: translateX(100%) translateY(100%) rotate(45deg); }
         }
-        .header h1 {
-            font-family: 'Orbitron', monospace;
-            font-size: 2.0em;
-            font-weight: 900;
-            margin-bottom: 10px;
-            text-shadow: 
-                0 0 10px rgba(255, 255, 255, 0.5),
-                0 0 20px rgba(255, 107, 53, 0.8),
-                0 0 30px rgba(255, 107, 53, 0.6);
-            letter-spacing: 2px;
+        .header-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
             position: relative;
             z-index: 1;
         }
-        .header-menu {
+        .header h1 {
+            font-family: 'Orbitron', monospace;
+            font-size: 0.95em;
+            font-weight: 900;
+            text-shadow: 0 0 10px rgba(255, 255, 255, 0.4);
+            letter-spacing: 2px;
+            white-space: nowrap;
+        }
+        .header-controls {
             display: flex;
-            justify-content: center;
             align-items: center;
-            gap: 30px;
-            margin-top: 15px;
-            flex-wrap: wrap;
-            position: relative;
-            z-index: 1;
+            gap: 8px;
+            flex-shrink: 0;
         }
         .menu-item {
             background: rgba(255, 255, 255, 0.15);
             backdrop-filter: blur(10px);
-            padding: 14px 28px;
-            border-radius: 12px;
-            font-size: 16px;
+            padding: 3px 10px;
+            border-radius: 6px;
+            font-size: 11px;
             font-weight: 600;
             cursor: default;
-            transition: all 0.3s ease;
             border: 1px solid rgba(255, 255, 255, 0.2);
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
-        }
-        .menu-item:hover {
-            background: rgba(255, 255, 255, 0.25);
-            transform: translateY(-2px);
-            box-shadow: 0 6px 20px rgba(255, 107, 53, 0.4);
+            white-space: nowrap;
         }
         .menu-item-value {
             font-family: 'Orbitron', monospace;
-            font-size: 26px;
+            font-size: 12px;
             font-weight: bold;
-            margin-left: 8px;
+            margin-left: 4px;
             color: #fff;
-            text-shadow: 0 0 10px rgba(255, 255, 255, 0.8);
-        }
-        .header .symbol-selector {
-            margin-top: 15px;
-            position: relative;
-            z-index: 1;
         }
         .header select {
-            padding: 12px 24px;
-            font-size: 16px;
+            padding: 3px 8px;
+            font-size: 11px;
             font-weight: 600;
-            border-radius: 10px;
-            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.3);
             background: rgba(255, 255, 255, 0.95);
             color: #1a1a2e;
             cursor: pointer;
-            transition: all 0.3s ease;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2);
+            transition: border-color 0.3s ease;
         }
         .header select:hover {
             border-color: rgba(255, 255, 255, 0.6);
-            box-shadow: 0 6px 20px rgba(255, 107, 53, 0.4);
-            transform: translateY(-2px);
         }
         .stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 25px;
-            padding: 35px;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 8px;
+            padding: 8px 16px;
             background: rgba(26, 26, 46, 0.4);
             backdrop-filter: blur(5px);
+            flex-shrink: 0;
         }
         .stat-card {
             background: rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(10px);
-            padding: 25px;
-            border-radius: 15px;
+            padding: 7px 10px;
+            border-radius: 8px;
             text-align: center;
             border: 1px solid rgba(255, 107, 53, 0.2);
-            box-shadow: 
-                0 4px 15px rgba(0, 0, 0, 0.3),
-                inset 0 1px 0 rgba(255, 255, 255, 0.1);
-            transition: all 0.3s ease;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+            transition: border-color 0.3s ease;
             position: relative;
             overflow: hidden;
         }
@@ -3384,65 +3622,66 @@ async fn order_book_web_server(
             background: linear-gradient(90deg, transparent, rgba(255, 107, 53, 0.1), transparent);
             transition: left 0.5s ease;
         }
-        .stat-card:hover {
-            transform: translateY(-5px);
-            border-color: rgba(255, 107, 53, 0.5);
-            box-shadow: 
-                0 8px 25px rgba(255, 107, 53, 0.3),
-                0 0 20px rgba(255, 107, 53, 0.2);
-        }
-        .stat-card:hover::before {
-            left: 100%;
-        }
+        .stat-card:hover { border-color: rgba(255, 107, 53, 0.5); }
+        .stat-card:hover::before { left: 100%; }
         .stat-label {
-            font-size: 13px;
+            font-size: 10px;
             color: #9ca3af;
-            margin-bottom: 12px;
+            margin-bottom: 3px;
             text-transform: uppercase;
             letter-spacing: 1px;
             font-weight: 600;
         }
         .stat-value {
             font-family: 'Orbitron', monospace;
-            font-size: 32px;
+            font-size: 18px;
             font-weight: 700;
             color: #e5e7eb;
-            text-shadow: 0 0 10px rgba(255, 255, 255, 0.3);
+            text-shadow: 0 0 8px rgba(255, 255, 255, 0.3);
         }
         .stat-value.bid { 
             color: #10b981;
-            text-shadow: 0 0 15px rgba(16, 185, 129, 0.6);
+            text-shadow: 0 0 10px rgba(16, 185, 129, 0.6);
         }
         .stat-value.ask { 
             color: #ef4444;
-            text-shadow: 0 0 15px rgba(239, 68, 68, 0.6);
+            text-shadow: 0 0 10px rgba(239, 68, 68, 0.6);
         }
         .stat-value.spread { 
             color: #ff6b35;
-            text-shadow: 0 0 15px rgba(255, 107, 53, 0.6);
+            text-shadow: 0 0 10px rgba(255, 107, 53, 0.6);
         }
-        .order-book-container {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 25px;
-            padding: 35px;
+        /* ── Live tab main layout ── */
+        .live-main {
+            display: flex;
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            gap: 8px;
+            padding: 8px;
         }
         .order-book-side {
+            flex: 1;
+            min-width: 0;
             background: rgba(26, 26, 46, 0.4);
             backdrop-filter: blur(5px);
-            border-radius: 15px;
-            overflow: hidden;
+            border-radius: 10px;
             border: 1px solid rgba(255, 107, 53, 0.2);
             box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 0;
         }
         .order-book-header {
-            padding: 18px 20px;
+            padding: 8px 12px;
             font-family: 'Orbitron', monospace;
             font-weight: 700;
             text-align: center;
-            font-size: 18px;
+            font-size: 12px;
             letter-spacing: 2px;
             text-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
+            flex-shrink: 0;
         }
         .order-book-header.bids {
             background: linear-gradient(135deg, rgba(16, 185, 129, 0.9) 0%, rgba(5, 150, 105, 0.9) 100%);
@@ -3454,30 +3693,66 @@ async fn order_book_web_server(
             color: white;
             box-shadow: 0 0 20px rgba(239, 68, 68, 0.4);
         }
+        /* ── Dark-mode scrollbar styles ── */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 3px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(255, 107, 53, 0.35);
+            border-radius: 3px;
+            transition: background 0.2s ease;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(255, 107, 53, 0.65);
+        }
+        ::-webkit-scrollbar-corner {
+            background: transparent;
+        }
+        /* Firefox */
+        .order-book-scroll,
+        .trades-scroll,
+        .data-section-scroll,
+        .data-table-fill {
+            scrollbar-width: thin;
+            scrollbar-color: rgba(255, 107, 53, 0.35) rgba(255, 255, 255, 0.03);
+        }
+        .order-book-scroll {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 0;
+        }
         .order-book-table {
             width: 100%;
             border-collapse: collapse;
         }
         .order-book-table th {
-            padding: 14px;
+            padding: 7px 10px;
             text-align: right;
             background: rgba(255, 107, 53, 0.15);
             font-weight: 700;
-            font-size: 11px;
+            font-size: 10px;
             text-transform: uppercase;
             color: #ff6b35;
             letter-spacing: 1px;
             border-bottom: 2px solid rgba(255, 107, 53, 0.3);
+            position: sticky;
+            top: 0;
+            z-index: 1;
         }
         .order-book-table th:first-child {
             text-align: left;
         }
         .order-book-table td {
-            padding: 12px 14px;
+            padding: 6px 10px;
             text-align: right;
             font-family: 'Courier New', monospace;
-            font-size: 14px;
-            border-bottom: 1px solid rgba(255, 107, 53, 0.1);
+            font-size: 13px;
+            border-bottom: 1px solid rgba(255, 107, 53, 0.08);
             color: #e5e7eb;
             transition: background 0.2s ease;
         }
@@ -3495,47 +3770,61 @@ async fn order_book_web_server(
         .size {
             color: #9ca3af;
         }
-        .trades-section {
-            padding: 35px;
-            background: rgba(26, 26, 46, 0.4);
-            backdrop-filter: blur(5px);
+        /* ── Trades panel (right column in Live tab) ── */
+        .trades-panel {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            padding: 8px;
+            background: rgba(26, 26, 46, 0.3);
+            border-left: 1px solid rgba(255, 107, 53, 0.15);
+            overflow: hidden;
+            min-height: 0;
         }
         .trades-header {
             font-family: 'Orbitron', monospace;
-            font-size: 22px;
+            font-size: 12px;
             font-weight: 700;
-            margin-bottom: 25px;
+            margin-bottom: 6px;
             color: #ff6b35;
-            text-shadow: 0 0 10px rgba(255, 107, 53, 0.5);
+            text-shadow: 0 0 8px rgba(255, 107, 53, 0.5);
             letter-spacing: 1px;
+            flex-shrink: 0;
+        }
+        .trades-scroll {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 0;
         }
         .trades-table {
             width: 100%;
             border-collapse: collapse;
             background: rgba(255, 255, 255, 0.03);
-            backdrop-filter: blur(10px);
-            border-radius: 12px;
+            border-radius: 8px;
             overflow: hidden;
             border: 1px solid rgba(255, 107, 53, 0.2);
         }
         .trades-table th {
-            padding: 14px;
+            padding: 7px 8px;
             text-align: right;
             background: linear-gradient(135deg, rgba(255, 107, 53, 0.8) 0%, rgba(255, 140, 0, 0.8) 100%);
             color: white;
             font-weight: 700;
-            font-size: 11px;
+            font-size: 10px;
             text-transform: uppercase;
             letter-spacing: 1px;
+            position: sticky;
+            top: 0;
         }
         .trades-table th:first-child {
             text-align: left;
         }
         .trades-table td {
-            padding: 12px 14px;
+            padding: 6px 8px;
             text-align: right;
             font-family: 'Courier New', monospace;
-            font-size: 14px;
+            font-size: 12px;
             border-bottom: 1px solid rgba(255, 107, 53, 0.1);
             color: #e5e7eb;
         }
@@ -3546,272 +3835,1088 @@ async fn order_book_web_server(
             background: rgba(255, 107, 53, 0.1);
         }
         .status {
-            padding: 20px 30px;
-            background: rgba(31, 41, 55, 0.8);
-            backdrop-filter: blur(10px);
-            color: white;
-            text-align: center;
-            font-size: 14px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 4px 10px;
+            border-radius: 20px;
+            background: rgba(31, 41, 55, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: #9ca3af;
+            font-size: 11px;
             font-weight: 600;
             letter-spacing: 1px;
-            border-top: 1px solid rgba(255, 107, 53, 0.2);
             text-transform: uppercase;
+            white-space: nowrap;
+        }
+        .status::before {
+            content: '';
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #6b7280;
+            flex-shrink: 0;
         }
         .status.connected {
-            background: linear-gradient(135deg, rgba(16, 185, 129, 0.9) 0%, rgba(5, 150, 105, 0.9) 100%);
-            box-shadow: 0 0 20px rgba(16, 185, 129, 0.4);
+            background: rgba(16, 185, 129, 0.2);
+            border-color: rgba(16, 185, 129, 0.5);
+            color: #6ee7b7;
+        }
+        .status.connected::before {
+            background: #10b981;
+            box-shadow: 0 0 6px rgba(16, 185, 129, 0.8);
             animation: pulse 2s ease infinite;
         }
         @keyframes pulse {
-            0%, 100% { box-shadow: 0 0 20px rgba(16, 185, 129, 0.4); }
-            50% { box-shadow: 0 0 30px rgba(16, 185, 129, 0.6); }
+            0%, 100% { box-shadow: 0 0 4px rgba(16, 185, 129, 0.8); }
+            50% { box-shadow: 0 0 10px rgba(16, 185, 129, 1); }
         }
         .status.error {
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.9) 0%, rgba(220, 38, 38, 0.9) 100%);
-            box-shadow: 0 0 20px rgba(239, 68, 68, 0.4);
+            background: rgba(239, 68, 68, 0.2);
+            border-color: rgba(239, 68, 68, 0.5);
+            color: #fca5a5;
         }
-        @media (max-width: 768px) {
-            .order-book-container {
-                grid-template-columns: 1fr;
-            }
-            .header h1 {
-                font-size: 2em;
-            }
+        .status.error::before {
+            background: #ef4444;
+        }
+        /* ── Tab navigation ── */
+        .tab-nav {
+            display: flex;
+            gap: 3px;
+            padding: 5px 16px 0;
+            margin-top: 6px;
+            background: rgba(26, 26, 46, 0.6);
+            border-bottom: 2px solid rgba(255, 107, 53, 0.3);
+            flex-shrink: 0;
+        }
+        .tab-btn {
+            padding: 5px 16px;
+            border: none;
+            border-radius: 6px 6px 0 0;
+            background: rgba(255,255,255,0.06);
+            color: #9ca3af;
+            font-family: 'Rajdhani', sans-serif;
+            font-size: 12px;
+            font-weight: 600;
+            letter-spacing: 1px;
+            cursor: pointer;
+            transition: all 0.25s;
+        }
+        .tab-btn:hover { background: rgba(255,107,53,0.15); color: #e5e7eb; }
+        .tab-btn.active {
+            background: linear-gradient(135deg, rgba(255,107,53,0.8), rgba(255,140,0,0.8));
+            color: #fff;
+            box-shadow: 0 -2px 12px rgba(255,107,53,0.4);
+        }
+        .tab-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; min-height: 0; }
+        .tab-panel.active { display: flex; }
+        /* ── History chart ── */
+        .history-section {
+            padding: 12px 16px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 0;
+        }
+        .history-controls { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; flex-shrink: 0; }
+        .history-controls select, .history-controls button {
+            padding: 6px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,107,53,0.4);
+            background: rgba(255,255,255,0.08);
+            color: #e5e7eb;
+            font-family: 'Rajdhani', sans-serif;
+            font-size: 13px;
+            cursor: pointer;
+        }
+        .history-controls button {
+            background: linear-gradient(135deg, rgba(255,107,53,0.7), rgba(255,140,0,0.7));
+            font-weight: 700;
+        }
+        .history-controls button:hover { opacity: 0.85; }
+        .chart-wrap {
+            background: rgba(26,26,46,0.5);
+            border: 1px solid rgba(255,107,53,0.2);
+            border-radius: 12px;
+            padding: 14px;
+            position: relative;
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        .chart-wrap canvas { flex: 1; min-height: 0; }
+        /* ── Generic data table ── */
+        .data-section {
+            padding: 12px 16px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 0;
+        }
+        .data-section-scroll {
+            padding: 12px 16px;
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            overflow-x: hidden;
+            min-height: 0;
+        }
+        .data-table-wrap { overflow-x: auto; flex-shrink: 0; }
+        .data-table-fill { overflow-x: auto; flex: 1; overflow-y: auto; min-height: 0; }
+        .data-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: rgba(255,255,255,0.03);
+            border-radius: 12px;
+            overflow: hidden;
+            border: 1px solid rgba(255,107,53,0.2);
+        }
+        .data-table th {
+            padding: 9px 12px;
+            text-align: left;
+            background: linear-gradient(135deg,rgba(255,107,53,0.8),rgba(255,140,0,0.8));
+            color: #fff;
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            white-space: nowrap;
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        .data-table td {
+            padding: 7px 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            border-bottom: 1px solid rgba(255,107,53,0.1);
+            color: #e5e7eb;
+        }
+        .data-table tbody tr:hover { background: rgba(255,107,53,0.08); }
+        /* ── Securities search ── */
+        .search-bar {
+            width: 100%;
+            max-width: 420px;
+            padding: 7px 14px;
+            border-radius: 8px;
+            border: 1px solid rgba(255,107,53,0.4);
+            background: rgba(255,255,255,0.08);
+            color: #e5e7eb;
+            font-family: 'Rajdhani', sans-serif;
+            font-size: 14px;
+            margin-bottom: 10px;
+            flex-shrink: 0;
+        }
+        .search-bar::placeholder { color: #6b7280; }
+        .section-title {
+            font-family: 'Orbitron', monospace;
+            font-size: 16px;
+            font-weight: 700;
+            color: #ff6b35;
+            margin-bottom: 10px;
+            text-shadow: 0 0 8px rgba(255,107,53,0.4);
+            flex-shrink: 0;
+        }
+        @media (max-width: 900px) {
+            .live-main { flex-direction: column; padding: 6px; }
+            .order-book-side { flex: none; height: 33%; }
+            .trades-panel { flex: 1; border-left: none; border-top: 1px solid rgba(255,107,53,0.15); }
+            .header h1 { font-size: 0.85em; }
         }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="header">
-            <h1>HIGH FREQUENCY WOZINGA TRADING PLATFORM</h1>
-            <div class="header-menu">
-                <div class="menu-item">
-                    Total Markets: <span class="menu-item-value" id="totalMarkets">-</span>
+            <div class="header-row">
+                <h1>WOZINGA HFT PLATFORM</h1>
+                <div class="header-controls">
+                    <div class="menu-item">Markets: <span class="menu-item-value" id="totalMarkets">-</span></div>
+                    <select id="symbolSelect">
+                        <option value="BTC_USDT">BTC_USDT</option>
+                        <option value="BTC_USD">BTC_USD</option>
+                        <option value="SOL_BTC">SOL_BTC</option>
+                        <option value="XRP_BTC">XRP_BTC</option>
+                        <option value="DOGE_BTC">DOGE_BTC</option>
+                    </select>
+                    <div class="status" id="status">Connecting...</div>
                 </div>
             </div>
-            <div class="symbol-selector">
-                <select id="symbolSelect">
-                    <option value="BTC_USDT">BTC_USDT</option>
-                    <option value="BTC_USD">BTC_USD</option>
-                    <option value="SOL_BTC">SOL_BTC</option>
-                    <option value="XRP_BTC">XRP_BTC</option>
-                    <option value="DOGE_BTC">DOGE_BTC</option>
-                </select>
+        </div>
+
+        <!-- Tab navigation -->
+        <div class="tab-nav">
+            <button class="tab-btn active" onclick="switchTab('live', this)">Live</button>
+            <button class="tab-btn" onclick="switchTab('history', this)">History</button>
+            <button class="tab-btn" onclick="switchTab('orders', this)">Orders</button>
+            <button class="tab-btn" onclick="switchTab('positions', this)">Positions</button>
+            <button class="tab-btn" onclick="switchTab('algo', this)">Algo</button>
+            <button class="tab-btn" onclick="switchTab('backtest', this)">Backtest</button>
+            <button class="tab-btn" onclick="switchTab('securities', this)">Securities</button>
+        </div>
+
+        <!-- ── LIVE TAB ── -->
+        <div id="tab-live" class="tab-panel active">
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-label">Best Bid</div>
+                    <div class="stat-value bid" id="bestBid">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Best Ask</div>
+                    <div class="stat-value ask" id="bestAsk">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Spread</div>
+                    <div class="stat-value spread" id="spread">-</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Trade Count</div>
+                    <div class="stat-value" id="tradeCount">0</div>
+                </div>
+            </div>
+
+            <div class="live-main">
+                <div class="order-book-side">
+                    <div class="order-book-header bids">BIDS</div>
+                    <div class="order-book-scroll">
+                        <table class="order-book-table">
+                            <thead><tr><th>Price</th><th>Size</th></tr></thead>
+                            <tbody id="bidsTable">
+                                <tr><td colspan="2" style="text-align:center;padding:20px">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="order-book-side">
+                    <div class="order-book-header asks">ASKS</div>
+                    <div class="order-book-scroll">
+                        <table class="order-book-table">
+                            <thead><tr><th>Price</th><th>Size</th></tr></thead>
+                            <tbody id="asksTable">
+                                <tr><td colspan="2" style="text-align:center;padding:20px">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="trades-panel">
+                    <div class="trades-header">Recent Trades</div>
+                    <div class="trades-scroll">
+                        <table class="trades-table">
+                            <thead><tr><th>Price</th><th>Size</th><th>Time</th></tr></thead>
+                            <tbody id="tradesTable">
+                                <tr><td colspan="3" style="text-align:center;padding:20px">No trades yet</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
             </div>
         </div>
-        
-        <div class="stats">
-            <div class="stat-card">
-                <div class="stat-label">Best Bid</div>
-                <div class="stat-value bid" id="bestBid">-</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Best Ask</div>
-                <div class="stat-value ask" id="bestAsk">-</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Spread</div>
-                <div class="stat-value spread" id="spread">-</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-label">Trade Count</div>
-                <div class="stat-value" id="tradeCount">0</div>
+
+        <!-- ── HISTORY TAB ── -->
+        <div id="tab-history" class="tab-panel">
+            <div class="history-section">
+                <div class="section-title">Bid / Ask History</div>
+                <div class="history-controls">
+                    <select id="histSymbolSelect"></select>
+                    <button onclick="loadHistory()">Load</button>
+                    <span id="histStatus" style="color:#9ca3af;font-size:13px"></span>
+                </div>
+                <div class="chart-wrap">
+                    <canvas id="histChart"></canvas>
+                </div>
             </div>
         </div>
-        
-        <div class="trades-section">
-            <div class="trades-header">Recent Trades</div>
-            <table class="trades-table">
-                <thead>
-                    <tr>
-                        <th>Price</th>
-                        <th>Size</th>
-                        <th>Time</th>
-                    </tr>
-                </thead>
-                <tbody id="tradesTable">
-                    <tr><td colspan="3" style="text-align: center; padding: 20px;">No trades yet</td></tr>
-                </tbody>
-            </table>
-        </div>
-        
-        <div class="order-book-container">
-            <div class="order-book-side">
-                <div class="order-book-header bids">BIDS</div>
-                <table class="order-book-table">
-                    <thead>
-                        <tr>
-                            <th>Price</th>
-                            <th>Size</th>
-                        </tr>
-                    </thead>
-                    <tbody id="bidsTable">
-                        <tr><td colspan="2" style="text-align: center; padding: 20px;">Loading...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-            
-            <div class="order-book-side">
-                <div class="order-book-header asks">ASKS</div>
-                <table class="order-book-table">
-                    <thead>
-                        <tr>
-                            <th>Price</th>
-                            <th>Size</th>
-                        </tr>
-                    </thead>
-                    <tbody id="asksTable">
-                        <tr><td colspan="2" style="text-align: center; padding: 20px;">Loading...</td></tr>
-                    </tbody>
-                </table>
+
+        <!-- ── ORDERS TAB ── -->
+        <div id="tab-orders" class="tab-panel">
+            <div class="data-section">
+                <div class="section-title">Order Execution History</div>
+                <div class="data-table-fill">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>ClOrdID</th>
+                                <th>Symbol</th>
+                                <th>Side</th>
+                                <th>Qty</th>
+                                <th>Price</th>
+                                <th>Status</th>
+                                <th>CumQty</th>
+                                <th>AvgPx</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ordersTable">
+                            <tr><td colspan="9" style="text-align:center;padding:20px">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
             </div>
         </div>
-        
-        <div class="status" id="status">Connecting...</div>
+
+        <!-- ── POSITIONS TAB ── -->
+        <div id="tab-positions" class="tab-panel">
+            <div class="data-section">
+                <div class="section-title">Live Positions &amp; P&amp;L</div>
+                <div class="data-table-fill">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Net Qty</th>
+                                <th>Avg Entry</th>
+                                <th>Last Mid</th>
+                                <th>Unreal P&amp;L</th>
+                                <th>Real P&amp;L</th>
+                                <th>Total P&amp;L</th>
+                                <th>Trades</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positionsTable">
+                            <tr><td colspan="8" style="text-align:center;padding:20px">Loading…</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div id="positionsStatus" style="padding:6px 0;color:#9ca3af;font-size:12px;flex-shrink:0;"></div>
+            </div>
+        </div>
+
+        <!-- ── ALGO TAB ── -->
+        <div id="tab-algo" class="tab-panel">
+            <div class="data-section-scroll">
+                <div class="section-title">Trading Algorithm</div>
+
+                <!-- Status banner -->
+                <div id="algoStatusBanner" style="padding:12px 20px;border-radius:8px;margin-bottom:20px;font-weight:600;font-size:15px;background:rgba(75,85,99,0.5);color:#9ca3af;">
+                    Loading algo status…
+                </div>
+
+                <!-- Controls row -->
+                <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px;">
+                    <button onclick="algoEnable()" style="padding:10px 24px;border-radius:8px;border:none;background:linear-gradient(135deg,#22c55e,#16a34a);color:white;font-weight:700;cursor:pointer;font-size:14px;">Enable Algo</button>
+                    <button onclick="algoDisable()" style="padding:10px 24px;border-radius:8px;border:none;background:linear-gradient(135deg,#ef4444,#dc2626);color:white;font-weight:700;cursor:pointer;font-size:14px;">Disable Algo</button>
+                    <button onclick="loadAlgoStatus()" style="padding:10px 24px;border-radius:8px;border:none;background:rgba(255,107,53,0.2);color:#ff6b35;font-weight:700;cursor:pointer;font-size:14px;border:1px solid rgba(255,107,53,0.3);">Refresh</button>
+                </div>
+
+                <!-- Config editor -->
+                <div style="margin-bottom:24px;">
+                    <div style="color:#ff6b35;font-weight:600;margin-bottom:12px;font-size:14px;text-transform:uppercase;letter-spacing:1px;">Configuration</div>
+                    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;">
+                        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Symbol
+                            <input id="algoCfgSymbol" type="text" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Order Qty (base units)
+                            <input id="algoCfgQty" type="number" step="0.0001" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Min Spread (bps)
+                            <input id="algoCfgSpread" type="number" step="0.1" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Max Position (base units)
+                            <input id="algoCfgMaxPos" type="number" step="0.001" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Poll Interval (ms)
+                            <input id="algoCfgPoll" type="number" step="100" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Time-in-Force (0=Day,3=IOC,4=FOK)
+                            <input id="algoCfgTIF" type="text" maxlength="1" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                        </label>
+                    </div>
+                    <button onclick="algoSaveConfig()" style="margin-top:14px;padding:10px 24px;border-radius:8px;border:none;background:linear-gradient(135deg,rgba(255,107,53,0.8),rgba(255,140,0,0.8));color:white;font-weight:700;cursor:pointer;font-size:14px;">Save Config</button>
+                    <span id="algoCfgMsg" style="margin-left:12px;font-size:13px;color:#9ca3af;"></span>
+                </div>
+
+                <!-- Signal log -->
+                <div>
+                    <div style="color:#ff6b35;font-weight:600;margin-bottom:12px;font-size:14px;text-transform:uppercase;letter-spacing:1px;">Recent Signals</div>
+                    <table class="data-table" style="font-size:13px;">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Symbol</th>
+                                <th>Side</th>
+                                <th>Price</th>
+                                <th>Qty</th>
+                                <th>Reason</th>
+                            </tr>
+                        </thead>
+                        <tbody id="algoSignalLog">
+                            <tr><td colspan="6" style="text-align:center;padding:20px;color:#9ca3af;">No signals yet</td></tr>
+                        </tbody>
+                    </table>
+                    <div style="margin-top:8px;color:#6b7280;font-size:12px;">Signals fired: <span id="algoSigCount">0</span> | Orders placed: <span id="algoOrdCount">0</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── BACKTEST TAB ── -->
+        <div id="tab-backtest" class="tab-panel">
+            <div class="data-section-scroll">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+                    <div style="display:flex;align-items:baseline;gap:14px;">
+                        <div class="section-title" style="margin-bottom:0;">Strategy Backtester</div>
+                        <span id="btStatus" style="color:#9ca3af;font-size:13px;"></span>
+                    </div>
+                    <button onclick="runBacktest()" id="btRunBtn" style="padding:10px 20px;border-radius:8px;border:none;background:linear-gradient(135deg,rgba(255,107,53,0.9),rgba(255,140,0,0.9));color:white;font-weight:700;cursor:pointer;font-size:14px;">Run Backtest</button>
+                </div>
+
+                <!-- Parameter form -->
+                <div style="display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;margin-bottom:24px;">
+                    <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Symbol
+                        <select id="btSymbol" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;"></select>
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Snapshots
+                        <input id="btLimit" type="number" value="5000" min="100" max="50000" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;">
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Min Spread (bps)
+                        <input id="btSpread" type="number" value="5" step="0.1" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;">
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Order Qty
+                        <input id="btQty" type="number" value="0.001" step="0.0001" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;">
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Max Position
+                        <input id="btMaxPos" type="number" value="0.01" step="0.001" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;">
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Tick Size
+                        <input id="btTick" type="number" value="0.01" step="0.001" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;">
+                    </label>
+                </div>
+
+                <!-- Summary stat cards -->
+                <div id="btSummary" style="display:none;">
+                    <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:14px;margin-bottom:24px;">
+                        <div class="stat-card"><div class="stat-label">Total P&amp;L</div><div class="stat-value" id="btStatPnl">-</div></div>
+                        <div class="stat-card"><div class="stat-label">Total Trades</div><div class="stat-value" id="btStatTrades">-</div></div>
+                        <div class="stat-card"><div class="stat-label">Win Rate</div><div class="stat-value" id="btStatWinRate">-</div></div>
+                        <div class="stat-card"><div class="stat-label">Max Drawdown</div><div class="stat-value" id="btStatDrawdown">-</div></div>
+                        <div class="stat-card"><div class="stat-label">Sharpe Ratio</div><div class="stat-value" id="btStatSharpe">-</div></div>
+                        <div class="stat-card"><div class="stat-label">Final Position</div><div class="stat-value" id="btStatPos">-</div></div>
+                    </div>
+
+                    <!-- Price + signals chart -->
+                    <div class="chart-wrap" style="margin-bottom:16px;height:260px;flex:none;">
+                        <div style="color:#ff6b35;font-size:12px;font-weight:600;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px;">Price &amp; Trade Signals</div>
+                        <canvas id="btPriceChart"></canvas>
+                    </div>
+
+                    <!-- Equity curve chart -->
+                    <div class="chart-wrap" style="margin-bottom:16px;height:260px;flex:none;">
+                        <div style="color:#ff6b35;font-size:12px;font-weight:600;margin-bottom:6px;text-transform:uppercase;letter-spacing:1px;">Equity Curve (Cumulative P&amp;L)</div>
+                        <canvas id="btEquityChart"></canvas>
+                    </div>
+
+                    <!-- Trade log table -->
+                    <div>
+                        <div style="color:#ff6b35;font-size:13px;font-weight:600;margin-bottom:8px;text-transform:uppercase;letter-spacing:1px;">Trade Log <span id="btTradeCount" style="font-weight:400;color:#9ca3af;"></span></div>
+                        <div class="data-table-wrap">
+                            <table class="data-table" style="font-size:13px;">
+                                <thead>
+                                    <tr>
+                                        <th>Time</th>
+                                        <th>Side</th>
+                                        <th>Fill Price</th>
+                                        <th>Qty</th>
+                                        <th>Trade P&amp;L</th>
+                                        <th>Cumul. P&amp;L</th>
+                                        <th>Net Pos After</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="btTradeLog">
+                                    <tr><td colspan="7" style="text-align:center;padding:20px;color:#9ca3af">Run a backtest to see trades</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ── SECURITIES TAB ── -->
+        <div id="tab-securities" class="tab-panel">
+            <div class="data-section">
+                <div class="section-title">Securities</div>
+                <input class="search-bar" id="secSearch" type="text" placeholder="Search by symbol…" oninput="filterSecurities()">
+                <div class="data-table-fill">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Security ID</th>
+                                <th>Exchange</th>
+                                <th>Attributes</th>
+                            </tr>
+                        </thead>
+                        <tbody id="securitiesTable">
+                            <tr><td colspan="4" style="text-align:center;padding:20px">Loading...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
     </div>
-    
+
     <script>
+        // ── shared state ────────────────────────────────────────────────────────────
         let currentSymbol = 'BTC_USDT';
         let updateInterval = null;
-        
+        let histChartInstance = null;
+        let allSecurities = [];
+
+        // ── tab switching ────────────────────────────────────────────────────────────
+        function switchTab(name, btn) {
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById('tab-' + name).classList.add('active');
+            btn.classList.add('active');
+            if (name === 'orders') loadOrders();
+            if (name === 'positions') loadPositions();
+            if (name === 'algo') loadAlgoStatus();
+            if (name === 'backtest') initBacktestSymbols();
+            if (name === 'securities') loadSecurities();
+        }
+
+        // ── symbol selector ──────────────────────────────────────────────────────────
         const symbolSelect = document.getElementById('symbolSelect');
-        symbolSelect.addEventListener('change', (e) => {
+        symbolSelect.addEventListener('change', e => {
             currentSymbol = e.target.value;
             updateOrderBook();
         });
-        
+
+        // ── helpers ──────────────────────────────────────────────────────────────────
         function formatNumber(num) {
             if (num === null || num === undefined || isNaN(num)) return '-';
             return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 8 });
         }
-        
+
         function formatTime(timestamp) {
             if (!timestamp) return '-';
-            const date = new Date(timestamp / 1000000); // Convert nanoseconds to milliseconds
-            return date.toLocaleTimeString();
+            // kdb+ timestamp is nanoseconds since 2000-01-01 (not Unix epoch)
+            // Unix epoch offset: 946684800 seconds = 946684800000000000 nanoseconds
+            const KDB_EPOCH_OFFSET_NS = 946684800000000000n;
+            try {
+                const ns = BigInt(Math.round(timestamp));
+                const ms = Number((ns + KDB_EPOCH_OFFSET_NS) / 1000000n);
+                return new Date(ms).toLocaleString();
+            } catch(_) {
+                return new Date(timestamp / 1000000).toLocaleTimeString();
+            }
         }
-        
+
+        function formatKdbTime(ts) {
+            // ts is either a Unix-ms integer (from Rust binary IPC conversion) or
+            // a legacy ISO-8601 string "2024-02-25T10:30:00.000000000"
+            if (!ts && ts !== 0) return '-';
+            try {
+                const ms = (typeof ts === 'number') ? ts : Date.parse(ts);
+                return new Date(ms).toLocaleString();
+            } catch(_) { return String(ts); }
+        }
+
+        // ── LIVE tab ─────────────────────────────────────────────────────────────────
         function updateTotalMarkets() {
             fetch('/api/symbols')
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Failed to fetch symbols');
-                    }
-                    return response.json();
-                })
+                .then(r => r.json())
                 .then(data => {
-                    const totalMarkets = data.symbols ? data.symbols.length : 0;
-                    document.getElementById('totalMarkets').textContent = totalMarkets;
-                    
-                    // Update symbol selector with all available symbols
-                    const symbolSelect = document.getElementById('symbolSelect');
-                    const currentValue = symbolSelect.value;
-                    symbolSelect.innerHTML = '';
-                    if (data.symbols && data.symbols.length > 0) {
-                        // If current symbol is not in the list, switch to first available
-                        const hasCurrentSymbol = data.symbols.includes(currentValue);
-                        const symbolToSelect = hasCurrentSymbol ? currentValue : data.symbols[0];
-                        
-                        data.symbols.forEach(symbol => {
-                            const option = document.createElement('option');
-                            option.value = symbol;
-                            option.textContent = symbol;
-                            if (symbol === symbolToSelect) {
-                                option.selected = true;
-                            }
-                            symbolSelect.appendChild(option);
-                        });
-                        
-                        // Update currentSymbol if we switched
-                        if (!hasCurrentSymbol && symbolToSelect) {
-                            currentSymbol = symbolToSelect;
-                            updateOrderBook();
-                        }
-                    } else {
-                        const option = document.createElement('option');
-                        option.value = 'BTC_USDT';
-                        option.textContent = 'BTC_USDT';
-                        symbolSelect.appendChild(option);
-                    }
+                    document.getElementById('totalMarkets').textContent = data.symbols ? data.symbols.length : 0;
+                    const sel = document.getElementById('symbolSelect');
+                    const cur = sel.value;
+                    sel.innerHTML = '';
+                    const syms = (data.symbols && data.symbols.length > 0) ? data.symbols : ['BTC_USDT'];
+                    syms.forEach(s => {
+                        const o = document.createElement('option');
+                        o.value = s; o.textContent = s;
+                        if (s === cur) o.selected = true;
+                        sel.appendChild(o);
+                    });
+                    // also populate history symbol selector
+                    const hSel = document.getElementById('histSymbolSelect');
+                    hSel.innerHTML = '';
+                    syms.forEach(s => {
+                        const o = document.createElement('option');
+                        o.value = s; o.textContent = s;
+                        if (s === currentSymbol) o.selected = true;
+                        hSel.appendChild(o);
+                    });
                 })
-                .catch(error => {
-                    console.error('Error fetching symbols:', error);
-                });
+                .catch(err => console.error('Error fetching symbols:', err));
         }
-        
+
         function updateOrderBook() {
-            fetch(`/api/orderbook/${currentSymbol}`)
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Failed to fetch order book');
-                    }
-                    return response.json();
-                })
+            fetch('/api/orderbook/' + currentSymbol)
+                .then(r => { if (!r.ok) throw new Error('fetch failed'); return r.json(); })
                 .then(data => {
                     document.getElementById('status').textContent = 'Connected';
                     document.getElementById('status').className = 'status connected';
-                    
-                    // Update stats
                     document.getElementById('bestBid').textContent = formatNumber(data.best_bid);
                     document.getElementById('bestAsk').textContent = formatNumber(data.best_ask);
                     document.getElementById('spread').textContent = formatNumber(data.spread);
                     document.getElementById('tradeCount').textContent = data.trade_count || 0;
-                    
-                    // Update bids table
-                    const bidsTable = document.getElementById('bidsTable');
-                    if (data.bids && data.bids.length > 0) {
-                        bidsTable.innerHTML = data.bids.map(level => `
-                            <tr>
-                                <td class="price">${formatNumber(level.price)}</td>
-                                <td class="size">${formatNumber(level.size)}</td>
-                            </tr>
-                        `).join('');
-                    } else {
-                        bidsTable.innerHTML = '<tr><td colspan="2" style="text-align: center; padding: 20px;">No bids</td></tr>';
-                    }
-                    
-                    // Update asks table
-                    const asksTable = document.getElementById('asksTable');
-                    if (data.asks && data.asks.length > 0) {
-                        asksTable.innerHTML = data.asks.map(level => `
-                            <tr>
-                                <td class="price">${formatNumber(level.price)}</td>
-                                <td class="size">${formatNumber(level.size)}</td>
-                            </tr>
-                        `).join('');
-                    } else {
-                        asksTable.innerHTML = '<tr><td colspan="2" style="text-align: center; padding: 20px;">No asks</td></tr>';
-                    }
-                    
-                    // Update trades table
-                    const tradesTable = document.getElementById('tradesTable');
-                    if (data.trades && data.trades.length > 0) {
-                        tradesTable.innerHTML = data.trades.map(trade => `
-                            <tr>
-                                <td class="price">${formatNumber(trade.price)}</td>
-                                <td class="size">${formatNumber(trade.size)}</td>
-                                <td>${formatTime(trade.timestamp)}</td>
-                            </tr>
-                        `).join('');
-                    } else {
-                        tradesTable.innerHTML = '<tr><td colspan="3" style="text-align: center; padding: 20px;">No trades yet</td></tr>';
-                    }
+
+                    const bids = document.getElementById('bidsTable');
+                    bids.innerHTML = data.bids && data.bids.length
+                        ? data.bids.map(l => `<tr><td class="price">${formatNumber(l.price)}</td><td class="size">${formatNumber(l.size)}</td></tr>`).join('')
+                        : '<tr><td colspan="2" style="text-align:center;padding:20px">No bids</td></tr>';
+
+                    const asks = document.getElementById('asksTable');
+                    asks.innerHTML = data.asks && data.asks.length
+                        ? data.asks.map(l => `<tr><td class="price">${formatNumber(l.price)}</td><td class="size">${formatNumber(l.size)}</td></tr>`).join('')
+                        : '<tr><td colspan="2" style="text-align:center;padding:20px">No asks</td></tr>';
+
+                    const trades = document.getElementById('tradesTable');
+                    trades.innerHTML = data.trades && data.trades.length
+                        ? data.trades.map(t => `<tr><td class="price">${formatNumber(t.price)}</td><td class="size">${formatNumber(t.size)}</td><td>${formatTime(t.timestamp)}</td></tr>`).join('')
+                        : '<tr><td colspan="3" style="text-align:center;padding:20px">No trades yet</td></tr>';
                 })
-                .catch(error => {
-                    console.error('Error:', error);
-                    document.getElementById('status').textContent = 'Error: ' + error.message;
+                .catch(err => {
+                    document.getElementById('status').textContent = 'Error: ' + err.message;
                     document.getElementById('status').className = 'status error';
                 });
         }
-        
-        // Initial load
+
+        // ── HISTORY tab ──────────────────────────────────────────────────────────────
+        function loadHistory() {
+            const sym = document.getElementById('histSymbolSelect').value || currentSymbol;
+            const statusEl = document.getElementById('histStatus');
+            statusEl.textContent = 'Loading…';
+            fetch('/api/history/' + sym)
+                .then(r => r.json())
+                .then(rows => {
+                    if (!Array.isArray(rows) || rows.length === 0) {
+                        statusEl.textContent = 'No snapshot data for ' + sym;
+                        return;
+                    }
+                    statusEl.textContent = rows.length + ' snapshots';
+                    const labels = rows.map(r => formatKdbTime(r.time));
+                    const bids   = rows.map(r => r.best_bid);
+                    const asks   = rows.map(r => r.best_ask);
+                    if (histChartInstance) histChartInstance.destroy();
+                    histChartInstance = new Chart(document.getElementById('histChart'), {
+                        type: 'line',
+                        data: {
+                            labels,
+                            datasets: [
+                                { label: 'Best Bid', data: bids, borderColor: '#10b981', backgroundColor: 'rgba(16,185,129,0.08)', tension: 0.2, pointRadius: 0 },
+                                { label: 'Best Ask', data: asks, borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,0.08)',   tension: 0.2, pointRadius: 0 }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            interaction: { mode: 'index', intersect: false },
+                            plugins: { legend: { labels: { color: '#e5e7eb' } } },
+                            scales: {
+                                x: { ticks: { color: '#9ca3af', maxTicksLimit: 10 }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                                y: { ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                            }
+                        }
+                    });
+                })
+                .catch(err => { statusEl.textContent = 'Error: ' + err.message; });
+        }
+
+        // ── ORDERS tab ───────────────────────────────────────────────────────────────
+        function loadOrders() {
+            const tbody = document.getElementById('ordersTable');
+            tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:20px">Loading…</td></tr>';
+            fetch('/api/orders/history')
+                .then(r => r.json())
+                .then(data => {
+                    const orders = data.orders || [];
+                    if (!orders.length) {
+                        tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:20px">No orders found</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = orders.map(o => `
+                        <tr>
+                            <td>${o.cl_ord_id || '-'}</td>
+                            <td>${o.symbol || '-'}</td>
+                            <td style="color:${o.side==='1'?'#10b981':'#ef4444'}">${o.side==='1'?'BUY':'SELL'}</td>
+                            <td>${o.order_qty || '-'}</td>
+                            <td>${o.price || '-'}</td>
+                            <td>${o.ord_status || '-'}</td>
+                            <td>${o.cum_qty || '-'}</td>
+                            <td>${o.avg_px || '-'}</td>
+                            <td>${o.transact_time || '-'}</td>
+                        </tr>`).join('');
+                })
+                .catch(err => { tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;color:#ef4444;padding:20px">Error: '+err.message+'</td></tr>'; });
+        }
+
+        // ── POSITIONS tab ─────────────────────────────────────────────────────────────
+        function loadPositions() {
+            const tbody = document.getElementById('positionsTable');
+            const status = document.getElementById('positionsStatus');
+            tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:20px">Loading…</td></tr>';
+            fetch('/api/positions')
+                .then(r => r.json())
+                .then(data => {
+                    const positions = data.positions || [];
+                    status.textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+                    if (!positions.length) {
+                        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:20px;color:#9ca3af">No positions — place orders to see fills here</td></tr>';
+                        return;
+                    }
+                    tbody.innerHTML = positions.map(p => {
+                        const totalPnl = (p.unrealized_pnl || 0) + (p.realized_pnl || 0);
+                        const pnlColor = v => v > 0 ? '#10b981' : v < 0 ? '#ef4444' : '#9ca3af';
+                        const sideColor = p.net_qty > 0 ? '#10b981' : p.net_qty < 0 ? '#ef4444' : '#9ca3af';
+                        const fmt = v => v === undefined || v === null ? '-' : Number(v).toFixed(6);
+                        const fmtPnl = v => v === undefined || v === null ? '-' : (v >= 0 ? '+' : '') + Number(v).toFixed(4);
+                        return `<tr>
+                            <td style="font-weight:bold;color:#ff6b35">${p.symbol}</td>
+                            <td style="color:${sideColor}">${fmt(p.net_qty)}</td>
+                            <td>${fmt(p.avg_entry_px)}</td>
+                            <td>${fmt(p.last_mid_px)}</td>
+                            <td style="color:${pnlColor(p.unrealized_pnl)}">${fmtPnl(p.unrealized_pnl)}</td>
+                            <td style="color:${pnlColor(p.realized_pnl)}">${fmtPnl(p.realized_pnl)}</td>
+                            <td style="color:${pnlColor(totalPnl)};font-weight:bold">${fmtPnl(totalPnl)}</td>
+                            <td>${p.trade_count}</td>
+                        </tr>`;
+                    }).join('');
+                })
+                .catch(err => { tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#ef4444;padding:20px">Error: '+err.message+'</td></tr>'; });
+        }
+
+        // ── ALGO tab ──────────────────────────────────────────────────────────────────
+        let _algoCfgCache = null;
+
+        function loadAlgoStatus() {
+            fetch('/api/algo/status')
+                .then(r => r.json())
+                .then(data => {
+                    const cfg = data.config || {};
+                    _algoCfgCache = cfg;
+                    const banner = document.getElementById('algoStatusBanner');
+                    if (cfg.enabled) {
+                        banner.style.background = 'rgba(34,197,94,0.15)';
+                        banner.style.color = '#22c55e';
+                        banner.textContent = '● ALGO ENABLED — trading ' + (cfg.symbol || '') + ' | qty=' + (cfg.order_qty || '') + ' | min_spread=' + (cfg.min_spread_bps || '') + 'bps';
+                    } else {
+                        banner.style.background = 'rgba(75,85,99,0.3)';
+                        banner.style.color = '#9ca3af';
+                        banner.textContent = '○ ALGO DISABLED — configure and enable to start trading';
+                    }
+                    // Populate config fields
+                    document.getElementById('algoCfgSymbol').value = cfg.symbol || '';
+                    document.getElementById('algoCfgQty').value = cfg.order_qty || '';
+                    document.getElementById('algoCfgSpread').value = cfg.min_spread_bps || '';
+                    document.getElementById('algoCfgMaxPos').value = cfg.max_position || '';
+                    document.getElementById('algoCfgPoll').value = cfg.poll_interval_ms || '';
+                    document.getElementById('algoCfgTIF').value = cfg.time_in_force || '';
+                    // Counters
+                    document.getElementById('algoSigCount').textContent = data.signals_fired || 0;
+                    document.getElementById('algoOrdCount').textContent = data.orders_placed || 0;
+                    // Signal log
+                    const signals = data.recent_signals || [];
+                    const logBody = document.getElementById('algoSignalLog');
+                    if (!signals.length) {
+                        logBody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:20px;color:#9ca3af">No signals yet</td></tr>';
+                    } else {
+                        logBody.innerHTML = signals.map(s => {
+                            const t = new Date(s.timestamp_ms).toLocaleTimeString();
+                            const sideLabel = s.side === '1' ? '<span style="color:#10b981">BUY</span>' : '<span style="color:#ef4444">SELL</span>';
+                            return `<tr>
+                                <td>${t}</td>
+                                <td>${s.symbol}</td>
+                                <td>${sideLabel}</td>
+                                <td>${Number(s.price).toFixed(4)}</td>
+                                <td>${s.qty}</td>
+                                <td style="font-size:11px;max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${s.reason}">${s.reason}</td>
+                            </tr>`;
+                        }).join('');
+                    }
+                })
+                .catch(err => { document.getElementById('algoStatusBanner').textContent = 'Error loading algo status: ' + err.message; });
+        }
+
+        function algoEnable() {
+            fetch('/api/algo/enable', {method:'POST'}).then(() => loadAlgoStatus());
+        }
+
+        function algoDisable() {
+            fetch('/api/algo/disable', {method:'POST'}).then(() => loadAlgoStatus());
+        }
+
+        function algoSaveConfig() {
+            const msg = document.getElementById('algoCfgMsg');
+            const cfg = Object.assign({}, _algoCfgCache || {}, {
+                symbol:          document.getElementById('algoCfgSymbol').value,
+                order_qty:       parseFloat(document.getElementById('algoCfgQty').value),
+                min_spread_bps:  parseFloat(document.getElementById('algoCfgSpread').value),
+                max_position:    parseFloat(document.getElementById('algoCfgMaxPos').value),
+                poll_interval_ms:parseInt(document.getElementById('algoCfgPoll').value),
+                time_in_force:   document.getElementById('algoCfgTIF').value,
+            });
+            fetch('/api/algo/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)})
+                .then(r => r.json())
+                .then(() => { msg.textContent = 'Saved ✓'; msg.style.color = '#22c55e'; setTimeout(() => { msg.textContent=''; }, 3000); loadAlgoStatus(); })
+                .catch(err => { msg.textContent = 'Error: ' + err.message; msg.style.color = '#ef4444'; });
+        }
+
+        // ── BACKTEST tab ──────────────────────────────────────────────────────────────
+        let btPriceChartInst = null;
+        let btEquityChartInst = null;
+
+        function initBacktestSymbols() {
+            // Populate symbol selector from same source as other selectors
+            const sel = document.getElementById('btSymbol');
+            if (sel.options.length > 0) return; // already populated
+            fetch('/api/symbols')
+                .then(r => r.json())
+                .then(data => {
+                    const syms = data.symbols || [];
+                    syms.forEach(s => {
+                        const o = document.createElement('option');
+                        o.value = s; o.textContent = s;
+                        sel.appendChild(o);
+                    });
+                    if (!sel.value && syms.length) sel.value = syms[0];
+                })
+                .catch(() => {});
+        }
+
+        function runBacktest() {
+            const btn = document.getElementById('btRunBtn');
+            const status = document.getElementById('btStatus');
+            const symbol   = document.getElementById('btSymbol').value;
+            const limit    = document.getElementById('btLimit').value || 5000;
+            const spread   = document.getElementById('btSpread').value || 5;
+            const qty      = document.getElementById('btQty').value || 0.001;
+            const maxPos   = document.getElementById('btMaxPos').value || 0.01;
+            const tick     = document.getElementById('btTick').value || 0.01;
+
+            if (!symbol) { status.textContent = 'Select a symbol first.'; return; }
+
+            btn.disabled = true;
+            btn.textContent = 'Running…';
+            status.textContent = 'Fetching data and simulating…';
+            document.getElementById('btSummary').style.display = 'none';
+
+            const url = `/api/backtest?symbol=${encodeURIComponent(symbol)}&limit=${limit}&min_spread_bps=${spread}&order_qty=${qty}&max_position=${maxPos}&tick_size=${tick}`;
+
+            fetch(url)
+                .then(r => r.json())
+                .then(data => {
+                    btn.disabled = false;
+                    btn.textContent = 'Run Backtest';
+                    if (data.error) { status.textContent = 'Error: ' + data.error; return; }
+                    renderBacktestResults(data, symbol);
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    btn.textContent = 'Run Backtest';
+                    status.textContent = 'Error: ' + err.message;
+                });
+        }
+
+        function renderBacktestResults(data, symbol) {
+            const s = data.summary || {};
+            const status = document.getElementById('btStatus');
+            status.textContent = `Processed ${s.snapshots_processed || 0} snapshots for ${symbol}`;
+            document.getElementById('btSummary').style.display = 'block';
+
+            // Summary cards
+            const pnlColor = v => v > 0 ? '#10b981' : v < 0 ? '#ef4444' : '#9ca3af';
+            const fmtPnl = v => (v >= 0 ? '+' : '') + Number(v).toFixed(6);
+            document.getElementById('btStatPnl').textContent = fmtPnl(s.total_pnl || 0);
+            document.getElementById('btStatPnl').style.color = pnlColor(s.total_pnl || 0);
+            document.getElementById('btStatTrades').textContent = s.total_trades || 0;
+            document.getElementById('btStatWinRate').textContent = (s.win_rate_pct || 0).toFixed(1) + '%';
+            document.getElementById('btStatDrawdown').textContent = fmtPnl(-(s.max_drawdown || 0));
+            document.getElementById('btStatDrawdown').style.color = '#ef4444';
+            document.getElementById('btStatSharpe').textContent = (s.sharpe_ratio || 0).toFixed(3);
+            document.getElementById('btStatSharpe').style.color = pnlColor(s.sharpe_ratio || 0);
+            document.getElementById('btStatPos').textContent = Number(s.final_position || 0).toFixed(6);
+
+            // Trade log
+            const trades = data.trades || [];
+            document.getElementById('btTradeCount').textContent = `(${trades.length} trades shown)`;
+            const logBody = document.getElementById('btTradeLog');
+            if (!trades.length) {
+                logBody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:20px;color:#9ca3af">No trades fired — try lowering min spread or increasing snapshots</td></tr>';
+            } else {
+                // Show last 200 trades to keep table fast
+                const display = trades.slice(-200);
+                logBody.innerHTML = display.map(t => {
+                    const dt = new Date(t.timestamp_ms).toLocaleString();
+                    const sideLabel = t.side === '1'
+                        ? '<span style="color:#10b981">BUY</span>'
+                        : '<span style="color:#ef4444">SELL</span>';
+                    const pnlStr = t.pnl !== 0 ? fmtPnl(t.pnl) : '-';
+                    const pnlStyle = t.pnl > 0 ? 'color:#10b981' : t.pnl < 0 ? 'color:#ef4444' : '';
+                    return `<tr>
+                        <td style="white-space:nowrap">${dt}</td>
+                        <td>${sideLabel}</td>
+                        <td>${Number(t.price).toFixed(4)}</td>
+                        <td>${t.qty}</td>
+                        <td style="${pnlStyle}">${pnlStr}</td>
+                        <td style="${pnlColor(t.cumulative_pnl) !== '#9ca3af' ? 'color:'+pnlColor(t.cumulative_pnl) : ''}">${fmtPnl(t.cumulative_pnl)}</td>
+                        <td>${Number(t.net_qty_after).toFixed(6)}</td>
+                    </tr>`;
+                }).join('');
+            }
+
+            // ── Price + signals chart ──────────────────────────────────────────
+            const priceSeries = data.price_series || [];
+            const priceLabels = priceSeries.map(p => new Date(p[0]).toLocaleTimeString());
+            const bidData  = priceSeries.map(p => p[1]);
+            const askData  = priceSeries.map(p => p[2]);
+
+            // Create scatter datasets for buy/sell signals
+            // Map each trade to the nearest price series index for x positioning
+            const buyPoints  = [];
+            const sellPoints = [];
+            trades.forEach(t => {
+                const label = new Date(t.timestamp_ms).toLocaleTimeString();
+                const point = { x: label, y: t.price };
+                if (t.side === '1') buyPoints.push(point);
+                else sellPoints.push(point);
+            });
+
+            if (btPriceChartInst) btPriceChartInst.destroy();
+            btPriceChartInst = new Chart(document.getElementById('btPriceChart'), {
+                type: 'line',
+                data: {
+                    labels: priceLabels,
+                    datasets: [
+                        {
+                            label: 'Best Bid',
+                            data: bidData,
+                            borderColor: '#10b981',
+                            backgroundColor: 'rgba(16,185,129,0.05)',
+                            tension: 0.2,
+                            pointRadius: 0,
+                            borderWidth: 1.5,
+                        },
+                        {
+                            label: 'Best Ask',
+                            data: askData,
+                            borderColor: '#ef4444',
+                            backgroundColor: 'rgba(239,68,68,0.05)',
+                            tension: 0.2,
+                            pointRadius: 0,
+                            borderWidth: 1.5,
+                        },
+                        {
+                            label: 'Buy',
+                            data: buyPoints,
+                            type: 'scatter',
+                            borderColor: '#10b981',
+                            backgroundColor: '#10b981',
+                            pointStyle: 'triangle',
+                            pointRadius: 6,
+                            showLine: false,
+                        },
+                        {
+                            label: 'Sell',
+                            data: sellPoints,
+                            type: 'scatter',
+                            borderColor: '#ef4444',
+                            backgroundColor: '#ef4444',
+                            pointStyle: 'triangle',
+                            rotation: 180,
+                            pointRadius: 6,
+                            showLine: false,
+                        },
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: { legend: { labels: { color: '#e5e7eb' } } },
+                    scales: {
+                        x: { ticks: { color: '#9ca3af', maxTicksLimit: 10 }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                        y: { ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                    }
+                }
+            });
+
+            // ── Equity curve chart ────────────────────────────────────────────
+            const equityCurve = data.equity_curve || [];
+            const eqLabels = equityCurve.map(p => new Date(p[0]).toLocaleTimeString());
+            const eqData   = equityCurve.map(p => p[1]);
+
+            if (btEquityChartInst) btEquityChartInst.destroy();
+            btEquityChartInst = new Chart(document.getElementById('btEquityChart'), {
+                type: 'line',
+                data: {
+                    labels: eqLabels,
+                    datasets: [{
+                        label: 'Cumulative P&L',
+                        data: eqData,
+                        borderColor: '#a78bfa',
+                        backgroundColor: 'rgba(167,139,250,0.08)',
+                        tension: 0.3,
+                        pointRadius: 0,
+                        fill: true,
+                        borderWidth: 2,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { labels: { color: '#e5e7eb' } } },
+                    scales: {
+                        x: { ticks: { color: '#9ca3af', maxTicksLimit: 10 }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                        y: { ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } }
+                    }
+                }
+            });
+        }
+
+        // ── SECURITIES tab ───────────────────────────────────────────────────────────
+        function loadSecurities() {
+            const tbody = document.getElementById('securitiesTable');
+            tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:20px">Loading…</td></tr>';
+            fetch('/api/securities')
+                .then(r => r.json())
+                .then(data => {
+                    allSecurities = data.securities || [];
+                    renderSecurities(allSecurities);
+                })
+                .catch(err => { tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:#ef4444;padding:20px">Error: '+err.message+'</td></tr>'; });
+        }
+
+        function renderSecurities(list) {
+            const tbody = document.getElementById('securitiesTable');
+            if (!list.length) {
+                tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:20px">No securities found</td></tr>';
+                return;
+            }
+            tbody.innerHTML = list.map(s => `
+                <tr>
+                    <td style="font-weight:bold;color:#ff6b35">${s.symbol || ''}</td>
+                    <td>${s.security_id || ''}</td>
+                    <td>${s.exchange || ''}</td>
+                    <td style="font-size:11px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${(s.attributes_json||'').replace(/"/g,'&quot;')}">${s.attributes_json || ''}</td>
+                </tr>`).join('');
+        }
+
+        function filterSecurities() {
+            const q = document.getElementById('secSearch').value.toLowerCase();
+            renderSecurities(q ? allSecurities.filter(s => (s.symbol||'').toLowerCase().includes(q)) : allSecurities);
+        }
+
+        // ── boot ─────────────────────────────────────────────────────────────────────
         updateTotalMarkets();
         updateOrderBook();
-        
-        // Update total markets every 5 seconds (less frequent)
         setInterval(updateTotalMarkets, 5000);
-        
-        // Update order book every 500ms
         updateInterval = setInterval(updateOrderBook, 500);
     </script>
 </body>
@@ -3825,6 +4930,8 @@ async fn order_book_web_server(
         market_data_session: Arc<FIXSession>,  // Market data session (has order books)
         market_data_sessions: Vec<(Arc<FIXSession>, String, u16)>,
         all_symbols: Vec<String>,  // All symbols to subscribe to
+        kdb: Arc<KdbWriter>,  // kdb+ connection for historical queries
+        algo: Arc<algo::TradingAlgo>,  // Trading algorithm
     }
     
     let all_symbols_list = vec![
@@ -3847,6 +4954,8 @@ async fn order_book_web_server(
         market_data_session: Arc::clone(&market_data_session),
         market_data_sessions: market_data_sessions.clone(),
         all_symbols: all_symbols_list.clone(),
+        kdb: Arc::clone(&kdb_writer),
+        algo: Arc::clone(&algo),
     };
     
     // API endpoint to get order book data
@@ -4075,18 +5184,359 @@ async fn order_book_web_server(
         }
     }
     
+    fn escape_kdb_string(value: &str) -> String {
+        value.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    // Build a WHERE predicate that safely handles symbols with punctuation by
+    // constructing a symbol atom via `$"..."` instead of raw backtick literals.
+    fn build_kdb_symbol_predicate(symbol: &str) -> String {
+        format!("symbol=`$\"{}\"", escape_kdb_string(symbol))
+    }
+
+    // GET /api/history/:symbol — last 500 best-bid/ask snapshots for a symbol (from kdb+)
+    async fn get_history_api(
+        AxumPath(symbol): AxumPath<String>,
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> impl axum::response::IntoResponse {
+        use axum::http::header;
+        // Use binary IPC to avoid .j.j 'type errors with timestamp$ columns.
+        // The K table is converted to JSON on the Rust side; "time" comes out as Unix ms integer.
+        let symbol_predicate = build_kdb_symbol_predicate(&symbol);
+        let q = format!(
+            "neg[500] sublist select from orderbook_snapshots where {}",
+            symbol_predicate
+        );
+        match state.kdb.query_table_to_json(&q).await {
+            Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json),
+            Err(e) => {
+                let payload = serde_json::json!({
+                    "error": format!("kdb+ query failed: {}", e),
+                    "context": {
+                        "symbol": symbol,
+                        "where": symbol_predicate
+                    }
+                });
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    payload.to_string(),
+                )
+            }
+        }
+    }
+
+    // GET /api/securities — all securities from kdb+
+    async fn get_securities_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> impl axum::response::IntoResponse {
+        use axum::http::header;
+        // Deduplicate: keep only the last record per symbol
+        let q = "select last time, last security_id, last exchange, last attributes_json by symbol from securities";
+        match state.kdb.query_json(q).await {
+            Ok(raw_json) => {
+                // .j.j on a keyed table returns an object; unwrap into array of records
+                let securities_json = match serde_json::from_str::<serde_json::Value>(&raw_json) {
+                    Ok(v) => {
+                        // Keyed table result: object whose keys are symbols and values are row objects
+                        let arr: Vec<serde_json::Value> = if let Some(obj) = v.as_object() {
+                            obj.iter().map(|(sym, row)| {
+                                let mut rec = row.clone();
+                                if let Some(m) = rec.as_object_mut() {
+                                    m.insert("symbol".to_string(), serde_json::Value::String(sym.clone()));
+                                }
+                                rec
+                            }).collect()
+                        } else if let Some(arr) = v.as_array() {
+                            arr.clone()
+                        } else {
+                            vec![v]
+                        };
+                        serde_json::json!({ "securities": arr, "count": arr.len() })
+                    }
+                    Err(_) => serde_json::json!({ "securities": [], "error": raw_json }),
+                };
+                (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
+                 securities_json.to_string())
+            }
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, [(header::CONTENT_TYPE, "application/json")],
+                       format!("{{\"error\":\"{}\"}}", e)),
+        }
+    }
+
+    // GET /api/orders/history — execution reports from orders/processed/*.json
+    async fn get_orders_history_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        // Fall back to open orders store for current orders
+        let open_orders = state.order_session.open_orders.get_open_orders();
+        let mut orders: Vec<serde_json::Value> = open_orders.iter().map(|o| serde_json::json!({
+            "cl_ord_id": o.cl_ord_id, "order_id": o.order_id, "symbol": o.symbol,
+            "side": o.side, "order_qty": o.order_qty, "price": o.price,
+            "ord_status": o.ord_status, "exec_type": o.exec_type,
+            "cum_qty": o.cum_qty, "leaves_qty": o.leaves_qty,
+            "avg_px": o.avg_px, "transact_time": o.transact_time,
+            "order_create_time": o.order_create_time, "rejection_reason": o.rejection_reason,
+        })).collect();
+
+        // Also load saved JSON files from orders/processed/
+        if let Ok(mut dir) = tokio::fs::read_dir("orders/processed").await {
+            while let Ok(Some(entry)) = dir.next_entry().await {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Ok(contents) = tokio::fs::read_to_string(&path).await {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&contents) {
+                            // Extract the execution_report section if present
+                            let record = v.get("execution_report").cloned().unwrap_or(v);
+                            orders.push(record);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(Json(serde_json::json!({ "orders": orders, "count": orders.len() })))
+    }
+
+    // GET /api/positions — live position snapshot with unrealized P&L from order book
+    async fn get_positions_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        let mut positions = state.order_session.positions.snapshot();
+
+        // Refresh unrealized P&L from live order book mid prices
+        {
+            let books = state.market_data_session.order_books.lock().await;
+            for pos in positions.iter_mut() {
+                if let Some(db) = books.get(&pos.symbol) {
+                    let snap = db.get_snapshot();
+                    let mid = snap.mid_price();
+                    pos.refresh_unrealized(mid);
+                }
+            }
+        }
+
+        // Sort by absolute net_qty descending
+        positions.sort_by(|a, b| b.net_qty.abs().partial_cmp(&a.net_qty.abs()).unwrap_or(std::cmp::Ordering::Equal));
+
+        let positions_json: Vec<serde_json::Value> = positions.iter().map(|p| {
+            serde_json::json!({
+                "symbol": p.symbol,
+                "net_qty": p.net_qty,
+                "avg_entry_px": p.avg_entry_px,
+                "realized_pnl": p.realized_pnl,
+                "unrealized_pnl": p.unrealized_pnl,
+                "last_mid_px": p.last_mid_px,
+                "trade_count": p.trade_count
+            })
+        }).collect();
+
+        Ok(Json(serde_json::json!({
+            "positions": positions_json,
+            "count": positions_json.len()
+        })))
+    }
+
+    // GET /api/algo/status — current algo configuration and stats
+    async fn get_algo_status_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Json<serde_json::Value> {
+        let status = state.algo.status().await;
+        Json(serde_json::to_value(&status).unwrap_or_default())
+    }
+
+    // POST /api/algo/enable — enable the trading algo
+    async fn algo_enable_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Json<serde_json::Value> {
+        let mut cfg = state.algo.config.lock().await.clone();
+        cfg.enabled = true;
+        state.algo.update_config(cfg).await;
+        Json(serde_json::json!({"ok": true, "enabled": true}))
+    }
+
+    // POST /api/algo/disable — disable the trading algo
+    async fn algo_disable_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Json<serde_json::Value> {
+        let mut cfg = state.algo.config.lock().await.clone();
+        cfg.enabled = false;
+        state.algo.update_config(cfg).await;
+        Json(serde_json::json!({"ok": true, "enabled": false}))
+    }
+
+    // POST /api/algo/config — update algo config fields
+    async fn algo_config_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+        Json(new_cfg): Json<algo::AlgoConfig>,
+    ) -> Json<serde_json::Value> {
+        state.algo.update_config(new_cfg).await;
+        Json(serde_json::json!({"ok": true}))
+    }
+
+    // Load historical snapshots from data/snapshots.csv.
+    // Used as fallback when KDB+ has no in-memory snapshot data.
+    // CSV columns: timestamp_ms,symbol,best_bid,best_ask
+    fn load_snapshots_from_csv(symbol: &str, limit: usize) -> Vec<algo::Snapshot> {
+        use std::io::BufRead;
+        let file = match std::fs::File::open("data/snapshots.csv") {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let reader = std::io::BufReader::new(file);
+        let mut snapshots: Vec<algo::Snapshot> = Vec::new();
+        let mut first_line = true;
+
+        for line in reader.lines().flatten() {
+            if first_line {
+                first_line = false;
+                continue; // skip header
+            }
+            let cols: Vec<&str> = line.splitn(4, ',').collect();
+            if cols.len() < 4 {
+                continue;
+            }
+            if cols[1] != symbol {
+                continue;
+            }
+            let timestamp_ms: i64 = cols[0].parse().unwrap_or(0);
+            let best_bid: f64   = cols[2].parse().unwrap_or(0.0);
+            let best_ask: f64   = cols[3].parse().unwrap_or(0.0);
+            if best_bid > 0.0 && best_ask > 0.0 && best_ask > best_bid {
+                snapshots.push(algo::Snapshot { timestamp_ms, best_bid, best_ask });
+            }
+        }
+
+        // Return the most recent `limit` rows (CSV is chronological).
+        if snapshots.len() > limit {
+            snapshots.drain(..snapshots.len() - limit);
+        }
+        snapshots
+    }
+
+    // GET /api/backtest — run backtest simulation against historical kdb+ snapshots
+    // Query params: symbol, limit, min_spread_bps, order_qty, max_position, tick_size
+    async fn get_backtest_api(
+        axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> impl axum::response::IntoResponse {
+        use axum::http::header;
+
+        let symbol = params.get("symbol").cloned().unwrap_or_else(|| "BTC_USDT".to_string());
+        let limit: usize = params
+            .get("limit")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000)
+            .clamp(1, 100_000);
+        let min_spread_bps: f64 = params.get("min_spread_bps").and_then(|v| v.parse().ok()).unwrap_or(5.0);
+        let order_qty: f64 = params.get("order_qty").and_then(|v| v.parse().ok()).unwrap_or(0.001);
+        let max_position: f64 = params.get("max_position").and_then(|v| v.parse().ok()).unwrap_or(0.01);
+        let tick_size: f64 = params.get("tick_size").and_then(|v| v.parse().ok()).unwrap_or(0.01);
+
+        // Build an AlgoConfig for this backtest run (enabled flag doesn't matter here)
+        let cfg = algo::AlgoConfig {
+            enabled: false,
+            symbol: symbol.clone(),
+            order_qty,
+            min_spread_bps,
+            max_position,
+            poll_interval_ms: 1000,
+            tick_size,
+            time_in_force: "3".to_string(),
+        };
+
+        // Query kdb+ for historical snapshots. On any error or empty result, fall back
+        // to data/ticks.csv so backtests work even when kdb+ has no in-memory data.
+        let symbol_predicate = build_kdb_symbol_predicate(&symbol);
+        let q = format!(
+            "neg[{}] sublist select time, best_bid, best_ask from orderbook_snapshots where {}",
+            limit, symbol_predicate
+        );
+        let kdb_snapshots: Vec<algo::Snapshot> = match state.kdb.query_table_to_json(&q).await {
+            Err(e) => {
+                info!("📊 kdb+ query error ({}), using CSV fallback", e);
+                Vec::new()
+            }
+            Ok(raw_json) => {
+                match serde_json::from_str::<serde_json::Value>(&raw_json) {
+                    Err(_) => Vec::new(),
+                    Ok(parsed) => {
+                        match parsed.as_array() {
+                            None => Vec::new(),
+                            Some(rows) => rows.iter().filter_map(|row| {
+                                let timestamp_ms = row.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
+                                let best_bid = row.get("best_bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let best_ask = row.get("best_ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                if best_bid > 0.0 && best_ask > 0.0 {
+                                    Some(algo::Snapshot { timestamp_ms, best_bid, best_ask })
+                                } else {
+                                    None
+                                }
+                            }).collect()
+                        }
+                    }
+                }
+            }
+        };
+
+        // If KDB+ returned nothing (empty table or error), fall back to data/ticks.csv.
+        let (snapshots, data_source) = if kdb_snapshots.is_empty() {
+            let csv_snaps = load_snapshots_from_csv(&symbol, limit);
+            (csv_snaps, "csv")
+        } else {
+            (kdb_snapshots, "kdb")
+        };
+
+        if snapshots.is_empty() {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": "No snapshot data found for this symbol",
+                    "hint": "Run the server connected to live market data to accumulate snapshots. Data is auto-saved to data/ticks.csv every 60 seconds."
+                }).to_string(),
+            );
+        }
+
+        // Run the simulation
+        info!("📊 Backtest: {} snapshots from {} for {}", snapshots.len(), data_source, symbol);
+        let result = algo::run_backtest(&cfg, &snapshots);
+
+        match serde_json::to_string(&result) {
+            Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CONTENT_TYPE, "application/json")],
+                format!("{{\"error\":\"Serialization failed: {}\"}}", e),
+            ),
+        }
+    }
+
     // Build the router
     let html_page_clone = html_page.to_string();
     let app = Router::new()
         .route("/", get(move || {
             let html = html_page_clone.clone();
-            async move { Html(html) }
+            async move {
+                let mut headers = axum::http::HeaderMap::new();
+                headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store, no-cache, must-revalidate"));
+                (headers, Html(html))
+            }
         }))
         .route("/api/orderbook/:symbol", get(get_order_book_api))
         .route("/api/symbols", get(list_symbols_api))
         .route("/api/open-orders", get(get_open_orders_api))
         .route("/api/market-data-status", get(get_all_market_data_status_api))
         .route("/api/subscribe-all-symbols/:port", post(subscribe_all_symbols_api))
+        .route("/api/history/:symbol", get(get_history_api))
+        .route("/api/securities", get(get_securities_api))
+        .route("/api/orders/history", get(get_orders_history_api))
+        .route("/api/positions", get(get_positions_api))
+        .route("/api/algo/status", get(get_algo_status_api))
+        .route("/api/algo/enable", post(algo_enable_api))
+        .route("/api/algo/disable", post(algo_disable_api))
+        .route("/api/algo/config", post(algo_config_api))
+        .route("/api/backtest", get(get_backtest_api))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
     
@@ -4567,23 +6017,31 @@ async fn main() -> Result<()> {
     // Note: Management Console has been moved to a standalone program
     // Run: cargo run --bin fix_console
     
-    // Web server disabled - using kdb+ for data access instead
-    // Uncomment the code below to re-enable the web server:
-    /*
+    // Web server — serves the trading UI and API endpoints on port 8080
     let order_session_for_web = Arc::clone(&session);
     let market_data_for_web = Arc::clone(&market_data_session);
     let market_data_sessions_for_web = vec![
-        Arc::clone(&market_data_session),
-        Arc::clone(&market_data_others_34405),
-        Arc::clone(&market_data_others_34406),
-        Arc::clone(&market_data_others_34407),
+        (Arc::clone(&market_data_session),        "BTC Market Data".to_string(),    config.market_data_btc.gateway_url.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(34404_u16)),
+        (Arc::clone(&market_data_others_34405),   "Others 34405".to_string(),       config.market_data_others.port_34405),
+        (Arc::clone(&market_data_others_34406),   "Others 34406".to_string(),       config.market_data_others.port_34406),
+        (Arc::clone(&market_data_others_34407),   "Others 34407".to_string(),       config.market_data_others.port_34407),
     ];
-    let web_server_handle = tokio::spawn(async move {
-        if let Err(e) = order_book_web_server(order_session_for_web, market_data_for_web, market_data_sessions_for_web, "0.0.0.0:8080").await {
+    // Trading Algo — starts disabled; enable via web UI or API (must be created before web server)
+    let algo = Arc::new(algo::TradingAlgo::new(algo::AlgoConfig::default()));
+    let algo_for_web = Arc::clone(&algo);
+    let algo_order_session = Arc::clone(&session);
+    let algo_market_session = Arc::clone(&market_data_session);
+    let algo_positions = Arc::clone(&session.positions);
+    let _algo_handle = tokio::spawn(async move {
+        algo.run(algo_order_session, algo_market_session, algo_positions).await;
+    });
+
+    let kdb_for_web = Arc::clone(&kdb_writer);
+    let _web_server_handle = tokio::spawn(async move {
+        if let Err(e) = order_book_web_server(order_session_for_web, market_data_for_web, market_data_sessions_for_web, kdb_for_web, algo_for_web, "0.0.0.0:8080").await {
             error!("Fatal error in web server: {}", e);
         }
     });
-    */
     
     // Open Orders CSV Generator - event-driven (updates immediately on execution reports)
     let open_orders_store = Arc::clone(&session.open_orders);
@@ -4591,6 +6049,18 @@ async fn main() -> Result<()> {
     let _csv_generator_handle = tokio::spawn(async move {
         if let Err(e) = open_orders_csv_generator_event_driven(open_orders_store, csv_update_rx).await {
             error!("Fatal error in open orders CSV generator: {}", e);
+        }
+    });
+
+    // Auto-save tick data to data/ticks.csv every 60 seconds for backtest persistence.
+    // Uses append mode so data accumulates across server sessions.
+    let market_data_for_autosave = Arc::clone(&market_data_session);
+    let _tick_autosave_handle = tokio::spawn(async move {
+        let mut save_interval = interval(Duration::from_secs(60));
+        save_interval.tick().await; // skip the immediate first tick
+        loop {
+            save_interval.tick().await;
+            let _ = market_data_for_autosave.save_ticks_to_parquet("data/ticks.csv").await;
         }
     });
 
@@ -4602,9 +6072,6 @@ async fn main() -> Result<()> {
             error!("Fatal error in ZeroMQ publisher: {}", e);
         }
     });
-
-    // Web server disabled - using kdb+ for data access instead
-    // Console queries kdb+ directly via IPC
 
     // Wait for initial connections and logons
     info!("Waiting for connections and logons to complete...");

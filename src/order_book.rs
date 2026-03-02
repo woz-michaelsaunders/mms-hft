@@ -180,10 +180,13 @@ impl OrderBook {
                 if let Some(idx) = dense_idx {
                     self.bids[idx] = level;
                 } else {
-                    if size_scaled > 0 {
-                        self.sparse_bids.insert(price_cents, level.unwrap());
-                    } else {
-                        self.sparse_bids.remove(&price_cents);
+                    // Price has drifted outside the dense range — re-center and clear
+                    // stale sparse entries to prevent unbounded HashMap growth.
+                    self.adjust_price_base(price_cents);
+                    self.sparse_bids.clear();
+                    self.sparse_asks.clear();
+                    if let Some(idx) = self.get_dense_index(price_cents) {
+                        self.bids[idx] = level;
                     }
                 }
                 self.update_best_bid()
@@ -193,10 +196,13 @@ impl OrderBook {
                 if let Some(idx) = dense_idx {
                     self.asks[idx] = level;
                 } else {
-                    if size_scaled > 0 {
-                        self.sparse_asks.insert(price_cents, level.unwrap());
-                    } else {
-                        self.sparse_asks.remove(&price_cents);
+                    // Price has drifted outside the dense range — re-center and clear
+                    // stale sparse entries to prevent unbounded HashMap growth.
+                    self.adjust_price_base(price_cents);
+                    self.sparse_bids.clear();
+                    self.sparse_asks.clear();
+                    if let Some(idx) = self.get_dense_index(price_cents) {
+                        self.asks[idx] = level;
                     }
                 }
                 self.update_best_ask()
