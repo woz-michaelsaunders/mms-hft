@@ -19,7 +19,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use zmq;
-use order_book::{OrderBook, Side, UpdateAction};
+use order_book::{OrderBookSnapshot, Side, UpdateAction};
 use order_book_buffer::DoubleBufferedOrderBook;
 use arc_swap::ArcSwap;
 use kdb_integration::KdbWriter;
@@ -34,25 +34,6 @@ use tower_http::cors::CorsLayer;
 
 const MAX_TICK_BUFFER: usize = 10_000;
 
-// #region agent log
-const DEBUG_LOG_PATH: &str = "/home/ubuntu/fix_server/.cursor/debug.log";
-fn debug_log(location: &str, message: &str, data: serde_json::Value, hypothesis_id: &str) {
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis();
-    let id = format!("log_{}_{}", ts, hypothesis_id);
-    let line = serde_json::json!({
-        "id": id,
-        "timestamp": ts as u64,
-        "location": location,
-        "message": message,
-        "data": data,
-        "hypothesisId": hypothesis_id
-    });
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(DEBUG_LOG_PATH) {
-        let _ = writeln!(f, "{}", line.to_string());
-        let _ = f.sync_all();
-    }
-}
-// #endregion
 
 // Configuration structure
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -537,16 +518,10 @@ impl FIXSession {
 
                     *self.stream.lock().await = Some(stream);
                     *self.connection_state.lock().await = ConnectionState::Connected;
-                    // #region agent log
-                    debug_log("main.rs:connect_with_retry", "connect_success", serde_json::json!({ "attempt": attempt, "gateway_url": gateway_url }), "H4");
-                    // #endregion
                     info!("✅ Connected successfully to FIX gateway at attempt {}", attempt);
                     return Ok(());
                 }
                 Ok(Err(e)) => {
-                    // #region agent log
-                    debug_log("main.rs:connect_with_retry", "connect_fail", serde_json::json!({ "attempt": attempt, "err": e.to_string(), "gateway_url": gateway_url }), "H4");
-                    // #endregion
                     error!("Connection attempt {} failed: {}", attempt, e);
 
                     if attempt >= max_attempts {
@@ -563,9 +538,6 @@ impl FIXSession {
                     backoff = std::cmp::min(backoff * 2, 30_000);
                 }
                 Err(_) => {
-                    // #region agent log
-                    debug_log("main.rs:connect_with_retry", "connect_timeout", serde_json::json!({ "attempt": attempt, "gateway_url": gateway_url }), "H4");
-                    // #endregion
                     error!("Connection attempt {} timeout (30s)", attempt);
 
                     if attempt >= max_attempts {
@@ -1025,7 +997,7 @@ impl FIXSession {
     }
 
     /// Get snapshot of order book for a symbol (lock-free read)
-    pub async fn get_order_book_snapshot(&self, symbol: &str) -> Option<Arc<OrderBook>> {
+    pub async fn get_order_book_snapshot(&self, symbol: &str) -> Option<Arc<OrderBookSnapshot>> {
         let books = self.order_books.lock().await;
         books.get(symbol).map(|book| book.get_snapshot())
     }
@@ -1034,12 +1006,11 @@ impl FIXSession {
     pub async fn get_best_quote(&self, symbol: &str) -> Option<(f64, f64, f64)> {
         let books = self.order_books.lock().await;
         if let Some(book) = books.get(symbol) {
-            let snapshot = book.get_snapshot();
-            let bid = snapshot.best_bid();
-            let ask = snapshot.best_ask();
-            let spread = snapshot.spread();
+            let snap = book.get_snapshot();
+            let bid = snap.best_bid;
+            let ask = snap.best_ask;
             if bid > 0.0 && ask > 0.0 {
-                Some((bid, ask, spread))
+                Some((bid, ask, snap.spread()))
             } else {
                 None
             }
@@ -1052,8 +1023,7 @@ impl FIXSession {
     pub async fn get_order_book_depth(&self, symbol: &str, side: Side, depth: usize) -> Vec<(f64, f64)> {
         let books = self.order_books.lock().await;
         if let Some(book) = books.get(symbol) {
-            let snapshot = book.get_snapshot();
-            snapshot.get_depth(side, depth)
+            book.get_snapshot().get_depth(side, depth)
         } else {
             Vec::new()
         }
@@ -2514,14 +2484,6 @@ async fn message_loop(
                             }
                         }
                         Err(e) => {
-                            // #region agent log
-                            debug_log(
-                                "main.rs:message_loop",
-                                "receive_message_err",
-                                serde_json::json!({ "err": e.to_string(), "loop_type": "order_management", "gateway_url": gateway_url }),
-                                "H2_H3",
-                            );
-                            // #endregion
                             warn!("⚠️  Connection closed: {}", e);
                             connection_active = false;
                         }
@@ -2531,9 +2493,6 @@ async fn message_loop(
         }
 
         // Wait before reconnecting
-        // #region agent log
-        debug_log("main.rs:message_loop", "connection_loop_exited", serde_json::json!({ "loop_type": "order_management" }), "H2_H3");
-        // #endregion
         info!("Reconnecting in 5 seconds...");
         sleep(Duration::from_secs(5)).await;
     }
@@ -2740,14 +2699,6 @@ async fn market_data_loop(
                         info!("📦 Waiting for complete FIX message: {}", err_str);
                         continue;
                     } else {
-                        // #region agent log
-                        debug_log(
-                            "main.rs:market_data_loop",
-                            "receive_message_err",
-                            serde_json::json!({ "err": err_str, "loop_type": "market_data", "gateway_url": gateway_url }),
-                            "H2_H3",
-                        );
-                        // #endregion
                         warn!("⚠️  Market Data connection closed: {}", e);
                         connection_active = false;
                     }
@@ -2775,22 +2726,12 @@ async fn heartbeat_loop(session: Arc<FIXSession>, heartbeat_interval: u64) -> Re
         // Only send heartbeat if session is ready (logon ACK received)
         if session.is_ready().await {
             match session.heartbeat().await {
-                Ok(()) => {
-                    // #region agent log
-                    debug_log("main.rs:heartbeat_loop", "heartbeat_sent", serde_json::json!({}), "H1");
-                    // #endregion
-                }
+                Ok(()) => {}
                 Err(e) => {
-                    // #region agent log
-                    debug_log("main.rs:heartbeat_loop", "heartbeat_error", serde_json::json!({ "err": e.to_string() }), "H1");
-                    // #endregion
                     warn!("Heartbeat error: {}", e);
                 }
             }
         } else {
-            // #region agent log
-            debug_log("main.rs:heartbeat_loop", "heartbeat_skipped", serde_json::json!({ "reason": "session_not_ready" }), "H1");
-            // #endregion
             // Session not ready yet - skip this heartbeat
             // This prevents sending heartbeats before logon ACK is received
         }
@@ -3182,8 +3123,8 @@ async fn zmq_order_book_publisher_event_driven(
             };
             
             if let Some(order_book) = snapshot {
-                let best_bid = order_book.best_bid();
-                let best_ask = order_book.best_ask();
+                let best_bid = order_book.best_bid;
+                let best_ask = order_book.best_ask;
                 
                 log::info!("📊 Order book snapshot: best_bid={}, best_ask={}", best_bid, best_ask);
                 
@@ -3339,8 +3280,8 @@ async fn zmq_order_book_publisher(session: Arc<FIXSession>, bind_addr: &str) -> 
         
         if let Some(order_book) = snapshot {
             let symbol = "BTC_USDT";
-            let best_bid = order_book.best_bid();
-            let best_ask = order_book.best_ask();
+            let best_bid = order_book.best_bid;
+            let best_ask = order_book.best_ask;
             
             // Only publish if order book has valid data
             if best_bid > 0.0 && best_ask > 0.0 {
@@ -4967,8 +4908,8 @@ async fn order_book_web_server(
         let snapshot = state.market_data_session.get_order_book_snapshot(&symbol).await;
         
         if let Some(order_book) = snapshot {
-            let best_bid = order_book.best_bid();
-            let best_ask = order_book.best_ask();
+            let best_bid = order_book.best_bid;
+            let best_ask = order_book.best_ask;
             let spread = order_book.spread();
             
             // Get depth (top 20 levels)
@@ -5777,8 +5718,8 @@ async fn display_market_data_debug(sessions: &[(Arc<FIXSession>, String, u16)]) 
             
             for (symbol, book) in symbol_list.iter().take(5) {
                 let snapshot = book.get_snapshot();
-                let bid = snapshot.best_bid();
-                let ask = snapshot.best_ask();
+                let bid = snapshot.best_bid;
+                let ask = snapshot.best_ask;
                 let spread = snapshot.spread();
                 
                 if bid > 0.0 && ask > 0.0 {
@@ -6077,123 +6018,6 @@ async fn main() -> Result<()> {
     info!("Waiting for connections and logons to complete...");
     sleep(Duration::from_secs(3)).await;
 
-    // Send a single test order and verify successful placement
-    info!("📊 Submitting single test order...");
-    info!("");
-
-    let test_order = OrderRequest {
-        cl_ord_id: "TEST_ORDER_001".to_string(),
-        symbol: "BTC_USDT".to_string(),  // Correct format with underscore
-        side: '1',  // Buy
-        qty: 0.001,
-        price: Some(45000.0),
-        ord_type: None,
-        time_in_force: None,
-        currency: None,
-        exec_inst: None,
-        quote_id: None,
-        cash_order_qty: None,
-        cash_margin: None,
-        trigger_price_type: None,
-        self_match_prevention_scope: None,
-        self_match_prevention_instruction: None,
-        self_match_prevention_id: None,
-        broker_id: None,
-        receive_window: None,
-    };
-
-    info!("Test Order Details:");
-    info!("  Client Order ID: {}", test_order.cl_ord_id);
-    info!("  Symbol: {}", test_order.symbol);
-    info!("  Side: {} (1=Buy, 2=Sell)", test_order.side);
-    info!("  Quantity: {}", test_order.qty);
-    if let Some(price) = test_order.price {
-        info!("  Price: {}", price);
-    } else {
-        info!("  Price: N/A (MARKET order)");
-    }
-    info!("");
-
-    if order_tx.send(test_order.clone()).await.is_err() {
-        error!("Failed to send test order to queue");
-    } else {
-        info!("✅ Test order queued for submission");
-    }
-
-    // Wait a bit for order to be processed
-    info!("Waiting for order processing (5 seconds)...");
-    sleep(Duration::from_secs(5)).await;
-
-    // Send order status request to check order status
-    info!("");
-    info!("📋 Requesting order status...");
-    if let Err(e) = session.order_status_request(&test_order.cl_ord_id, &test_order.symbol).await {
-        error!("Failed to send order status request: {}", e);
-    }
-
-    // Wait for status response (30 seconds)
-    info!("Waiting for status response (30 seconds)...");
-    sleep(Duration::from_secs(30)).await;
-
-    // Wait for market data responses (SecurityListRequest is sent immediately after logon in market_data_loop)
-    info!("");
-    info!("🔗 Waiting for market data server responses...");
-    sleep(Duration::from_secs(20)).await;
-
-    info!("");
-    info!("═══════════════════════════════════════════════════════════");
-    info!("Order latency test complete.");
-    info!("═══════════════════════════════════════════════════════════");
-    
-    // Wait for order book to be populated before placing test orders
-    info!("");
-    info!("⏳ Waiting for order book to be populated...");
-    let mut order_book_ready = false;
-    for _ in 0..30 {
-        // Check if order book has data
-        let books = market_data_session.order_books.lock().await;
-        if let Some(book) = books.get("BTC_USDT") {
-            let bid = book.get_active().best_bid();
-            let ask = book.get_active().best_ask();
-            if bid > 0.0 && ask > 0.0 {
-                info!("✅ Order book ready: Bid={:.2}, Ask={:.2}", bid, ask);
-                order_book_ready = true;
-                drop(books);
-                break;
-            }
-        }
-        drop(books);
-        sleep(Duration::from_secs(1)).await;
-    }
-    
-    if order_book_ready {
-        // Place small test orders to generate trades
-        info!("");
-        if let Err(e) = market_data_session.place_test_orders_for_trades(Arc::clone(&session), "BTC_USDT", 4).await {
-            warn!("Failed to place test orders: {}", e);
-        }
-        
-        // Wait for trades to appear
-        info!("");
-        info!("⏳ Waiting 10 seconds for trades to appear in order book...");
-        sleep(Duration::from_secs(10)).await;
-        
-        // Check trade count
-        let books = market_data_session.order_books.lock().await;
-        if let Some(book) = books.get("BTC_USDT") {
-            let trade_count = book.get_active().trade_count();
-            info!("📊 Current trade count in order book: {}", trade_count);
-            if trade_count > 0 {
-                let recent_trades = book.get_active().get_recent_trades(10);
-                info!("   Recent trades:");
-                for (price, size, timestamp) in recent_trades {
-                    info!("     Price: {:.2}, Size: {}, Time: {}", price, size, timestamp);
-                }
-            }
-        }
-    } else {
-        warn!("⚠️  Order book not ready, skipping test order placement");
-    }
     info!("");
     info!("🔄 Server running continuously - all services active:");
     info!("   ✓ Order Management Gateway connection");

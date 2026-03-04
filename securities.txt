@@ -24,8 +24,8 @@ Total Securities: 26
 
 4. Symbol: BTC_USD
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 5. Symbol: VET_BTC
    Attributes:
@@ -34,8 +34,8 @@ Total Securities: 26
 
 6. Symbol: SOL_BTC
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 7. Symbol: XRP_BTC
    Attributes:
@@ -54,13 +54,13 @@ Total Securities: 26
 
 10. Symbol: ADA_BTC
    Attributes:
-     Tag 871: 1012
      Tag 872: true
+     Tag 871: 1012
 
 11. Symbol: SUI_BTC
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 12. Symbol: TRUMP_BTC
    Attributes:
@@ -99,13 +99,13 @@ Total Securities: 26
 
 19. Symbol: LTC_BTC
    Attributes:
-     Tag 871: 1012
      Tag 872: true
+     Tag 871: 1012
 
 20. Symbol: WBTC_USD
    Attributes:
-     Tag 871: 1012
      Tag 872: false
+     Tag 871: 1012
 
 21. Symbol: MASK_BTC
    Attributes:
@@ -114,13 +114,13 @@ Total Securities: 26
 
 22. Symbol: DOGE_BTC
    Attributes:
-     Tag 871: 1012
      Tag 872: true
+     Tag 871: 1012
 
 23. Symbol: BTC_HKD
    Attributes:
-     Tag 871: 1012
      Tag 872: false
+     Tag 871: 1012
 
 24. Symbol: AVAX_BTC
    Attributes:
@@ -129,8 +129,8 @@ Total Securities: 26
 
 25. Symbol: BTC_EUR
    Attributes:
-     Tag 872: true
      Tag 871: 1012
+     Tag 872: true
 
 26. Symbol: ATOM_BTC
    Attributes:

@@ -149,10 +149,8 @@ impl TradingAlgo {
         best_ask: f64,
         net_position: f64,
     ) -> Vec<Signal> {
-        let signals = Vec::new();
-
         if best_bid <= 0.0 || best_ask <= 0.0 || best_ask <= best_bid {
-            return signals;
+            return vec![];
         }
 
         let spread = best_ask - best_bid;
@@ -160,7 +158,7 @@ impl TradingAlgo {
 
         if spread_bps < cfg.min_spread_bps {
             debug!("Spread {:.2} bps < min {:.2} bps — no signal", spread_bps, cfg.min_spread_bps);
-            return signals;
+            return vec![];
         }
 
         let ts = Utc::now().timestamp_millis();
@@ -274,7 +272,7 @@ impl TradingAlgo {
                 books.get(&cfg.symbol)
                     .map(|db| {
                         let snap = db.get_snapshot();
-                        (snap.best_bid(), snap.best_ask())
+                        (snap.best_bid, snap.best_ask)
                     })
                     .unwrap_or((0.0, 0.0))
             };

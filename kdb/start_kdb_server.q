@@ -83,12 +83,12 @@ system "t 30000";
 system "p ", string port;
 show "kdb+ server listening on port ", string port;
 show "Tables initialized:";
-show "  - orderbook_levels (symbol indexed with g#)";
-show "  - trades (symbol indexed with g#)";
-show "  - orderbook_snapshots (symbol indexed with g#)";
-show "  - securities (symbol indexed with g#)";
-show "  - own_trades (own execution fills, symbol indexed with g#)";
-show "Persistence: tables saved to kdb/hdb/ every 5 minutes and reloaded on startup";
+show "  - orderbook_levels (plain scan; g# intentionally disabled)";
+show "  - trades (plain scan; g# intentionally disabled)";
+show "  - orderbook_snapshots (plain scan; g# intentionally disabled)";
+show "  - securities (plain scan; g# intentionally disabled)";
+show "  - own_trades (own execution fills; plain scan)";
+show "Persistence: tables saved to kdb/hdb/ every minute and reloaded on startup";
 
 // Example queries:
 // select count by symbol from own_trades

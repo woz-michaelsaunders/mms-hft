@@ -207,36 +207,14 @@ impl KdbWriter {
         Ok(())
     }
 
-    /// Execute a q expression via IPC using kxkdb (async for speed)
-    async fn execute_q_async(&self, q_code: &str) -> Result<()> {
-        if !*self.connected.lock().await {
-            return Err(anyhow!("Not connected to kdb+"));
-        }
-        
-        let mut stream_guard = self.stream.lock().await;
-        let stream = stream_guard.as_mut()
-            .ok_or_else(|| anyhow!("Stream not available"))?;
-        
-        // Use async message for speed (no response wait)
-        match stream.send_async_message(&q_code).await {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                warn!("Failed to execute q code async: {} - Error: {}", q_code, e);
-                Err(anyhow!("kdb+ execution error: {}", e))
-            }
-        }
-    }
-
-    /// Execute a single insert statement (helper for batch inserts)
+    /// Fire-and-forget bulk insert — sends an async message (no response wait).
+    /// Used by all flush_*_batch functions for high-throughput data writes.
     async fn execute_single_insert(stream: &Arc<Mutex<Option<QStream>>>, q_code: &str) -> Result<()> {
         let mut stream_guard = stream.lock().await;
         let qstream = stream_guard.as_mut()
             .ok_or_else(|| anyhow!("Stream not available"))?;
-        // Use sync message to get error feedback
-        match qstream.send_sync_message(&q_code).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(anyhow!("Insert failed: {}", e))
-        }
+        qstream.send_async_message(&q_code).await
+            .map_err(|e| anyhow!("Async insert failed: {}", e))
     }
 
     /// Execute a q expression via IPC using kxkdb (sync for initialization)
@@ -259,93 +237,67 @@ impl KdbWriter {
         }
     }
 
-    /// Flush a batch of order book levels using bulk insert (FASTEST method)
+    /// Flush a batch of order book levels using a single bulk insert command
     async fn flush_levels_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[OrderBookLevel]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
-        
-        use log::info;
+
         info!("🔄 Flushing {} order book levels to kdb+", batch.len());
-        
-        // Build bulk insert with proper kdb+ list syntax
-        // Convert timestamps to kdb+ timestamp format: `timestamp$nanoseconds`
-        let times: Vec<String> = batch.iter().map(|l| {
-            // Convert nanoseconds to kdb+ timestamp
-            format!("`timestamp${}", l.timestamp)
-        }).collect();
+
+        let times: Vec<String> = batch.iter().map(|l| format!("`timestamp${}", l.timestamp)).collect();
         let symbols: Vec<String> = batch.iter().map(|l| format!("`{}", l.symbol)).collect();
         let sides: Vec<String> = batch.iter().map(|l| format!("`{}", l.side)).collect();
         let prices: Vec<String> = batch.iter().map(|l| format!("{}f", l.price)).collect();
         let sizes: Vec<String> = batch.iter().map(|l| format!("{}f", l.size)).collect();
         let actions: Vec<String> = batch.iter().map(|l| format!("`{}", l.action)).collect();
-        
-        // Insert rows one at a time using execute_q_async
-        // This ensures each insert is executed properly
-        let mut success_count = 0;
-        for level in batch {
-            // Use table append syntax (this works!)
-            let q_code = format!(
-                "orderbook_levels: orderbook_levels, enlist (`timestamp${}; `{}; `{}; {}f; {}f; `{})",
-                level.timestamp, level.symbol, level.side, level.price, level.size, level.action
-            );
-            if let Ok(()) = Self::execute_single_insert(stream, q_code.as_str()).await {
-                success_count += 1;
-            } else {
-                warn!("❌ Failed to insert level: {}", q_code);
-            }
-        }
-        
-        if success_count > 0 {
-            info!("✅ Successfully flushed {} order book levels", success_count);
+
+        let q_code = format!(
+            "`orderbook_levels insert (({});({});({});({});({});({}))",
+            times.join(";"), symbols.join(";"), sides.join(";"),
+            prices.join(";"), sizes.join(";"), actions.join(";")
+        );
+
+        match Self::execute_single_insert(stream, &q_code).await {
+            Ok(()) => info!("✅ Successfully flushed {} order book levels", batch.len()),
+            Err(e) => warn!("❌ Failed to bulk-insert order book levels: {}", e),
         }
         Ok(())
     }
 
-    /// Flush a batch of trades using bulk insert
+    /// Flush a batch of trades using a single bulk insert command
     async fn flush_trades_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[Trade]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
-        
-        use log::info;
+
         info!("🔄 Flushing {} trades to kdb+", batch.len());
-        
+
         let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
         let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
         let prices: Vec<String> = batch.iter().map(|t| format!("{}f", t.price)).collect();
         let sizes: Vec<String> = batch.iter().map(|t| format!("{}f", t.size)).collect();
-        
-        // Insert rows one at a time
-        let mut success_count = 0;
-        for trade in batch {
-            // Use direct table append
-            let q_code = format!(
-                "trades: trades, enlist (`timestamp${}; `{}; {}f; {}f)",
-                trade.timestamp, trade.symbol, trade.price, trade.size
-            );
-            if let Ok(()) = Self::execute_single_insert(stream, q_code.as_str()).await {
-                success_count += 1;
-            } else {
-                warn!("❌ Failed to insert trade: {}", q_code);
-            }
-        }
-        
-        if success_count > 0 {
-            info!("✅ Successfully flushed {} trades", success_count);
+
+        let q_code = format!(
+            "`trades insert (({});({});({});({}))",
+            times.join(";"), symbols.join(";"), prices.join(";"), sizes.join(";")
+        );
+
+        match Self::execute_single_insert(stream, &q_code).await {
+            Ok(()) => info!("✅ Successfully flushed {} trades", batch.len()),
+            Err(e) => warn!("❌ Failed to bulk-insert trades: {}", e),
         }
         Ok(())
     }
 
-    /// Flush a batch of snapshots using bulk insert
+    /// Flush a batch of snapshots using a single bulk insert command
     async fn flush_snapshots_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[Snapshot]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
-        
-        use log::info;
+
         info!("🔄 Flushing {} snapshots to kdb+", batch.len());
-        
+
         let times: Vec<String> = batch.iter().map(|s| format!("`timestamp${}", s.timestamp)).collect();
         let symbols: Vec<String> = batch.iter().map(|s| format!("`{}", s.symbol)).collect();
         let best_bids: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid)).collect();
@@ -353,25 +305,17 @@ impl KdbWriter {
         let best_bid_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid_size)).collect();
         let best_ask_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_ask_size)).collect();
         let spreads: Vec<String> = batch.iter().map(|s| format!("{}f", s.spread)).collect();
-        
-        // Insert rows one at a time
-        let mut success_count = 0;
-        for snapshot in batch {
-            // Use direct table append
-            let q_code = format!(
-                "orderbook_snapshots: orderbook_snapshots, enlist (`timestamp${}; `{}; {}f; {}f; {}f; {}f; {}f)",
-                snapshot.timestamp, snapshot.symbol, snapshot.best_bid, snapshot.best_ask,
-                snapshot.best_bid_size, snapshot.best_ask_size, snapshot.spread
-            );
-            if let Ok(()) = Self::execute_single_insert(stream, q_code.as_str()).await {
-                success_count += 1;
-            } else {
-                warn!("❌ Failed to insert snapshot: {}", q_code);
-            }
-        }
-        
-        if success_count > 0 {
-            info!("✅ Successfully flushed {} snapshots", success_count);
+
+        let q_code = format!(
+            "`orderbook_snapshots insert (({});({});({});({});({});({});({}))",
+            times.join(";"), symbols.join(";"), best_bids.join(";"),
+            best_asks.join(";"), best_bid_sizes.join(";"),
+            best_ask_sizes.join(";"), spreads.join(";")
+        );
+
+        match Self::execute_single_insert(stream, &q_code).await {
+            Ok(()) => info!("✅ Successfully flushed {} snapshots", batch.len()),
+            Err(e) => warn!("❌ Failed to bulk-insert snapshots: {}", e),
         }
         Ok(())
     }
@@ -385,7 +329,6 @@ impl KdbWriter {
         size: f64,
         action: char,
     ) -> Result<()> {
-        use log::info;
         info!("📝 write_order_book_level called: {} {} {} {} {}", symbol, side, price, size, action);
         
         if !*self.connected.lock().await {
@@ -393,7 +336,7 @@ impl KdbWriter {
             return Ok(()); // Silently skip if not connected
         }
         
-        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0) - KDB_TIMESTAMP_OFFSET_NS;
         
         let level = OrderBookLevel {
             timestamp,
@@ -438,7 +381,7 @@ impl KdbWriter {
         }
         
         let trade = Trade {
-            timestamp,
+            timestamp: timestamp - KDB_TIMESTAMP_OFFSET_NS,
             symbol: symbol.to_string(),
             price,
             size,
@@ -474,7 +417,7 @@ impl KdbWriter {
             return Ok(()); // Silently skip if not connected
         }
         
-        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0) - KDB_TIMESTAMP_OFFSET_NS;
         
         let snapshot = Snapshot {
             timestamp,
@@ -502,31 +445,34 @@ impl KdbWriter {
         Ok(())
     }
 
-    /// Flush a batch of own execution fills to kdb+
+    /// Flush a batch of own execution fills using a single bulk insert command
     async fn flush_own_trades_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[OwnTrade]) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
-        
-        use log::info;
+
         info!("🔄 Flushing {} own trades to kdb+", batch.len());
-        
-        let mut success_count = 0;
-        for t in batch {
-            let q_code = format!(
-                "own_trades: own_trades, enlist (`timestamp${}; `{}; `{}; {}f; {}f; {}f; `{}; `{}; `{})",
-                t.timestamp, t.symbol, t.side, t.last_px, t.last_qty, t.avg_px,
-                t.cl_ord_id, t.order_id, t.exec_type
-            );
-            if let Ok(()) = Self::execute_single_insert(stream, &q_code).await {
-                success_count += 1;
-            } else {
-                warn!("❌ Failed to insert own_trade: cl_ord_id={}", t.cl_ord_id);
-            }
-        }
-        
-        if success_count > 0 {
-            info!("✅ Successfully flushed {} own trades", success_count);
+
+        let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
+        let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
+        let sides: Vec<String> = batch.iter().map(|t| format!("`{}", t.side)).collect();
+        let last_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_px)).collect();
+        let last_qtys: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_qty)).collect();
+        let avg_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.avg_px)).collect();
+        let cl_ord_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.cl_ord_id)).collect();
+        let order_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.order_id)).collect();
+        let exec_types: Vec<String> = batch.iter().map(|t| format!("`{}", t.exec_type)).collect();
+
+        let q_code = format!(
+            "`own_trades insert (({});({});({});({});({});({});({});({});({}))",
+            times.join(";"), symbols.join(";"), sides.join(";"),
+            last_pxs.join(";"), last_qtys.join(";"), avg_pxs.join(";"),
+            cl_ord_ids.join(";"), order_ids.join(";"), exec_types.join(";")
+        );
+
+        match Self::execute_single_insert(stream, &q_code).await {
+            Ok(()) => info!("✅ Successfully flushed {} own trades", batch.len()),
+            Err(e) => warn!("❌ Failed to bulk-insert own trades: {}", e),
         }
         Ok(())
     }
@@ -548,7 +494,7 @@ impl KdbWriter {
             return Ok(());
         }
         
-        let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) - KDB_TIMESTAMP_OFFSET_NS;
         
         let own_trade = OwnTrade {
             timestamp,
@@ -587,10 +533,9 @@ impl KdbWriter {
             return Ok(());
         }
         
-        use log::info;
         info!("📝 Writing {} securities to kdb+", securities.len());
         
-        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0) - KDB_TIMESTAMP_OFFSET_NS;
         
         // Insert securities one at a time using proper table append syntax
         let mut success_count = 0;

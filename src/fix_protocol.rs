@@ -132,6 +132,17 @@ impl FIXMessage {
         self.fields.get(&tag).map(|s| s.as_str())
     }
 
+    /// Return the nth occurrence (0-indexed) of a tag from `fields_ordered`.
+    /// Use this instead of `get_field` when parsing repeating groups manually,
+    /// since `get_field` only returns the last value for duplicate tags.
+    pub fn get_field_nth(&self, tag: usize, n: usize) -> Option<&str> {
+        self.fields_ordered
+            .iter()
+            .filter(|(t, _)| *t == tag)
+            .nth(n)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// Extract repeating group instances based on a group count tag and starting tag
     /// For example, SecurityListResponse has tag 146 (NoRelatedSym) = 26, then 26 instances of tag 55 (Symbol) follow
     pub fn get_repeating_group(&self, count_tag: usize, group_start_tag: usize) -> Vec<HashMap<usize, String>> {
@@ -301,7 +312,7 @@ impl FIXMessage {
                 continue;
             }
 
-            let parts: Vec<&str> = field.split('=').collect();
+            let parts: Vec<&str> = field.splitn(2, '=').collect();
             if parts.len() != 2 {
                 continue;
             }
