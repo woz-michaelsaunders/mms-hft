@@ -3,7 +3,7 @@
 // Optimized for high-speed bulk inserts
 
 use anyhow::{anyhow, Result};
-use log::{info, error, warn};
+use log::{debug, info, error, warn};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Utc;
@@ -13,6 +13,11 @@ use std::collections::VecDeque;
 
 /// kdb+ epoch offset in nanoseconds (nanoseconds from Unix epoch 1970-01-01 to kdb+ epoch 2000-01-01)
 const KDB_TIMESTAMP_OFFSET_NS: i64 = 946_684_800_000_000_000_i64;
+
+/// Maximum entries in each write buffer.  If this is exceeded (e.g. kdb+ is slow or
+/// temporarily disconnected) the oldest half is dropped with a warning so we never
+/// accumulate unbounded RAM.
+const MAX_KDB_BUFFER: usize = 10_000;
 
 // Batch buffer structures
 #[derive(Clone)]
@@ -243,7 +248,7 @@ impl KdbWriter {
             return Ok(());
         }
 
-        info!("🔄 Flushing {} order book levels to kdb+", batch.len());
+        debug!("🔄 Flushing {} order book levels to kdb+", batch.len());
 
         let times: Vec<String> = batch.iter().map(|l| format!("`timestamp${}", l.timestamp)).collect();
         let symbols: Vec<String> = batch.iter().map(|l| format!("`{}", l.symbol)).collect();
@@ -259,7 +264,7 @@ impl KdbWriter {
         );
 
         match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => info!("✅ Successfully flushed {} order book levels", batch.len()),
+            Ok(()) => debug!("✅ Flushed {} order book levels", batch.len()),
             Err(e) => warn!("❌ Failed to bulk-insert order book levels: {}", e),
         }
         Ok(())
@@ -271,7 +276,7 @@ impl KdbWriter {
             return Ok(());
         }
 
-        info!("🔄 Flushing {} trades to kdb+", batch.len());
+        debug!("🔄 Flushing {} trades to kdb+", batch.len());
 
         let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
         let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
@@ -284,7 +289,7 @@ impl KdbWriter {
         );
 
         match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => info!("✅ Successfully flushed {} trades", batch.len()),
+            Ok(()) => debug!("✅ Flushed {} trades", batch.len()),
             Err(e) => warn!("❌ Failed to bulk-insert trades: {}", e),
         }
         Ok(())
@@ -296,7 +301,7 @@ impl KdbWriter {
             return Ok(());
         }
 
-        info!("🔄 Flushing {} snapshots to kdb+", batch.len());
+        debug!("🔄 Flushing {} snapshots to kdb+", batch.len());
 
         let times: Vec<String> = batch.iter().map(|s| format!("`timestamp${}", s.timestamp)).collect();
         let symbols: Vec<String> = batch.iter().map(|s| format!("`{}", s.symbol)).collect();
@@ -314,7 +319,7 @@ impl KdbWriter {
         );
 
         match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => info!("✅ Successfully flushed {} snapshots", batch.len()),
+            Ok(()) => debug!("✅ Flushed {} snapshots", batch.len()),
             Err(e) => warn!("❌ Failed to bulk-insert snapshots: {}", e),
         }
         Ok(())
@@ -329,15 +334,12 @@ impl KdbWriter {
         size: f64,
         action: char,
     ) -> Result<()> {
-        info!("📝 write_order_book_level called: {} {} {} {} {}", symbol, side, price, size, action);
-        
         if !*self.connected.lock().await {
-            warn!("⚠️  Not connected to kdb+, skipping write");
             return Ok(()); // Silently skip if not connected
         }
-        
+
         let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0) - KDB_TIMESTAMP_OFFSET_NS;
-        
+
         let level = OrderBookLevel {
             timestamp,
             symbol: symbol.to_string(),
@@ -346,25 +348,33 @@ impl KdbWriter {
             size,
             action,
         };
-        
+
         let mut buffer = self.level_buffer.lock().await;
+
+        // Safety cap: if buffer is growing unboundedly (flush can't keep up), drop oldest half
+        if buffer.len() >= MAX_KDB_BUFFER {
+            let drop_count = buffer.len() / 2;
+            buffer.drain(..drop_count);
+            warn!("⚠️  kdb level buffer overflow ({} entries) — dropped {} oldest entries", MAX_KDB_BUFFER, drop_count);
+        }
+
         buffer.push_back(level);
         let buffer_len = buffer.len();
         drop(buffer);
-        
-        info!("📦 Buffered order book level. Buffer size: {}", buffer_len);
-        
+
+        debug!("📦 Buffered order book level. Buffer size: {}", buffer_len);
+
         // Flush immediately if batch size reached
         if buffer_len >= self.batch_size {
             let mut buffer = self.level_buffer.lock().await;
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
-            
+
             if let Err(e) = Self::flush_levels_batch(&self.stream, &batch).await {
                 warn!("Failed to flush level batch: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
@@ -388,18 +398,25 @@ impl KdbWriter {
         };
         
         let mut buffer = self.trade_buffer.lock().await;
+
+        if buffer.len() >= MAX_KDB_BUFFER {
+            let drop_count = buffer.len() / 2;
+            buffer.drain(..drop_count);
+            warn!("⚠️  kdb trade buffer overflow — dropped {} oldest entries", drop_count);
+        }
+
         buffer.push_back(trade);
-        
+
         // Flush immediately if batch size reached
         if buffer.len() >= self.batch_size {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
-            
+
             if let Err(e) = Self::flush_trades_batch(&self.stream, &batch).await {
                 warn!("Failed to flush trade batch: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
@@ -430,18 +447,25 @@ impl KdbWriter {
         };
         
         let mut buffer = self.snapshot_buffer.lock().await;
+
+        if buffer.len() >= MAX_KDB_BUFFER {
+            let drop_count = buffer.len() / 2;
+            buffer.drain(..drop_count);
+            warn!("⚠️  kdb snapshot buffer overflow — dropped {} oldest entries", drop_count);
+        }
+
         buffer.push_back(snapshot);
-        
+
         // Flush immediately if batch size reached
         if buffer.len() >= self.batch_size {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
-            
+
             if let Err(e) = Self::flush_snapshots_batch(&self.stream, &batch).await {
                 warn!("Failed to flush snapshot batch: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
@@ -451,7 +475,7 @@ impl KdbWriter {
             return Ok(());
         }
 
-        info!("🔄 Flushing {} own trades to kdb+", batch.len());
+        debug!("🔄 Flushing {} own trades to kdb+", batch.len());
 
         let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
         let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
@@ -471,7 +495,7 @@ impl KdbWriter {
         );
 
         match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => info!("✅ Successfully flushed {} own trades", batch.len()),
+            Ok(()) => debug!("✅ Flushed {} own trades", batch.len()),
             Err(e) => warn!("❌ Failed to bulk-insert own trades: {}", e),
         }
         Ok(())
@@ -509,8 +533,15 @@ impl KdbWriter {
         };
         
         let mut buffer = self.own_trade_buffer.lock().await;
+
+        if buffer.len() >= MAX_KDB_BUFFER {
+            let drop_count = buffer.len() / 2;
+            buffer.drain(..drop_count);
+            warn!("⚠️  kdb own_trade buffer overflow — dropped {} oldest entries", drop_count);
+        }
+
         buffer.push_back(own_trade);
-        
+
         if buffer.len() >= self.batch_size {
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
@@ -518,7 +549,7 @@ impl KdbWriter {
                 warn!("Failed to flush own_trades batch: {}", e);
             }
         }
-        
+
         Ok(())
     }
 

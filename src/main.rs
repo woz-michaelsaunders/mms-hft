@@ -8,6 +8,7 @@ use anyhow::{anyhow, Result};
 use fix_protocol::{FIXMessage, tags};
 use log::{info, error, warn};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -432,6 +433,9 @@ pub struct FIXSession {
     order_book_update_tx: Arc<Mutex<Option<broadcast::Sender<String>>>>,
     // kdb+ writer for order book data (shared across sessions)
     kdb_writer: Arc<KdbWriter>,
+    // Last market-data message timestamp (Unix ms). Zero = never received.
+    // Updated atomically on every W/X message; read by the stale-feed watchdog.
+    last_md_recv_ms: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -459,11 +463,22 @@ impl FIXSession {
     }
     
     pub fn new_with_credentials_and_kdb(sender: &str, target: &str, api_key: &str, api_secret: &str, kdb_writer: Arc<KdbWriter>) -> Self {
+        // Restore sequence number from disk so restarts don't cause MsgSeqNum gaps.
+        let safe_sender = sender.replace('.', "_").replace(' ', "_");
+        let seq_path = format!("data/seqnum_{}.txt", safe_sender);
+        let initial_seq: u32 = std::fs::read_to_string(&seq_path)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        if initial_seq > 0 {
+            info!("🔄 Restored seq_num={} for {} from {}", initial_seq, sender, seq_path);
+        }
+
         FIXSession {
             stream: Arc::new(Mutex::new(None)),
             sender_comp_id: sender.to_string(),
             target_comp_id: target.to_string(),
-            seq_num: Arc::new(Mutex::new(0)),
+            seq_num: Arc::new(Mutex::new(initial_seq)),
             is_connected: Arc::new(Mutex::new(false)),
             connection_state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
             api_key: api_key.to_string(),
@@ -487,6 +502,7 @@ impl FIXSession {
             order_update_tx: Arc::new(Mutex::new(None)),
             order_book_update_tx: Arc::new(Mutex::new(None)),
             kdb_writer,
+            last_md_recv_ms: Arc::new(AtomicU64::new(0)),
         }
     }
     
@@ -568,7 +584,15 @@ impl FIXSession {
     async fn logon_with_auth(&self, heartbeat_interval: u64, is_market_data: bool) -> Result<()> {
         *self.connection_state.lock().await = ConnectionState::Logging;
 
-        let seq_num = self.next_seq_num().await;
+        // FIX 4.4 §2.4: when ResetSeqNumFlag (141=Y) is sent in the Logon, the MsgSeqNum
+        // in that same message MUST be 1 — we are telling the other side that both counters
+        // reset.  Reset our own counter to 0 so next_seq_num() returns 1.
+        {
+            let mut seq = self.seq_num.lock().await;
+            *seq = 0;
+        }
+
+        let seq_num = self.next_seq_num().await; // returns 1
         let mut msg = FIXMessage::new('A', &self.sender_comp_id, &self.target_comp_id, seq_num);
 
         // Generate RawData - must be nonce in milliseconds per documentation
@@ -1619,8 +1643,10 @@ impl FIXSession {
                                 }
                             }
 
-                            securities.push(security.clone());
-                            info!("  ✅ {}", symbol_val);
+                            if !securities.iter().any(|s| s.symbol == symbol_val) {
+                                securities.push(security.clone());
+                                info!("  ✅ {}", symbol_val);
+                            }
                         }
                     }
                     info!("📊 Total securities loaded: {}", securities.len());
@@ -1642,8 +1668,10 @@ impl FIXSession {
                         }
 
                         let mut securities = self.securities.lock().await;
-                        securities.push(security.clone());
-                        info!("✅ Saved security: {} (Total: {})", symbol, securities.len());
+                        if !securities.iter().any(|s| s.symbol == symbol) {
+                            securities.push(security.clone());
+                            info!("✅ Saved security: {} (Total: {})", symbol, securities.len());
+                        }
                     } else {
                         info!("ℹ️ No securities found in SecurityListResponse");
                     }
@@ -1708,6 +1736,10 @@ impl FIXSession {
             }
             'W' => {
                 // Market Data Snapshot Full Refresh (35=W)
+                self.last_md_recv_ms.store(
+                    chrono::Utc::now().timestamp_millis() as u64,
+                    Ordering::Relaxed,
+                );
                 info!("");
                 info!("📈 MARKET DATA SNAPSHOT RECEIVED (35=W)");
 
@@ -1846,7 +1878,7 @@ impl FIXSession {
                     // Write snapshot to kdb+ and persist to CSV for backtest fallback
                     let _ = self.kdb_writer.write_snapshot(&symbol, best_bid, best_ask, 
                         best_bid_size, best_ask_size, spread).await;
-                    append_snapshot_to_csv(&symbol, best_bid, best_ask);
+                    append_snapshot_to_csv_with_sizes(&symbol, best_bid, best_ask, best_bid_size, best_ask_size);
 
                     // Only add tick if we have at least bid or ask data
                     if combined_tick.bid > 0.0 || combined_tick.ask > 0.0 || combined_tick.last_price > 0.0 {
@@ -1861,6 +1893,10 @@ impl FIXSession {
             }
             'X' => {
                 // Market Data Incremental Refresh (35=X) - Real-time updates
+                self.last_md_recv_ms.store(
+                    chrono::Utc::now().timestamp_millis() as u64,
+                    Ordering::Relaxed,
+                );
                 info!("");
                 info!("📈 MARKET DATA INCREMENTAL REFRESH RECEIVED (35=X)");
 
@@ -2050,7 +2086,7 @@ impl FIXSession {
                     // Write snapshot to kdb+ and persist to CSV for backtest fallback
                     let _ = self.kdb_writer.write_snapshot(&symbol, best_bid, best_ask, 
                         best_bid_size, best_ask_size, spread).await;
-                    append_snapshot_to_csv(&symbol, best_bid, best_ask);
+                    append_snapshot_to_csv_with_sizes(&symbol, best_bid, best_ask, best_bid_size, best_ask_size);
                     
                     // Signal ZeroMQ update ONCE per incremental refresh (after all entries processed)
                     if let Some(tx) = self.order_book_update_tx.lock().await.as_ref() {
@@ -2376,7 +2412,13 @@ impl FIXSession {
     async fn next_seq_num(&self) -> u32 {
         let mut seq = self.seq_num.lock().await;
         *seq += 1;
-        *seq
+        let n = *seq;
+        // Persist so restarts don't reset to 0 and cause MsgSeqNum-too-low rejections.
+        let safe_sender = self.sender_comp_id.replace('.', "_").replace(' ', "_");
+        let seq_path = format!("data/seqnum_{}.txt", safe_sender);
+        let _ = std::fs::create_dir_all("data");
+        let _ = std::fs::write(&seq_path, n.to_string());
+        n
     }
 
     async fn is_ready(&self) -> bool {
@@ -2771,6 +2813,10 @@ fn append_trade_to_csv(
 /// Append a best-bid/ask snapshot to data/snapshots.csv for backtest persistence.
 /// Called on every 35=W and 35=X message where both best_bid and best_ask are available.
 fn append_snapshot_to_csv(symbol: &str, best_bid: f64, best_ask: f64) {
+    append_snapshot_to_csv_with_sizes(symbol, best_bid, best_ask, 0.0, 0.0);
+}
+
+fn append_snapshot_to_csv_with_sizes(symbol: &str, best_bid: f64, best_ask: f64, best_bid_size: f64, best_ask_size: f64) {
     if best_bid <= 0.0 || best_ask <= 0.0 || best_ask <= best_bid {
         return;
     }
@@ -2780,10 +2826,10 @@ fn append_snapshot_to_csv(symbol: &str, best_bid: f64, best_ask: f64) {
         let file_is_new = !path.exists();
         let mut file = OpenOptions::new().create(true).append(true).open(path)?;
         if file_is_new {
-            writeln!(file, "timestamp_ms,symbol,best_bid,best_ask")?;
+            writeln!(file, "timestamp_ms,symbol,best_bid,best_ask,best_bid_size,best_ask_size")?;
         }
         let ts_ms = chrono::Utc::now().timestamp_millis();
-        writeln!(file, "{},{},{},{}", ts_ms, symbol, best_bid, best_ask)
+        writeln!(file, "{},{},{},{},{},{}", ts_ms, symbol, best_bid, best_ask, best_bid_size, best_ask_size)
     })();
 }
 
@@ -4148,6 +4194,13 @@ async fn order_book_web_server(
                     <div style="color:#ff6b35;font-weight:600;margin-bottom:12px;font-size:14px;text-transform:uppercase;letter-spacing:1px;">Configuration</div>
                     <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;">
                         <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Strategy
+                            <select id="algoCfgStrategy" onchange="algoStrategyChanged()" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                                <option value="spread_capture">Spread Capture</option>
+                                <option value="market_imbalance">Market Imbalance</option>
+                            </select>
+                        </label>
+                        <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
                             Symbol
                             <input id="algoCfgSymbol" type="text" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
                         </label>
@@ -4170,6 +4223,14 @@ async fn order_book_web_server(
                         <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
                             Time-in-Force (0=Day,3=IOC,4=FOK)
                             <input id="algoCfgTIF" type="text" maxlength="1" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                        </label>
+                        <label id="algoCfgImbalanceThresholdWrap" style="display:none;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Imbalance Threshold (0.5–1.0)
+                            <input id="algoCfgImbalanceThreshold" type="number" step="0.01" min="0.5" max="1.0" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
+                        </label>
+                        <label id="algoCfgImbalanceDepthWrap" style="display:none;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;">
+                            Imbalance Depth Levels
+                            <input id="algoCfgImbalanceDepth" type="number" step="1" min="1" max="20" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;">
                         </label>
                     </div>
                     <button onclick="algoSaveConfig()" style="margin-top:14px;padding:10px 24px;border-radius:8px;border:none;background:linear-gradient(135deg,rgba(255,107,53,0.8),rgba(255,140,0,0.8));color:white;font-weight:700;cursor:pointer;font-size:14px;">Save Config</button>
@@ -4213,6 +4274,13 @@ async fn order_book_web_server(
                 <!-- Parameter form -->
                 <div style="display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;margin-bottom:24px;">
                     <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Strategy
+                        <select id="btStrategy" onchange="btStrategyChanged()" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;">
+                            <option value="spread_capture">Spread Capture</option>
+                            <option value="market_imbalance">Market Imbalance</option>
+                        </select>
+                    </label>
+                    <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
                         Symbol
                         <select id="btSymbol" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;"></select>
                     </label>
@@ -4235,6 +4303,14 @@ async fn order_book_web_server(
                     <label style="display:flex;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
                         Tick Size
                         <input id="btTick" type="number" value="0.01" step="0.001" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;">
+                    </label>
+                    <label id="btImbalanceThresholdWrap" style="display:none;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Imbalance Threshold (0.5–1.0)
+                        <input id="btImbalanceThreshold" type="number" value="0.6" step="0.01" min="0.5" max="1.0" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;">
+                    </label>
+                    <label id="btImbalanceDepthWrap" style="display:none;flex-direction:column;gap:4px;font-size:13px;color:#9ca3af;flex:1;min-width:120px;">
+                        Imbalance Depth Levels
+                        <input id="btImbalanceDepth" type="number" value="1" step="1" min="1" max="1" style="padding:8px;background:rgba(31,41,55,0.8);border:1px solid rgba(255,107,53,0.3);border-radius:6px;color:#e5e7eb;font-size:14px;width:100%;" title="Backtest uses top-of-book only (depth=1)">
                     </label>
                 </div>
 
@@ -4553,12 +4629,16 @@ async fn order_book_web_server(
                         banner.textContent = '○ ALGO DISABLED — configure and enable to start trading';
                     }
                     // Populate config fields
+                    document.getElementById('algoCfgStrategy').value = cfg.strategy || 'spread_capture';
                     document.getElementById('algoCfgSymbol').value = cfg.symbol || '';
                     document.getElementById('algoCfgQty').value = cfg.order_qty || '';
                     document.getElementById('algoCfgSpread').value = cfg.min_spread_bps || '';
                     document.getElementById('algoCfgMaxPos').value = cfg.max_position || '';
                     document.getElementById('algoCfgPoll').value = cfg.poll_interval_ms || '';
                     document.getElementById('algoCfgTIF').value = cfg.time_in_force || '';
+                    document.getElementById('algoCfgImbalanceThreshold').value = cfg.imbalance_threshold != null ? cfg.imbalance_threshold : 0.6;
+                    document.getElementById('algoCfgImbalanceDepth').value = cfg.imbalance_depth_levels != null ? cfg.imbalance_depth_levels : 5;
+                    algoStrategyChanged();
                     // Counters
                     document.getElementById('algoSigCount').textContent = data.signals_fired || 0;
                     document.getElementById('algoOrdCount').textContent = data.orders_placed || 0;
@@ -4593,15 +4673,26 @@ async fn order_book_web_server(
             fetch('/api/algo/disable', {method:'POST'}).then(() => loadAlgoStatus());
         }
 
+        function algoStrategyChanged() {
+            const isImbalance = document.getElementById('algoCfgStrategy').value === 'market_imbalance';
+            const threshWrap = document.getElementById('algoCfgImbalanceThresholdWrap');
+            const depthWrap  = document.getElementById('algoCfgImbalanceDepthWrap');
+            threshWrap.style.display = isImbalance ? 'flex' : 'none';
+            depthWrap.style.display  = isImbalance ? 'flex' : 'none';
+        }
+
         function algoSaveConfig() {
             const msg = document.getElementById('algoCfgMsg');
             const cfg = Object.assign({}, _algoCfgCache || {}, {
-                symbol:          document.getElementById('algoCfgSymbol').value,
-                order_qty:       parseFloat(document.getElementById('algoCfgQty').value),
-                min_spread_bps:  parseFloat(document.getElementById('algoCfgSpread').value),
-                max_position:    parseFloat(document.getElementById('algoCfgMaxPos').value),
-                poll_interval_ms:parseInt(document.getElementById('algoCfgPoll').value),
-                time_in_force:   document.getElementById('algoCfgTIF').value,
+                strategy:               document.getElementById('algoCfgStrategy').value,
+                symbol:                 document.getElementById('algoCfgSymbol').value,
+                order_qty:              parseFloat(document.getElementById('algoCfgQty').value),
+                min_spread_bps:         parseFloat(document.getElementById('algoCfgSpread').value),
+                max_position:           parseFloat(document.getElementById('algoCfgMaxPos').value),
+                poll_interval_ms:       parseInt(document.getElementById('algoCfgPoll').value),
+                time_in_force:          document.getElementById('algoCfgTIF').value,
+                imbalance_threshold:    parseFloat(document.getElementById('algoCfgImbalanceThreshold').value),
+                imbalance_depth_levels: parseInt(document.getElementById('algoCfgImbalanceDepth').value),
             });
             fetch('/api/algo/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)})
                 .then(r => r.json())
@@ -4612,6 +4703,12 @@ async fn order_book_web_server(
         // ── BACKTEST tab ──────────────────────────────────────────────────────────────
         let btPriceChartInst = null;
         let btEquityChartInst = null;
+
+        function btStrategyChanged() {
+            const isImbalance = document.getElementById('btStrategy').value === 'market_imbalance';
+            document.getElementById('btImbalanceThresholdWrap').style.display = isImbalance ? 'flex' : 'none';
+            document.getElementById('btImbalanceDepthWrap').style.display     = isImbalance ? 'flex' : 'none';
+        }
 
         function initBacktestSymbols() {
             // Populate symbol selector from same source as other selectors
@@ -4634,12 +4731,15 @@ async fn order_book_web_server(
         function runBacktest() {
             const btn = document.getElementById('btRunBtn');
             const status = document.getElementById('btStatus');
-            const symbol   = document.getElementById('btSymbol').value;
-            const limit    = document.getElementById('btLimit').value || 5000;
-            const spread   = document.getElementById('btSpread').value || 5;
-            const qty      = document.getElementById('btQty').value || 0.001;
-            const maxPos   = document.getElementById('btMaxPos').value || 0.01;
-            const tick     = document.getElementById('btTick').value || 0.01;
+            const symbol    = document.getElementById('btSymbol').value;
+            const limit     = document.getElementById('btLimit').value || 5000;
+            const spread    = document.getElementById('btSpread').value || 5;
+            const qty       = document.getElementById('btQty').value || 0.001;
+            const maxPos    = document.getElementById('btMaxPos').value || 0.01;
+            const tick      = document.getElementById('btTick').value || 0.01;
+            const strategy  = document.getElementById('btStrategy').value || 'spread_capture';
+            const threshold = document.getElementById('btImbalanceThreshold').value || 0.6;
+            const depth     = document.getElementById('btImbalanceDepth').value || 1;
 
             if (!symbol) { status.textContent = 'Select a symbol first.'; return; }
 
@@ -4648,7 +4748,7 @@ async fn order_book_web_server(
             status.textContent = 'Fetching data and simulating…';
             document.getElementById('btSummary').style.display = 'none';
 
-            const url = `/api/backtest?symbol=${encodeURIComponent(symbol)}&limit=${limit}&min_spread_bps=${spread}&order_qty=${qty}&max_position=${maxPos}&tick_size=${tick}`;
+            const url = `/api/backtest?symbol=${encodeURIComponent(symbol)}&limit=${limit}&min_spread_bps=${spread}&order_qty=${qty}&max_position=${maxPos}&tick_size=${tick}&strategy=${strategy}&imbalance_threshold=${threshold}&imbalance_depth_levels=${depth}`;
 
             fetch(url)
                 .then(r => r.json())
@@ -5333,7 +5433,8 @@ async fn order_book_web_server(
                 first_line = false;
                 continue; // skip header
             }
-            let cols: Vec<&str> = line.splitn(4, ',').collect();
+            // Support both old 4-column format and new 6-column format with sizes
+            let cols: Vec<&str> = line.splitn(6, ',').collect();
             if cols.len() < 4 {
                 continue;
             }
@@ -5341,10 +5442,12 @@ async fn order_book_web_server(
                 continue;
             }
             let timestamp_ms: i64 = cols[0].parse().unwrap_or(0);
-            let best_bid: f64   = cols[2].parse().unwrap_or(0.0);
-            let best_ask: f64   = cols[3].parse().unwrap_or(0.0);
+            let best_bid: f64     = cols[2].parse().unwrap_or(0.0);
+            let best_ask: f64     = cols[3].parse().unwrap_or(0.0);
+            let best_bid_size: f64 = cols.get(4).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            let best_ask_size: f64 = cols.get(5).and_then(|v| v.parse().ok()).unwrap_or(0.0);
             if best_bid > 0.0 && best_ask > 0.0 && best_ask > best_bid {
-                snapshots.push(algo::Snapshot { timestamp_ms, best_bid, best_ask });
+                snapshots.push(algo::Snapshot { timestamp_ms, best_bid, best_ask, best_bid_size, best_ask_size, ..Default::default() });
             }
         }
 
@@ -5373,8 +5476,16 @@ async fn order_book_web_server(
         let order_qty: f64 = params.get("order_qty").and_then(|v| v.parse().ok()).unwrap_or(0.001);
         let max_position: f64 = params.get("max_position").and_then(|v| v.parse().ok()).unwrap_or(0.01);
         let tick_size: f64 = params.get("tick_size").and_then(|v| v.parse().ok()).unwrap_or(0.01);
+        let imbalance_threshold: f64 = params.get("imbalance_threshold").and_then(|v| v.parse().ok()).unwrap_or(algo::default_imbalance_threshold());
+        let imbalance_depth_levels: usize = params.get("imbalance_depth_levels").and_then(|v| v.parse().ok()).unwrap_or(algo::default_imbalance_depth_levels());
+        let slippage_bps: f64 = params.get("slippage_bps").and_then(|v| v.parse().ok()).unwrap_or(algo::default_slippage_bps());
+        let fee_bps: f64 = params.get("fee_bps").and_then(|v| v.parse().ok()).unwrap_or(algo::default_fee_bps());
+        let strategy = match params.get("strategy").map(|s| s.as_str()) {
+            Some("market_imbalance") => algo::StrategyType::MarketImbalance,
+            _ => algo::StrategyType::SpreadCapture,
+        };
 
-        // Build an AlgoConfig for this backtest run (enabled flag doesn't matter here)
+        // Build an AlgoConfig for this backtest run (enabled flag doesn't matter here).
         let cfg = algo::AlgoConfig {
             enabled: false,
             symbol: symbol.clone(),
@@ -5384,13 +5495,19 @@ async fn order_book_web_server(
             poll_interval_ms: 1000,
             tick_size,
             time_in_force: "3".to_string(),
+            strategy,
+            imbalance_threshold,
+            imbalance_depth_levels,
+            slippage_bps,
+            fee_bps,
+            min_signal_interval_ms: 0, // not relevant in backtest
         };
 
         // Query kdb+ for historical snapshots. On any error or empty result, fall back
         // to data/ticks.csv so backtests work even when kdb+ has no in-memory data.
         let symbol_predicate = build_kdb_symbol_predicate(&symbol);
         let q = format!(
-            "neg[{}] sublist select time, best_bid, best_ask from orderbook_snapshots where {}",
+            "neg[{}] sublist select time, best_bid, best_ask, best_bid_size, best_ask_size from orderbook_snapshots where {}",
             limit, symbol_predicate
         );
         let kdb_snapshots: Vec<algo::Snapshot> = match state.kdb.query_table_to_json(&q).await {
@@ -5408,8 +5525,10 @@ async fn order_book_web_server(
                                 let timestamp_ms = row.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
                                 let best_bid = row.get("best_bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 let best_ask = row.get("best_ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let best_bid_size = row.get("best_bid_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let best_ask_size = row.get("best_ask_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
                                 if best_bid > 0.0 && best_ask > 0.0 {
-                                    Some(algo::Snapshot { timestamp_ms, best_bid, best_ask })
+                                    Some(algo::Snapshot { timestamp_ms, best_bid, best_ask, best_bid_size, best_ask_size, ..Default::default() })
                                 } else {
                                     None
                                 }
@@ -5453,6 +5572,124 @@ async fn order_book_web_server(
         }
     }
 
+    // GET /api/backtest/sweep — run grid search over multiple AlgoConfig combinations.
+    // Accepts comma-separated or repeated query params: imbalance_threshold, fee_bps.
+    // Returns an array of { config, summary } sorted by Sharpe ratio (desc).
+    // Capped at 200 combinations to prevent runaway CPU usage.
+    async fn get_backtest_sweep_api(
+        axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> impl axum::response::IntoResponse {
+        use axum::http::header;
+
+        let symbol = params.get("symbol").cloned().unwrap_or_else(|| "BTC_USDT".to_string());
+        let limit: usize = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(5000).clamp(1, 50_000);
+        let order_qty: f64 = params.get("order_qty").and_then(|v| v.parse().ok()).unwrap_or(0.001);
+        let max_position: f64 = params.get("max_position").and_then(|v| v.parse().ok()).unwrap_or(0.01);
+        let tick_size: f64 = params.get("tick_size").and_then(|v| v.parse().ok()).unwrap_or(0.01);
+        let min_spread_bps_base: f64 = params.get("min_spread_bps").and_then(|v| v.parse().ok()).unwrap_or(5.0);
+
+        // Parse comma-separated sweep arrays (e.g. imbalance_threshold=0.55,0.60,0.65)
+        let parse_csv_f64 = |key: &str, fallback: f64| -> Vec<f64> {
+            params.get(key)
+                .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+                .filter(|v: &Vec<f64>| !v.is_empty())
+                .unwrap_or_else(|| vec![fallback])
+        };
+        let parse_csv_usize = |key: &str, fallback: usize| -> Vec<usize> {
+            params.get(key)
+                .map(|s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+                .filter(|v: &Vec<usize>| !v.is_empty())
+                .unwrap_or_else(|| vec![fallback])
+        };
+
+        let thresholds = parse_csv_f64("imbalance_threshold", algo::default_imbalance_threshold());
+        let depths = parse_csv_usize("imbalance_depth_levels", algo::default_imbalance_depth_levels());
+        let fee_bps_list = parse_csv_f64("fee_bps", algo::default_fee_bps());
+        let slippage_bps_list = parse_csv_f64("slippage_bps", algo::default_slippage_bps());
+
+        // Load data once, reuse across all runs
+        let symbol_predicate = build_kdb_symbol_predicate(&symbol);
+        let q = format!(
+            "neg[{}] sublist select time, best_bid, best_ask, best_bid_size, best_ask_size from orderbook_snapshots where {}",
+            limit, symbol_predicate
+        );
+        let snapshots: Vec<algo::Snapshot> = match state.kdb.query_table_to_json(&q).await {
+            Ok(raw_json) => serde_json::from_str::<serde_json::Value>(&raw_json)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|row| {
+                    let ts = row.get("time").and_then(|v| v.as_i64())?;
+                    let bb = row.get("best_bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let ba = row.get("best_ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let bbs = row.get("best_bid_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let bas = row.get("best_ask_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if bb > 0.0 && ba > 0.0 { Some(algo::Snapshot { timestamp_ms: ts, best_bid: bb, best_ask: ba, best_bid_size: bbs, best_ask_size: bas, ..Default::default() }) } else { None }
+                })
+                .collect(),
+            Err(_) => load_snapshots_from_csv(&symbol, limit),
+        };
+
+        if snapshots.is_empty() {
+            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({"error": "No snapshot data found for symbol", "symbol": symbol}).to_string());
+        }
+
+        // Build all combinations and run — cap at 200
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        'outer: for &threshold in &thresholds {
+            for &depth in &depths {
+                for &fee in &fee_bps_list {
+                    for &slip in &slippage_bps_list {
+                        if results.len() >= 200 { break 'outer; }
+                        let cfg = algo::AlgoConfig {
+                            enabled: false,
+                            symbol: symbol.clone(),
+                            order_qty,
+                            min_spread_bps: min_spread_bps_base,
+                            max_position,
+                            poll_interval_ms: 1000,
+                            tick_size,
+                            time_in_force: "3".to_string(),
+                            strategy: algo::StrategyType::MarketImbalance,
+                            imbalance_threshold: threshold,
+                            imbalance_depth_levels: depth,
+                            slippage_bps: slip,
+                            fee_bps: fee,
+                            min_signal_interval_ms: 0,
+                        };
+                        let result = algo::run_backtest(&cfg, &snapshots);
+                        results.push(serde_json::json!({
+                            "config": {
+                                "imbalance_threshold": threshold,
+                                "imbalance_depth_levels": depth,
+                                "fee_bps": fee,
+                                "slippage_bps": slip,
+                            },
+                            "summary": result.summary,
+                        }));
+                    }
+                }
+            }
+        }
+
+        // Sort by Sharpe ratio descending
+        results.sort_by(|a, b| {
+            let sa = a["summary"]["sharpe_ratio"].as_f64().unwrap_or(f64::NEG_INFINITY);
+            let sb = b["summary"]["sharpe_ratio"].as_f64().unwrap_or(f64::NEG_INFINITY);
+            sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        info!("📊 Sweep: {} runs on {} snapshots for {}", results.len(), snapshots.len(), symbol);
+        match serde_json::to_string(&results) {
+            Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, [(header::CONTENT_TYPE, "application/json")],
+                format!("{{\"error\":\"Serialization failed: {}\"}}", e)),
+        }
+    }
+
     // Build the router
     let html_page_clone = html_page.to_string();
     let app = Router::new()
@@ -5478,6 +5715,7 @@ async fn order_book_web_server(
         .route("/api/algo/disable", post(algo_disable_api))
         .route("/api/algo/config", post(algo_config_api))
         .route("/api/backtest", get(get_backtest_api))
+        .route("/api/backtest/sweep", get(get_backtest_sweep_api))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
     
@@ -6011,6 +6249,96 @@ async fn main() -> Result<()> {
     let zmq_handle = tokio::spawn(async move {
         if let Err(e) = zmq_order_book_publisher_event_driven(market_data_for_zmq, "tcp://0.0.0.0:5555", zmq_update_rx).await {
             error!("Fatal error in ZeroMQ publisher: {}", e);
+        }
+    });
+
+    // Stale-feed watchdog — detects silent TCP stalls on market-data sessions.
+    // If a session is Ready but hasn't received a W/X message in 30s, the TCP
+    // stream is closed so the existing reconnect loop re-establishes it.
+    let stale_sessions: Vec<Arc<FIXSession>> = vec![
+        Arc::clone(&market_data_session),
+        Arc::clone(&market_data_others_34405),
+        Arc::clone(&market_data_others_34406),
+        Arc::clone(&market_data_others_34407),
+    ];
+    let _stale_feed_watchdog = tokio::spawn(async move {
+        const STALE_THRESHOLD_MS: u64 = 30_000;
+        let mut check_interval = interval(Duration::from_secs(15));
+        check_interval.tick().await; // skip immediate first tick
+        loop {
+            check_interval.tick().await;
+            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+            for sess in &stale_sessions {
+                let last = sess.last_md_recv_ms.load(Ordering::Relaxed);
+                // Only flag as stale once we've received at least one message
+                if last == 0 { continue; }
+                if sess.is_ready().await && (now_ms - last) > STALE_THRESHOLD_MS {
+                    warn!("⚠️  Stale market data feed detected for {} — last message {}ms ago, forcing reconnect",
+                        sess.sender_comp_id, now_ms - last);
+                    // Drop the stream; the message_loop error path will reconnect.
+                    let mut stream = sess.stream.lock().await;
+                    *stream = None;
+                    drop(stream);
+                    *sess.connection_state.lock().await = ConnectionState::Disconnected;
+                    *sess.is_connected.lock().await = false;
+                    // Reset so we don't spam reconnects before the loop fires
+                    sess.last_md_recv_ms.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+
+    // Periodic prune of stale order_timings / order_data / order_times entries.
+    // Orders that never received an execution report (e.g. session dropped) would
+    // otherwise stay in these HashMaps forever, slowly growing RSS.
+    let session_for_prune = Arc::clone(&session);
+    let _order_prune_handle = tokio::spawn(async move {
+        const PRUNE_INTERVAL_SECS: u64 = 300; // run every 5 minutes
+        const MAX_AGE_SECS: i64 = 300;        // drop entries older than 5 minutes
+        let mut prune_interval = interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
+        prune_interval.tick().await; // skip the immediate first tick
+        loop {
+            prune_interval.tick().await;
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            let cutoff_ms = now_ms - MAX_AGE_SECS * 1000;
+
+            // Prune order_timings: drop entries whose file_read_timestamp is older than cutoff
+            {
+                let mut timings = session_for_prune.order_timings.lock().await;
+                let before = timings.len();
+                timings.retain(|_, t| {
+                    t.file_read_timestamp
+                        .map(|ts| ts > cutoff_ms)
+                        .unwrap_or(true) // keep entries with no timestamp (brand-new)
+                });
+                let pruned = before - timings.len();
+                if pruned > 0 {
+                    warn!("🧹 Pruned {} stale order_timings entries", pruned);
+                }
+            }
+
+            // Prune order_data: same keying, drop any cl_ord_id not in timings
+            {
+                let timings = session_for_prune.order_timings.lock().await;
+                let mut data = session_for_prune.order_data.lock().await;
+                let before = data.len();
+                data.retain(|k, _| timings.contains_key(k));
+                let pruned = before - data.len();
+                if pruned > 0 {
+                    warn!("🧹 Pruned {} stale order_data entries", pruned);
+                }
+            }
+
+            // Prune order_times (Instant-based latency tracker): drop if elapsed > 5 min
+            {
+                let mut times = session_for_prune.order_times.lock().await;
+                let before = times.len();
+                times.retain(|_, inst| inst.elapsed().as_secs() < MAX_AGE_SECS as u64);
+                let pruned = before - times.len();
+                if pruned > 0 {
+                    warn!("🧹 Pruned {} stale order_times entries", pruned);
+                }
+            }
         }
     });
 
