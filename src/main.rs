@@ -5480,6 +5480,8 @@ async fn order_book_web_server(
         let imbalance_depth_levels: usize = params.get("imbalance_depth_levels").and_then(|v| v.parse().ok()).unwrap_or(algo::default_imbalance_depth_levels());
         let slippage_bps: f64 = params.get("slippage_bps").and_then(|v| v.parse().ok()).unwrap_or(algo::default_slippage_bps());
         let fee_bps: f64 = params.get("fee_bps").and_then(|v| v.parse().ok()).unwrap_or(algo::default_fee_bps());
+        let maker_fee_bps: f64 = params.get("maker_fee_bps").and_then(|v| v.parse().ok()).unwrap_or(algo::default_maker_fee_bps());
+        let taker_fee_bps: f64 = params.get("taker_fee_bps").and_then(|v| v.parse().ok()).unwrap_or(fee_bps);
         let strategy = match params.get("strategy").map(|s| s.as_str()) {
             Some("market_imbalance") => algo::StrategyType::MarketImbalance,
             _ => algo::StrategyType::SpreadCapture,
@@ -5500,7 +5502,11 @@ async fn order_book_web_server(
             imbalance_depth_levels,
             slippage_bps,
             fee_bps,
+            maker_fee_bps,
+            taker_fee_bps,
             min_signal_interval_ms: 0, // not relevant in backtest
+            max_book_staleness_ms: 0,
+            max_orders_session: 0,
         };
 
         // Query kdb+ for historical snapshots. On any error or empty result, fall back
@@ -5658,7 +5664,11 @@ async fn order_book_web_server(
                             imbalance_depth_levels: depth,
                             slippage_bps: slip,
                             fee_bps: fee,
+                            maker_fee_bps: algo::default_maker_fee_bps(),
+                            taker_fee_bps: fee,
                             min_signal_interval_ms: 0,
+                            max_book_staleness_ms: 0,
+                            max_orders_session: 0,
                         };
                         let result = algo::run_backtest(&cfg, &snapshots);
                         results.push(serde_json::json!({

@@ -74,17 +74,36 @@ pub struct AlgoConfig {
     /// Taker fee in basis points (Crypto.com default ~4 bps = 0.04%).
     #[serde(default = "default_fee_bps")]
     pub fee_bps: f64,
+    /// Maker fee in bps — NEGATIVE means a rebate. Crypto.com MM Program pays a
+    /// maker rebate, so passive (SpreadCapture) fills should use this. Set to your
+    /// actual program rate via /api/algo/config.
+    #[serde(default = "default_maker_fee_bps")]
+    pub maker_fee_bps: f64,
+    /// Taker fee in bps (positive cost) for liquidity-removing (MarketImbalance) fills.
+    #[serde(default = "default_taker_fee_bps")]
+    pub taker_fee_bps: f64,
     /// Minimum milliseconds between consecutive signals — prevents order-quota burn
     /// and reduces adverse selection on stale book updates.
     #[serde(default = "default_min_signal_interval_ms")]
     pub min_signal_interval_ms: u64,
+    /// Suppress entries if the order book has not updated within this many ms
+    /// (guards against quoting on a frozen/stale feed). 0 = disabled.
+    #[serde(default = "default_max_book_staleness_ms")]
+    pub max_book_staleness_ms: u64,
+    /// Hard cap on orders placed per process run (circuit breaker). 0 = unlimited.
+    #[serde(default = "default_max_orders_session")]
+    pub max_orders_session: u64,
 }
 
 pub fn default_imbalance_threshold() -> f64 { 0.6 }
 pub fn default_imbalance_depth_levels() -> usize { 5 }
 pub fn default_slippage_bps() -> f64 { 1.0 }
 pub fn default_fee_bps() -> f64 { 4.0 }
+pub fn default_maker_fee_bps() -> f64 { -1.0 }  // placeholder MM-program rebate; set real rate
+pub fn default_taker_fee_bps() -> f64 { 4.0 }
 pub fn default_min_signal_interval_ms() -> u64 { 500 }
+pub fn default_max_book_staleness_ms() -> u64 { 2000 }
+pub fn default_max_orders_session() -> u64 { 0 }
 
 impl Default for AlgoConfig {
     fn default() -> Self {
@@ -102,7 +121,11 @@ impl Default for AlgoConfig {
             imbalance_depth_levels: default_imbalance_depth_levels(),
             slippage_bps: default_slippage_bps(),
             fee_bps: default_fee_bps(),
+            maker_fee_bps: default_maker_fee_bps(),
+            taker_fee_bps: default_taker_fee_bps(),
             min_signal_interval_ms: default_min_signal_interval_ms(),
+            max_book_staleness_ms: default_max_book_staleness_ms(),
+            max_orders_session: default_max_orders_session(),
         }
     }
 }
@@ -153,6 +176,66 @@ pub struct AlgoStatus {
     pub signals_fired: u64,
     pub orders_placed: u64,
     pub recent_signals: Vec<Signal>,
+    pub paper_mode: bool,
+    pub paper_fills: u64,
+    pub paper_position: f64,
+    pub paper_realized_pnl: f64,
+    pub paper_total_pnl: f64,
+}
+
+/// Shadow-trading (paper) state: simulated inventory and P&L from passive quotes
+/// filled against the LIVE book. Never sends a real order. Mirrors the backtest
+/// fill model (fill only on a real cross; mark at the new mid => adverse selection).
+#[derive(Default)]
+struct PaperState {
+    net_qty: f64,
+    avg_entry: f64,
+    realized: f64,
+    fills: u64,
+    quote_buy: Option<f64>,
+    quote_sell: Option<f64>,
+    last_mid: f64,
+}
+
+impl PaperState {
+    fn apply_fill(&mut self, side: &str, fill: f64, cfg: &AlgoConfig) {
+        let room = if side == "1" {
+            (cfg.max_position - self.net_qty).max(0.0)
+        } else {
+            (cfg.max_position + self.net_qty).max(0.0)
+        };
+        let qty = cfg.order_qty.min(room);
+        if qty <= 1e-12 {
+            return;
+        }
+        let signed = if side == "1" { qty } else { -qty };
+        let prev = self.net_qty;
+        let new_net = prev + signed;
+        if prev.abs() < 1e-12 {
+            self.avg_entry = fill;
+        } else if prev.signum() == signed.signum() {
+            self.avg_entry = (self.avg_entry * prev.abs() + fill * qty) / (prev.abs() + qty);
+        } else {
+            let closing = qty.min(prev.abs());
+            let pnl = if prev > 0.0 {
+                closing * (fill - self.avg_entry)
+            } else {
+                closing * (self.avg_entry - fill)
+            };
+            self.realized += pnl;
+            if new_net.abs() < 1e-12 {
+                self.avg_entry = 0.0;
+            } else if new_net.signum() != prev.signum() {
+                self.avg_entry = fill;
+            }
+        }
+        self.net_qty = new_net;
+        self.fills += 1;
+    }
+
+    fn total_pnl(&self) -> f64 {
+        self.realized + self.net_qty * (self.last_mid - self.avg_entry)
+    }
 }
 
 /// The trading algorithm.
@@ -161,6 +244,11 @@ pub struct TradingAlgo {
     signals_fired: Arc<Mutex<u64>>,
     orders_placed: Arc<Mutex<u64>>,
     signal_log: Arc<Mutex<SignalLog>>,
+    /// Shadow/paper mode. Default TRUE; while true the algo NEVER sends a real
+    /// order — it only simulates fills against the live book. (No toggle is
+    /// exposed yet, so the live-order path is currently unreachable by design.)
+    paper_mode: Arc<std::sync::atomic::AtomicBool>,
+    paper: Arc<Mutex<PaperState>>,
 }
 
 impl TradingAlgo {
@@ -170,16 +258,59 @@ impl TradingAlgo {
             signals_fired: Arc::new(Mutex::new(0)),
             orders_placed: Arc::new(Mutex::new(0)),
             signal_log: Arc::new(Mutex::new(SignalLog::new(50))),
+            paper_mode: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            paper: Arc::new(Mutex::new(PaperState::default())),
         }
     }
 
     /// Return a snapshot of current algo status.
     pub async fn status(&self) -> AlgoStatus {
+        let p = self.paper.lock().await;
         AlgoStatus {
             config: self.config.lock().await.clone(),
             signals_fired: *self.signals_fired.lock().await,
             orders_placed: *self.orders_placed.lock().await,
             recent_signals: self.signal_log.lock().await.recent(20),
+            paper_mode: self.paper_mode.load(std::sync::atomic::Ordering::Relaxed),
+            paper_fills: p.fills,
+            paper_position: p.net_qty,
+            paper_realized_pnl: p.realized,
+            paper_total_pnl: p.total_pnl(),
+        }
+    }
+
+    /// One shadow-trading step. Checks whether last step's resting paper quotes
+    /// were crossed by the live book, books the simulated fill (maker rebate via
+    /// apply_costs + adverse-selection markout at the new mid), then re-posts.
+    async fn paper_step(&self, best_bid: f64, best_ask: f64, cfg: &AlgoConfig) {
+        if best_bid <= 0.0 || best_ask <= best_bid {
+            return; // need a real two-sided book (UAT is bid-only => no paper fills)
+        }
+        let mid = 0.5 * (best_bid + best_ask);
+        let mut p = self.paper.lock().await;
+        p.last_mid = mid;
+
+        if let Some(pb) = p.quote_buy.take() {
+            if best_ask <= pb {
+                let fill = apply_costs(pb, "1", cfg.slippage_bps, cfg.maker_fee_bps);
+                p.apply_fill("1", fill, cfg);
+            }
+        }
+        if let Some(ps) = p.quote_sell.take() {
+            if best_bid >= ps {
+                let fill = apply_costs(ps, "2", cfg.slippage_bps, cfg.maker_fee_bps);
+                p.apply_fill("2", fill, cfg);
+            }
+        }
+
+        let spread_bps = (best_ask - best_bid) / best_bid * 10_000.0;
+        if spread_bps >= cfg.min_spread_bps {
+            if (cfg.max_position - p.net_qty) > 1e-12 {
+                p.quote_buy = Some(best_bid + cfg.tick_size);
+            }
+            if (cfg.max_position + p.net_qty) > 1e-12 {
+                p.quote_sell = Some(best_ask - cfg.tick_size);
+            }
         }
     }
 
@@ -419,8 +550,30 @@ impl TradingAlgo {
                 .map(|p| p.net_qty)
                 .unwrap_or(0.0);
 
-            // Enforce signal cooldown — skip evaluation if fired too recently
+            // Stale-feed guard: never quote on a frozen/stale order book.
             let now_ms = Utc::now().timestamp_millis();
+            if cfg.max_book_staleness_ms > 0 {
+                let last_md = market_session
+                    .last_md_recv_ms
+                    .load(std::sync::atomic::Ordering::Relaxed) as i64;
+                let age = if last_md == 0 { i64::MAX } else { now_ms - last_md };
+                if age > cfg.max_book_staleness_ms as i64 {
+                    warn!("Order book STALE ({} ms) - suppressing algo entries", age);
+                    tokio::time::sleep(interval).await;
+                    continue;
+                }
+            }
+
+            // PAPER/SHADOW MODE: simulate fills against the live book; never send
+            // a real order. Produces a live paper P&L the moment a two-sided
+            // (production) feed is connected.
+            if self.paper_mode.load(std::sync::atomic::Ordering::Relaxed) {
+                self.paper_step(best_bid, best_ask, &cfg).await;
+                tokio::time::sleep(interval).await;
+                continue;
+            }
+
+            // Enforce signal cooldown — skip evaluation if fired too recently
             if cfg.min_signal_interval_ms > 0
                 && (now_ms - last_signal_ms) < cfg.min_signal_interval_ms as i64
             {
@@ -443,6 +596,17 @@ impl TradingAlgo {
                 last_signal_ms = Utc::now().timestamp_millis();
                 *self.signals_fired.lock().await += 1;
                 self.signal_log.lock().await.push(signal.clone());
+
+                // Circuit breaker: stop placing once max_orders_session is hit.
+                if cfg.max_orders_session > 0
+                    && *self.orders_placed.lock().await >= cfg.max_orders_session
+                {
+                    warn!(
+                        "max_orders_session ({}) reached - halting order placement",
+                        cfg.max_orders_session
+                    );
+                    continue;
+                }
 
                 // Place the order via the FIX order session
                 let side_char = signal.side.chars().next().unwrap_or('1');
@@ -551,182 +715,159 @@ fn apply_costs(price: f64, side: &str, slippage_bps: f64, fee_bps: f64) -> f64 {
     }
 }
 
-/// Run the algo signal logic against a slice of historical snapshots.
+/// Run a passive market-making simulation over historical snapshots.
 ///
-/// Fills are assumed to occur at the signal price adjusted for slippage and
-/// fees (configured via `cfg.slippage_bps` and `cfg.fee_bps`).
+/// Two things make this honest where the old version was not:
+///  1. SANITY FILTER — one-sided, crossed, absurd-spread (>5%) or spike (>10%
+///     mid jump) ticks are dropped. Corrupt feed ticks otherwise produce garbage
+///     mark-to-market (e.g. a bogus best_ask blew P&L up to ~1e10).
+///  2. ADVERSE SELECTION — a passive quote posted at snapshot[i] only fills at
+///     snapshot[i+1] if the market actually trades THROUGH it (best_ask<=our bid,
+///     or best_bid>=our offer). The resulting inventory is then marked at the NEW
+///     mid, so a buy that fills *because price fell* is immediately marked down.
+///     That captures adverse selection — the term that actually decides whether
+///     market-making is profitable. The maker rebate is applied to the fill via
+///     `apply_costs` (a negative fee improves the fill).
+///
+/// Conservative by design: one-requote-interval quote life, no queue-jumping, no
+/// partial fills. It under-counts fills, not edge.
 pub fn run_backtest(cfg: &AlgoConfig, snapshots: &[Snapshot]) -> BacktestResult {
-    let mut trades: Vec<BacktestTrade> = Vec::new();
-    let mut equity_curve: Vec<[f64; 2]> = Vec::new();
+    // ── 1. Sanity-filter snapshots ────────────────────────────────────────
+    let mut clean: Vec<Snapshot> = Vec::with_capacity(snapshots.len());
+    let mut prev_mid: Option<f64> = None;
+    for s in snapshots {
+        if s.best_bid <= 0.0 || s.best_ask <= s.best_bid {
+            continue;
+        }
+        let mid = 0.5 * (s.best_bid + s.best_ask);
+        if (s.best_ask - s.best_bid) / s.best_bid > 0.05 {
+            continue; // >5% spread = junk tick
+        }
+        if let Some(pm) = prev_mid {
+            if (mid - pm).abs() / pm > 0.10 {
+                continue; // >10% mid jump = bad tick
+            }
+        }
+        prev_mid = Some(mid);
+        clean.push(s.clone());
+    }
+
+    let maker_fee = cfg.maker_fee_bps;
 
     let mut net_qty: f64 = 0.0;
-    let mut avg_entry_px: f64 = 0.0;
-    let mut realized_pnl: f64 = 0.0;
-    let mut last_mid_px: Option<f64> = None;
+    let mut avg_entry: f64 = 0.0;
+    let mut realized: f64 = 0.0;
 
-    // For Sharpe/Sortino: collect per-trade P&L increments
+    let mut trades: Vec<BacktestTrade> = Vec::new();
+    let mut equity_curve: Vec<[f64; 2]> = Vec::new();
     let mut pnl_increments: Vec<f64> = Vec::new();
-
-    // For max drawdown
     let mut peak_equity: f64 = 0.0;
     let mut max_drawdown: f64 = 0.0;
-
-    // For avg round-trip duration
     let mut position_open_time: Option<i64> = None;
     let mut round_trip_durations_ms: Vec<i64> = Vec::new();
-
-    // For max consecutive losses
     let mut consecutive_losses: u32 = 0;
     let mut max_consecutive_losses: u32 = 0;
+    let mut last_mid: Option<f64> = None;
 
-    // Downsample price series: at most 2000 points to keep payload small
-    let price_step = (snapshots.len() / 2000).max(1);
-    let price_series: Vec<[f64; 3]> = snapshots
+    let price_step = (clean.len() / 2000).max(1);
+    let price_series: Vec<[f64; 3]> = clean
         .iter()
         .enumerate()
         .filter(|(i, _)| i % price_step == 0)
         .map(|(_, s)| [s.timestamp_ms as f64, s.best_bid, s.best_ask])
         .collect();
 
-    for snap in snapshots {
-        if snap.best_bid <= 0.0 || snap.best_ask <= 0.0 || snap.best_ask <= snap.best_bid {
-            continue;
-        }
-        let mid_px = (snap.best_bid + snap.best_ask) / 2.0;
-        last_mid_px = Some(mid_px);
+    // ── 2. Walk consecutive snapshots; quotes from prev, fills at cur ──────
+    for w in clean.windows(2) {
+        let prev = &w[0];
+        let cur = &w[1];
+        let mid = 0.5 * (cur.best_bid + cur.best_ask);
+        last_mid = Some(mid);
 
-        // Prefer full depth slices from the snapshot; fall back to top-of-book.
-        let bids: Vec<(f64, f64)> = if !snap.bids.is_empty() {
-            snap.bids.clone()
-        } else if snap.best_bid_size > 0.0 {
-            vec![(snap.best_bid, snap.best_bid_size)]
-        } else {
-            vec![]
-        };
-        let asks: Vec<(f64, f64)> = if !snap.asks.is_empty() {
-            snap.asks.clone()
-        } else if snap.best_ask_size > 0.0 {
-            vec![(snap.best_ask, snap.best_ask_size)]
-        } else {
-            vec![]
-        };
+        let spread_bps = (prev.best_ask - prev.best_bid) / prev.best_bid * 10_000.0;
 
-        let signals = TradingAlgo::evaluate_signal(
-            cfg,
-            snap.best_bid,
-            snap.best_ask,
-            &bids,
-            &asks,
-            net_qty,
-        );
+        if spread_bps >= cfg.min_spread_bps {
+            let p_buy = prev.best_bid + cfg.tick_size;
+            let p_sell = prev.best_ask - cfg.tick_size;
 
-        // For equity tracking on ticks with no signal, still update drawdown curve.
-        if signals.is_empty() {
-            let total_equity = realized_pnl + net_qty * (mid_px - avg_entry_px);
-            if total_equity > peak_equity {
-                peak_equity = total_equity;
+            let mut fills: Vec<(&str, f64)> = Vec::new();
+            if cur.best_ask <= p_buy {
+                fills.push(("1", p_buy));
             }
-            let drawdown = peak_equity - total_equity;
-            if drawdown > max_drawdown {
-                max_drawdown = drawdown;
-            }
-            equity_curve.push([snap.timestamp_ms as f64, total_equity]);
-            continue;
-        }
-
-        for sig in signals {
-            // Apply slippage + fee to the fill price
-            let fill_price = apply_costs(sig.price, &sig.side, cfg.slippage_bps, cfg.fee_bps);
-            let fill_qty = sig.qty;
-            let signed_qty = if sig.side == "1" { fill_qty } else { -fill_qty };
-            let prev_net = net_qty;
-            let new_net = prev_net + signed_qty;
-            let mut trade_pnl: f64 = 0.0;
-
-            // Track position open time for round-trip duration
-            if prev_net.abs() < 1e-10 && new_net.abs() >= 1e-10 {
-                position_open_time = Some(snap.timestamp_ms);
+            if cur.best_bid >= p_sell {
+                fills.push(("2", p_sell));
             }
 
-            if prev_net == 0.0 {
-                // Opening a new position
-                avg_entry_px = fill_price;
-            } else if prev_net > 0.0 && signed_qty > 0.0 {
-                // Adding to long
-                let total_cost = avg_entry_px * prev_net + fill_price * fill_qty;
-                avg_entry_px = total_cost / new_net;
-            } else if prev_net < 0.0 && signed_qty < 0.0 {
-                // Adding to short
-                let total_cost = avg_entry_px * prev_net.abs() + fill_price * fill_qty;
-                avg_entry_px = total_cost / new_net.abs();
-            } else {
-                // Closing or reversing
-                let closing_qty = fill_qty.min(prev_net.abs());
-                trade_pnl = if prev_net > 0.0 {
-                    closing_qty * (fill_price - avg_entry_px)
+            for (side, quote_px) in fills {
+                let room = if side == "1" {
+                    (cfg.max_position - net_qty).max(0.0)
                 } else {
-                    closing_qty * (avg_entry_px - fill_price)
+                    (cfg.max_position + net_qty).max(0.0)
                 };
-                realized_pnl += trade_pnl;
-                if new_net.abs() < 1e-10 {
-                    avg_entry_px = 0.0;
-                    // Record round-trip duration
-                    if let Some(open_ts) = position_open_time.take() {
-                        round_trip_durations_ms.push(snap.timestamp_ms - open_ts);
+                let qty = cfg.order_qty.min(room);
+                if qty <= 1e-12 {
+                    continue;
+                }
+
+                let fill = apply_costs(quote_px, side, cfg.slippage_bps, maker_fee);
+                let signed = if side == "1" { qty } else { -qty };
+                let prev_net = net_qty;
+                let new_net = prev_net + signed;
+                let mut trade_pnl = 0.0;
+
+                if prev_net.abs() < 1e-12 {
+                    avg_entry = fill;
+                    position_open_time = Some(cur.timestamp_ms);
+                } else if prev_net.signum() == signed.signum() {
+                    avg_entry =
+                        (avg_entry * prev_net.abs() + fill * qty) / (prev_net.abs() + qty);
+                } else {
+                    let closing = qty.min(prev_net.abs());
+                    trade_pnl = if prev_net > 0.0 {
+                        closing * (fill - avg_entry)
+                    } else {
+                        closing * (avg_entry - fill)
+                    };
+                    realized += trade_pnl;
+                    if new_net.abs() < 1e-12 {
+                        avg_entry = 0.0;
+                        if let Some(open) = position_open_time.take() {
+                            round_trip_durations_ms.push(cur.timestamp_ms - open);
+                        }
+                    } else if new_net.signum() != prev_net.signum() {
+                        avg_entry = fill;
+                        position_open_time = Some(cur.timestamp_ms);
                     }
-                } else if new_net.signum() != prev_net.signum() {
-                    avg_entry_px = fill_price;
                 }
-            }
 
-            net_qty = new_net;
-            let cumulative_pnl = realized_pnl + net_qty * (mid_px - avg_entry_px);
-
-            pnl_increments.push(trade_pnl);
-
-            // Track consecutive losses
-            if trade_pnl < 0.0 {
-                consecutive_losses += 1;
-                if consecutive_losses > max_consecutive_losses {
-                    max_consecutive_losses = consecutive_losses;
+                net_qty = new_net;
+                let cum = realized + net_qty * (mid - avg_entry);
+                pnl_increments.push(trade_pnl);
+                if trade_pnl < 0.0 {
+                    consecutive_losses += 1;
+                    max_consecutive_losses = max_consecutive_losses.max(consecutive_losses);
+                } else if trade_pnl > 0.0 {
+                    consecutive_losses = 0;
                 }
-            } else if trade_pnl > 0.0 {
-                consecutive_losses = 0;
+                trades.push(BacktestTrade {
+                    timestamp_ms: cur.timestamp_ms,
+                    side: side.to_string(),
+                    price: fill,
+                    qty,
+                    pnl: trade_pnl,
+                    cumulative_pnl: cum,
+                    net_qty_after: net_qty,
+                });
             }
-
-            // Update drawdown
-            if cumulative_pnl > peak_equity {
-                peak_equity = cumulative_pnl;
-            }
-            let drawdown = peak_equity - cumulative_pnl;
-            if drawdown > max_drawdown {
-                max_drawdown = drawdown;
-            }
-
-            trades.push(BacktestTrade {
-                timestamp_ms: snap.timestamp_ms,
-                side: sig.side,
-                price: fill_price,
-                qty: fill_qty,
-                pnl: trade_pnl,
-                cumulative_pnl,
-                net_qty_after: net_qty,
-            });
         }
 
-        // One equity point per snapshot, including unrealised mark-to-market.
-        let total_equity = realized_pnl + net_qty * (mid_px - avg_entry_px);
-        if total_equity > peak_equity {
-            peak_equity = total_equity;
-        }
-        let drawdown = peak_equity - total_equity;
-        if drawdown > max_drawdown {
-            max_drawdown = drawdown;
-        }
-        equity_curve.push([snap.timestamp_ms as f64, total_equity]);
+        let equity = realized + net_qty * (mid - avg_entry);
+        peak_equity = peak_equity.max(equity);
+        max_drawdown = max_drawdown.max(peak_equity - equity);
+        equity_curve.push([cur.timestamp_ms as f64, equity]);
     }
 
-    // Compute summary stats
+    // ── 3. Summary statistics ─────────────────────────────────────────────
     let winning_trades = trades.iter().filter(|t| t.pnl > 0.0).count();
     let losing_trades = trades.iter().filter(|t| t.pnl < 0.0).count();
     let total_trades = trades.len();
@@ -736,34 +877,30 @@ pub fn run_backtest(cfg: &AlgoConfig, snapshots: &[Snapshot]) -> BacktestResult 
         0.0
     };
 
-    // Sharpe: mean / stddev of per-trade P&L increments (non-zero only)
     let nonzero: Vec<f64> = pnl_increments.iter().cloned().filter(|&v| v != 0.0).collect();
     let sharpe_ratio = if nonzero.len() >= 2 {
         let mean = nonzero.iter().sum::<f64>() / nonzero.len() as f64;
-        let variance = nonzero.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / nonzero.len() as f64;
-        let std_dev = variance.sqrt();
-        if std_dev > 0.0 { mean / std_dev * (252_f64.sqrt()) } else { 0.0 }
+        let var = nonzero.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / nonzero.len() as f64;
+        let sd = var.sqrt();
+        if sd > 0.0 { mean / sd * (252_f64.sqrt()) } else { 0.0 }
     } else {
         0.0
     };
-
-    // Sortino: penalises only downside (negative) returns
     let sortino_ratio = if nonzero.len() >= 2 {
         let mean = nonzero.iter().sum::<f64>() / nonzero.len() as f64;
         let neg: Vec<f64> = nonzero.iter().cloned().filter(|&v| v < 0.0).collect();
         if neg.len() >= 2 {
-            let downside_var = neg.iter().map(|v| v.powi(2)).sum::<f64>() / neg.len() as f64;
-            let downside_std = downside_var.sqrt();
-            if downside_std > 0.0 { mean / downside_std * (252_f64.sqrt()) } else { 0.0 }
+            let dvar = neg.iter().map(|v| v.powi(2)).sum::<f64>() / neg.len() as f64;
+            let dsd = dvar.sqrt();
+            if dsd > 0.0 { mean / dsd * (252_f64.sqrt()) } else { 0.0 }
+        } else if mean > 0.0 {
+            f64::INFINITY
         } else {
-            // No losing trades → perfect downside ratio
-            if mean > 0.0 { f64::INFINITY } else { 0.0 }
+            0.0
         }
     } else {
         0.0
     };
-
-    // Profit factor: gross_profit / gross_loss
     let gross_profit: f64 = pnl_increments.iter().filter(|&&v| v > 0.0).sum();
     let gross_loss: f64 = pnl_increments.iter().filter(|&&v| v < 0.0).map(|v| v.abs()).sum();
     let profit_factor = if gross_loss > 0.0 {
@@ -773,17 +910,14 @@ pub fn run_backtest(cfg: &AlgoConfig, snapshots: &[Snapshot]) -> BacktestResult 
     } else {
         0.0
     };
-
-    // Average round-trip duration
     let avg_trade_duration_ms = if !round_trip_durations_ms.is_empty() {
         round_trip_durations_ms.iter().sum::<i64>() / round_trip_durations_ms.len() as i64
     } else {
         0
     };
-
-    let final_total_pnl = match last_mid_px {
-        Some(mid_px) => realized_pnl + net_qty * (mid_px - avg_entry_px),
-        None => realized_pnl,
+    let total_pnl = match last_mid {
+        Some(m) => realized + net_qty * (m - avg_entry),
+        None => realized,
     };
 
     BacktestResult {
@@ -792,7 +926,7 @@ pub fn run_backtest(cfg: &AlgoConfig, snapshots: &[Snapshot]) -> BacktestResult 
             winning_trades,
             losing_trades,
             win_rate_pct,
-            total_pnl: final_total_pnl,
+            total_pnl,
             max_drawdown,
             sharpe_ratio,
             sortino_ratio,
@@ -800,7 +934,7 @@ pub fn run_backtest(cfg: &AlgoConfig, snapshots: &[Snapshot]) -> BacktestResult 
             avg_trade_duration_ms,
             max_consecutive_losses,
             final_position: net_qty,
-            snapshots_processed: snapshots.len(),
+            snapshots_processed: clean.len(),
         },
         trades,
         equity_curve,
@@ -828,7 +962,11 @@ mod tests {
             // Zero costs so existing numeric assertions remain valid
             slippage_bps: 0.0,
             fee_bps: 0.0,
+            maker_fee_bps: 0.0,
+            taker_fee_bps: 0.0,
             min_signal_interval_ms: 0,
+            max_book_staleness_ms: 0,
+            max_orders_session: 0,
         }
     }
 
@@ -915,86 +1053,61 @@ mod tests {
     }
 
     #[test]
-    fn run_backtest_marks_open_inventory_to_market() {
-        let mut cfg = test_cfg();
-        cfg.order_qty = 1.0;
-        cfg.max_position = 1.0;
-
-        // Single even timestamp => one BUY at 100.5, end mid is 102.0.
-        let snapshots = vec![Snapshot {
-            timestamp_ms: 2,
-            best_bid: 100.0,
-            best_ask: 104.0,
-            ..Default::default()
-        }];
-
-        let result = run_backtest(&cfg, &snapshots);
-        assert_eq!(result.summary.total_trades, 1);
-        assert!((result.summary.final_position - 1.0).abs() < 1e-9);
-        assert!((result.summary.total_pnl - 1.5).abs() < 1e-9);
-        assert_eq!(result.equity_curve.len(), 1);
-    }
-
-    #[test]
-    fn run_backtest_has_at_most_one_trade_per_snapshot() {
-        let cfg = test_cfg();
-        let snapshots = vec![
-            Snapshot { timestamp_ms: 2, best_bid: 100.0, best_ask: 102.0, ..Default::default() },
-            Snapshot { timestamp_ms: 3, best_bid: 100.0, best_ask: 102.0, ..Default::default() },
-            Snapshot { timestamp_ms: 4, best_bid: 100.0, best_ask: 102.0, ..Default::default() },
+    fn run_backtest_fills_buy_when_market_crosses_down() {
+        let cfg = test_cfg(); // tick=0.5, qty=1, fees 0
+        // s0 posts a passive buy at 100.5; s1 best_ask=100.5 trades through it.
+        let snaps = vec![
+            Snapshot { timestamp_ms: 1, best_bid: 100.0, best_ask: 102.0, ..Default::default() },
+            Snapshot { timestamp_ms: 2, best_bid: 100.0, best_ask: 100.5, ..Default::default() },
         ];
-
-        let result = run_backtest(&cfg, &snapshots);
-        assert!(result.summary.total_trades <= snapshots.len());
-        assert_eq!(result.equity_curve.len(), snapshots.len());
+        let r = run_backtest(&cfg, &snaps);
+        assert_eq!(r.summary.total_trades, 1);
+        assert_eq!(r.trades[0].side, "1");
+        assert!((r.trades[0].price - 100.5).abs() < 1e-9);
+        assert!((r.summary.final_position - 1.0).abs() < 1e-9);
+        assert!(r.summary.total_pnl.is_finite());
     }
 
     #[test]
-    fn run_backtest_applies_fees_to_fill_price() {
-        let mut cfg = test_cfg();
-        cfg.order_qty = 1.0;
-        cfg.max_position = 1.0;
-        cfg.fee_bps = 10.0; // 0.1% fee for easy math
-        cfg.slippage_bps = 0.0;
-
-        // BUY at 100.5 with 10bps fee => fill at 100.5 * 1.001 = 100.6005
-        // Mid = (100.0 + 104.0) / 2 = 102.0
-        // PnL = 102.0 - 100.6005 = 1.3995
-        let snapshots = vec![Snapshot {
-            timestamp_ms: 2,
-            best_bid: 100.0,
-            best_ask: 104.0,
-            ..Default::default()
-        }];
-
-        let result = run_backtest(&cfg, &snapshots);
-        assert_eq!(result.summary.total_trades, 1);
-        // Fill price should be higher than signal price due to fee
-        assert!(result.trades[0].price > 100.5);
-        // Total PnL should be less than zero-cost scenario (1.5)
-        assert!(result.summary.total_pnl < 1.5);
+    fn run_backtest_no_fill_without_a_cross() {
+        let cfg = test_cfg();
+        // s1 ask=101.6 > buy quote 100.5, bid=100 < sell quote 101.5 -> no cross.
+        let snaps = vec![
+            Snapshot { timestamp_ms: 1, best_bid: 100.0, best_ask: 102.0, ..Default::default() },
+            Snapshot { timestamp_ms: 2, best_bid: 100.0, best_ask: 101.6, ..Default::default() },
+        ];
+        let r = run_backtest(&cfg, &snaps);
+        assert_eq!(r.summary.total_trades, 0);
+        assert!(r.summary.total_pnl.abs() < 1e-9);
     }
 
     #[test]
-    fn backtest_uses_depth_slices_from_snapshot() {
+    fn run_backtest_filters_bad_tick_and_stays_finite() {
+        let cfg = test_cfg();
+        // Middle snapshot is a corrupt tick (absurd ask): must be dropped and must
+        // NOT blow up P&L (this is exactly the old 1e10 failure mode).
+        let snaps = vec![
+            Snapshot { timestamp_ms: 1, best_bid: 100.0, best_ask: 102.0, ..Default::default() },
+            Snapshot { timestamp_ms: 2, best_bid: 100.0, best_ask: 1.0e13, ..Default::default() },
+            Snapshot { timestamp_ms: 3, best_bid: 100.0, best_ask: 100.5, ..Default::default() },
+        ];
+        let r = run_backtest(&cfg, &snaps);
+        assert_eq!(r.summary.snapshots_processed, 2); // bad tick dropped
+        assert!(r.summary.total_pnl.is_finite());
+        assert!(r.summary.total_pnl.abs() < 1.0e6);
+    }
+
+    #[test]
+    fn run_backtest_maker_rebate_improves_buy_fill() {
         let mut cfg = test_cfg();
-        cfg.strategy = StrategyType::MarketImbalance;
-        cfg.imbalance_threshold = 0.6;
-        cfg.imbalance_depth_levels = 2;
-
-        // Snapshot with full depth — bid-heavy (70% bid)
-        let snapshots = vec![Snapshot {
-            timestamp_ms: 1,
-            best_bid: 100.0,
-            best_ask: 101.0,
-            best_bid_size: 7.0,
-            best_ask_size: 3.0,
-            bids: vec![(100.0, 5.0), (99.5, 2.0)],
-            asks: vec![(101.0, 3.0)],
-        }];
-
-        let result = run_backtest(&cfg, &snapshots);
-        assert_eq!(result.summary.total_trades, 1);
-        assert_eq!(result.trades[0].side, "1"); // BUY signal
+        cfg.maker_fee_bps = -10.0; // 10bps rebate -> buy fills BELOW the quote
+        let snaps = vec![
+            Snapshot { timestamp_ms: 1, best_bid: 100.0, best_ask: 102.0, ..Default::default() },
+            Snapshot { timestamp_ms: 2, best_bid: 100.0, best_ask: 100.5, ..Default::default() },
+        ];
+        let r = run_backtest(&cfg, &snaps);
+        assert_eq!(r.summary.total_trades, 1);
+        assert!(r.trades[0].price < 100.5);
     }
 }
+
