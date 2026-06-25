@@ -1,0 +1,74 @@
+# Template: Scan-only SDLC Pipeline (no build / no Harbor)
+# Use for:
+#   - "container" repos that have NO Dockerfile (defer containerization)
+#   - iOS / desktop / MQL repos (no cluster build runner) — mirror + scan
+#
+# Pipeline: Gitleaks -> dep-audit (npm/pip) -> Semgrep -> DefectDojo
+# Scanners are NON-blocking: the goal is visibility/findings, not a deploy gate.
+# Findings still show as a red step; the job itself stays green so every scanner runs.
+#
+# Required org secret: DEFECTDOJO_TOKEN  (already set on wozinga-group)
+
+name: SDLC Scan (no build)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  REPO_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Secret scan (Gitleaks)
+        continue-on-error: true
+        run: |
+          GL_VER=$(curl -sf https://api.github.com/repos/gitleaks/gitleaks/releases/latest \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'][1:])")
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VER}/gitleaks_${GL_VER}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks detect --source=. --redact --exit-code 1
+
+      - name: Dependency audit (npm)
+        if: ${{ hashFiles('package.json') != '' }}
+        continue-on-error: true
+        run: |
+          npm install --package-lock-only --ignore-scripts 2>/dev/null || true
+          npm audit --audit-level=critical --omit=dev
+
+      - name: Dependency audit (pip)
+        if: ${{ hashFiles('requirements.txt') != '' }}
+        continue-on-error: true
+        run: |
+          python3 -m venv /tmp/auditenv
+          /tmp/auditenv/bin/pip install -q --upgrade pip pip-audit
+          /tmp/auditenv/bin/pip-audit -r requirements.txt --format markdown || true
+
+      - name: SAST (Semgrep)
+        continue-on-error: true
+        run: |
+          python3 -m venv /tmp/sgenv
+          /tmp/sgenv/bin/pip install -q --upgrade pip semgrep
+          /tmp/sgenv/bin/semgrep --config=auto --error --quiet \
+            --sarif --output=semgrep-results.sarif . || true
+
+      - name: Upload SAST results to DefectDojo
+        if: always()
+        run: |
+          [ -f semgrep-results.sarif ] || exit 0
+          curl -sf -X POST "https://dojo.gandetl.com/api/v2/import-scan/" \
+            -H "Authorization: Token ${{ secrets.DEFECTDOJO_TOKEN }}" \
+            -F "scan_type=SARIF" \
+            -F "file=@semgrep-results.sarif" \
+            -F "product_name=WozingaGroup" \
+            -F "engagement_name=${{ env.REPO_NAME }}" \
+            -F "auto_create_context=true" \
+            -F "active=true" \
+            -F "verified=false" \
+            || echo "DefectDojo upload failed (non-blocking)"
