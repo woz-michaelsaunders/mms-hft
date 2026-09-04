@@ -1,0 +1,65 @@
+# Example configuration for fix_server (Wozinga Trading Platform)
+# Copy this file to config.toml and fill in your actual credentials.
+# config.toml is git-ignored — never commit it.
+
+# ─── Order Management Session ────────────────────────────────────────────────
+[order_management]
+# FIX gateway TCP endpoint for order submission / execution reports
+gateway_url    = "tcp://fix-uat.crypto.com:34404"
+# SenderCompID assigned to your trading account by the exchange
+sender_comp_id = "UAT1.WOZINGA.UD.00"
+# TargetCompID of the exchange gateway
+target_comp_id = "UAT1.CDC.UD"
+
+# ─── Market Data Session — BTC symbols ───────────────────────────────────────
+[market_data_btc]
+gateway_url    = "tcp://fix-uat.crypto.com:34402"
+sender_comp_id = "UAT1.WOZINGA.MD.00"
+target_comp_id = "UAT1.CDC.MD"
+
+# ─── Market Data Sessions — Other symbols (ports 34405 / 34406 / 34407) ─────
+# base_url is the hostname; ports are specified individually below.
+[market_data_others]
+base_url       = "fix-uat.crypto.com"
+sender_comp_id = "UAT1.WOZINGA.MD.00"
+target_comp_id = "UAT1.CDC.MD"
+# Symbols whose first character is 0-9 or A-D
+port_34405     = 34405
+# Symbols whose first character is E-M
+port_34406     = 34406
+# Symbols whose first character is N-Z
+port_34407     = 34407
+
+# ─── API Credentials ─────────────────────────────────────────────────────────
+[api]
+# Crypto.com API key (used to sign the Logon HMAC-SHA256 password)
+api_key    = "YOUR_API_KEY_HERE"
+api_secret = "YOUR_API_SECRET_HERE"
+
+# ─── Connection Tuning ───────────────────────────────────────────────────────
+[connection]
+# How often to send FIX Heartbeat messages (seconds)
+heartbeat_interval      = 30
+# Maximum number of reconnection attempts before giving up (-1 = unlimited)
+max_reconnect_attempts  = 10
+# Initial reconnect backoff in milliseconds (doubles on each failure, max 30 s)
+reconnect_backoff_ms    = 1000
+
+# ─── kdb+ Connection (environment variables — not in this file) ──────────────
+# KDB_HOST  (default: localhost)
+# KDB_PORT  (default: 5001)
+# Start the kdb+ server first:  q kdb/start_kdb_server.q
+
+# ─── Trading Algorithm Defaults ──────────────────────────────────────────────
+# The algo starts disabled.  Enable it at runtime via POST /api/algo/enable
+# or by calling POST /api/algo/config with {"enabled": true, ...}.
+#
+# [algo]                        (not loaded from config.toml — set via REST API)
+# enabled          = false
+# symbol           = "BTC_USDT"
+# order_qty        = 0.001       # base currency units per order
+# min_spread_bps   = 5.0         # minimum spread in basis points to enter
+# max_position     = 0.01        # max net position before suppressing new orders
+# poll_interval_ms = 1000        # evaluation frequency in milliseconds
+# tick_size        = 0.01        # price step for passive quoting
+# time_in_force    = "3"         # "3"=IOC (safe default), "0"=Day, "4"=FOK

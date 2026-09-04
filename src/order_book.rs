@@ -6,7 +6,7 @@
 // - Branch-predictable update logic
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 /// Price level precision: 0.01 (2 decimal places)
 /// Price is stored as integer: price * 100
@@ -82,7 +82,13 @@ pub struct OrderBook {
     // Only used if price exceeds dense array bounds
     sparse_bids: HashMap<u64, PriceLevel>,
     sparse_asks: HashMap<u64, PriceLevel>,
-    // Cached best bid/ask for O(1) queries
+    // BTreeMap secondary indexes for O(log n) best-price tracking.
+    // Maps price_cents -> size_scaled; zero-size entries are removed on delete.
+    // Best bid  = bid_index.iter().next_back()  (highest key)
+    // Best ask  = ask_index.iter().next()        (lowest key)
+    bid_index: BTreeMap<u64, u64>,
+    ask_index: BTreeMap<u64, u64>,
+    // Cached best bid/ask for O(1) reads after every update
     best_bid: AtomicU64,  // Price in cents
     best_ask: AtomicU64,  // Price in cents
     best_bid_size: AtomicU64,
@@ -110,6 +116,8 @@ impl OrderBook {
             asks: vec![None; dense_size],
             sparse_bids: HashMap::with_capacity(1000),
             sparse_asks: HashMap::with_capacity(1000),
+            bid_index: BTreeMap::new(),
+            ask_index: BTreeMap::new(),
             best_bid: AtomicU64::new(0),
             best_ask: AtomicU64::new(u64::MAX),
             best_bid_size: AtomicU64::new(0),
@@ -142,14 +150,15 @@ impl OrderBook {
         }
     }
 
-    /// Adjust price base to center dense array around current price
+    /// Adjust price base to center dense array around current price.
+    /// Clears BTreeMap indexes because the dense array mapping becomes stale.
     #[inline(always)]
     fn adjust_price_base(&mut self, price_cents: u64) {
-        // Center the dense array around this price
         let new_base = price_cents.saturating_sub(self.dense_size as u64 / 2);
         if new_base != self.price_base {
-            // Clear and recenter (in production, you'd migrate existing levels)
             self.price_base = new_base;
+            self.bid_index.clear();
+            self.ask_index.clear();
         }
     }
 
@@ -180,11 +189,20 @@ impl OrderBook {
                 if let Some(idx) = dense_idx {
                     self.bids[idx] = level;
                 } else {
-                    if size_scaled > 0 {
-                        self.sparse_bids.insert(price_cents, level.unwrap());
-                    } else {
-                        self.sparse_bids.remove(&price_cents);
+                    // Price has drifted outside the dense range — re-center and clear
+                    // stale sparse entries to prevent unbounded HashMap growth.
+                    self.adjust_price_base(price_cents);
+                    self.sparse_bids.clear();
+                    self.sparse_asks.clear();
+                    if let Some(idx) = self.get_dense_index(price_cents) {
+                        self.bids[idx] = level;
                     }
+                }
+                // Maintain BTreeMap index
+                if size_scaled > 0 {
+                    self.bid_index.insert(price_cents, size_scaled);
+                } else {
+                    self.bid_index.remove(&price_cents);
                 }
                 self.update_best_bid()
             }
@@ -193,11 +211,20 @@ impl OrderBook {
                 if let Some(idx) = dense_idx {
                     self.asks[idx] = level;
                 } else {
-                    if size_scaled > 0 {
-                        self.sparse_asks.insert(price_cents, level.unwrap());
-                    } else {
-                        self.sparse_asks.remove(&price_cents);
+                    // Price has drifted outside the dense range — re-center and clear
+                    // stale sparse entries to prevent unbounded HashMap growth.
+                    self.adjust_price_base(price_cents);
+                    self.sparse_bids.clear();
+                    self.sparse_asks.clear();
+                    if let Some(idx) = self.get_dense_index(price_cents) {
+                        self.asks[idx] = level;
                     }
+                }
+                // Maintain BTreeMap index
+                if size_scaled > 0 {
+                    self.ask_index.insert(price_cents, size_scaled);
+                } else {
+                    self.ask_index.remove(&price_cents);
                 }
                 self.update_best_ask()
             }
@@ -216,62 +243,20 @@ impl OrderBook {
         }
     }
 
-    /// Update best bid by scanning dense array and sparse map
+    /// Return best bid (highest price) from the BTreeMap index — O(log n).
     #[inline(always)]
     fn update_best_bid(&self) -> (u64, u64) {
-        let mut best_price = 0u64;
-        let mut best_size = 0u64;
-
-        // Scan dense array (highest price first)
-        for i in (0..self.dense_size).rev() {
-            if let Some(level) = &self.bids[i] {
-                if level.size > 0 && level.price > best_price {
-                    best_price = level.price;
-                    best_size = level.size;
-                }
-            }
-        }
-
-        // Check sparse map
-        for (price, level) in &self.sparse_bids {
-            if level.size > 0 && *price > best_price {
-                best_price = *price;
-                best_size = level.size;
-            }
-        }
-
-        (best_price, best_size)
+        self.bid_index.iter().next_back()
+            .map(|(&p, &s)| (p, s))
+            .unwrap_or((0, 0))
     }
 
-    /// Update best ask by scanning dense array and sparse map
+    /// Return best ask (lowest price) from the BTreeMap index — O(log n).
     #[inline(always)]
     fn update_best_ask(&self) -> (u64, u64) {
-        let mut best_price = u64::MAX;
-        let mut best_size = 0u64;
-
-        // Scan dense array (lowest price first)
-        for i in 0..self.dense_size {
-            if let Some(level) = &self.asks[i] {
-                if level.size > 0 && level.price < best_price {
-                    best_price = level.price;
-                    best_size = level.size;
-                }
-            }
-        }
-
-        // Check sparse map
-        for (price, level) in &self.sparse_asks {
-            if level.size > 0 && *price < best_price {
-                best_price = *price;
-                best_size = level.size;
-            }
-        }
-
-        if best_price == u64::MAX {
-            (0, 0)
-        } else {
-            (best_price, best_size)
-        }
+        self.ask_index.iter().next()
+            .map(|(&p, &s)| (p, s))
+            .unwrap_or((0, 0))
     }
 
     /// Clear entire order book (for Empty Book message)
@@ -281,6 +266,8 @@ impl OrderBook {
         self.asks.fill(None);
         self.sparse_bids.clear();
         self.sparse_asks.clear();
+        self.bid_index.clear();
+        self.ask_index.clear();
         self.best_bid.store(0, Ordering::Relaxed);
         self.best_ask.store(u64::MAX, Ordering::Relaxed);
         self.best_bid_size.store(0, Ordering::Relaxed);
@@ -475,6 +462,8 @@ impl Clone for OrderBook {
             asks: self.asks.clone(),
             sparse_bids: self.sparse_bids.clone(),
             sparse_asks: self.sparse_asks.clone(),
+            bid_index: self.bid_index.clone(),
+            ask_index: self.ask_index.clone(),
             best_bid: AtomicU64::new(best_bid_val),
             best_ask: AtomicU64::new(best_ask_val),
             best_bid_size: AtomicU64::new(self.best_bid_size.load(Ordering::Relaxed)),
@@ -493,6 +482,76 @@ impl Clone for OrderBook {
         }
         
         cloned
+    }
+}
+
+/// Compact read-only snapshot of an order book.
+/// Built from a full `OrderBook` by capturing only the top-N price levels and
+/// recent trades — much cheaper to create than cloning the full dense array.
+#[derive(Debug, Clone)]
+pub struct OrderBookSnapshot {
+    pub best_bid: f64,
+    pub best_ask: f64,
+    pub best_bid_size: f64,
+    pub best_ask_size: f64,
+    /// Pre-sorted top-N bids (price descending)
+    pub bids: Vec<(f64, f64)>,
+    /// Pre-sorted top-N asks (price ascending)
+    pub asks: Vec<(f64, f64)>,
+    /// Recent trades: (price, size, timestamp_ns) — most recent first
+    pub recent_trades: Vec<(f64, f64, i64)>,
+}
+
+impl OrderBookSnapshot {
+    #[inline]
+    pub fn spread(&self) -> f64 {
+        if self.best_ask > 0.0 && self.best_bid > 0.0 {
+            self.best_ask - self.best_bid
+        } else {
+            0.0
+        }
+    }
+
+    #[inline]
+    pub fn mid_price(&self) -> f64 {
+        if self.best_ask > 0.0 && self.best_bid > 0.0 {
+            (self.best_bid + self.best_ask) / 2.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Return up to `depth` levels for the given side from the pre-built vecs.
+    pub fn get_depth(&self, side: Side, depth: usize) -> Vec<(f64, f64)> {
+        match side {
+            Side::Bid => self.bids.iter().take(depth).cloned().collect(),
+            Side::Ask => self.asks.iter().take(depth).cloned().collect(),
+        }
+    }
+
+    /// Return up to `limit` recent trades (most recent first).
+    pub fn get_recent_trades(&self, limit: usize) -> Vec<(f64, f64, i64)> {
+        self.recent_trades.iter().take(limit).cloned().collect()
+    }
+
+    pub fn trade_count(&self) -> usize {
+        self.recent_trades.len()
+    }
+}
+
+impl OrderBook {
+    /// Build a compact `OrderBookSnapshot` capturing the top `depth` levels per side
+    /// and the last `trade_limit` trades.  Far cheaper than cloning the full dense array.
+    pub fn to_snapshot(&self, depth: usize, trade_limit: usize) -> OrderBookSnapshot {
+        OrderBookSnapshot {
+            best_bid: self.best_bid(),
+            best_ask: self.best_ask(),
+            best_bid_size: self.best_bid_size(),
+            best_ask_size: self.best_ask_size(),
+            bids: self.get_depth(Side::Bid, depth),
+            asks: self.get_depth(Side::Ask, depth),
+            recent_trades: self.get_recent_trades(trade_limit),
+        }
     }
 }
 
