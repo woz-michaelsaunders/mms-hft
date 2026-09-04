@@ -3,3 +3,9 @@
 *.db
 venv/
 config.toml
+*.csv
+# runtime state — live FIX sequence numbers, must not be versioned
+data/seqnum_*.txt
+
+# rotated logs (*.log alone misses .log.1 / .log.2.gz)
+*.log.*

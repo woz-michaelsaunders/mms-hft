@@ -1,50 +1,57 @@
-use rusqlite::Connection;
+/// query_securities — list securities stored in kdb+.
+///
+/// Replaces the old SQLite-based implementation.  Uses the same kxkdb IPC
+/// library as the main server so there is a single, consistent data source.
+///
+/// Usage:
+///   cargo run --bin query_securities
+///
+/// Environment variables (optional):
+///   KDB_HOST  (default: localhost)
+///   KDB_PORT  (default: 5001)
 
-fn main() {
-    match Connection::open("securities.db") {
-        Ok(conn) => {
-            // Count total
-            match conn.query_row("SELECT COUNT(*) FROM securities", [], |row| row.get::<_, usize>(0)) {
-                Ok(count) => {
-                    println!("✅ Total securities in database: {}\n", count);
+use anyhow::{anyhow, Result};
+use kxkdb::ipc::{QStream, ConnectionMethod};
 
-                    // Show all securities
-                    match conn.prepare("SELECT id, symbol, security_id, exchange, attributes_json FROM securities ORDER BY id") {
-                        Ok(mut stmt) => {
-                            let securities = stmt.query_map([], |row| {
-                                Ok((
-                                    row.get::<_, i32>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, Option<String>>(2)?,
-                                    row.get::<_, Option<String>>(3)?,
-                                    row.get::<_, String>(4)?,
-                                ))
-                            });
+#[tokio::main]
+async fn main() -> Result<()> {
+    let kdb_host = std::env::var("KDB_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let kdb_port: u16 = std::env::var("KDB_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5001);
 
-                            if let Ok(securities) = securities {
-                                println!("Securities List:");
-                                println!("{}", "─".repeat(80));
-                                for (idx, security) in securities.enumerate() {
-                                    if let Ok((id, symbol, sec_id, exchange, attrs)) = security {
-                                        println!("{}. {} (ID: {})", idx + 1, symbol, id);
-                                        if let Some(id) = sec_id {
-                                            println!("   SecurityID: {}", id);
-                                        }
-                                        if let Some(exch) = exchange {
-                                            println!("   Exchange: {}", exch);
-                                        }
-                                        println!("   Attributes: {}", attrs);
-                                        println!();
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("Error preparing query: {}", e),
-                    }
-                }
-                Err(e) => eprintln!("Error counting securities: {}", e),
-            }
-        }
-        Err(e) => eprintln!("❌ Error opening database: {}", e),
+    println!("Connecting to kdb+ at {}:{}...", kdb_host, kdb_port);
+    let mut stream = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        QStream::connect(ConnectionMethod::TCP, &kdb_host, kdb_port, ""),
+    )
+    .await
+    .map_err(|_| anyhow!("Connection timed out"))?
+    .map_err(|e| anyhow!("Failed to connect to kdb+ at {}:{}: {}\n💡 Start kdb+: q kdb/start_kdb_server.q", kdb_host, kdb_port, e))?;
+
+    // Count
+    let q_count = "count securities";
+    let count_k = stream.send_sync_message(&q_count).await
+        .map_err(|e| anyhow!("Query error: {}", e))?;
+    let count: u64 = format!("{}", count_k).trim().parse().unwrap_or(0);
+    println!("✅ Total securities in kdb+: {}\n", count);
+
+    if count == 0 {
+        println!("No securities found. Run the main server to populate from the exchange.");
+        return Ok(());
     }
+
+    // Fetch all securities
+    let q_select = "select from securities";
+    let rows_k = stream.send_sync_message(&q_select).await
+        .map_err(|e| anyhow!("Query error: {}", e))?;
+
+    println!("Securities List:");
+    println!("{}", "─".repeat(80));
+    println!("{}", rows_k);
+    println!("{}", "─".repeat(80));
+    println!("\n{} securities total.", count);
+
+    Ok(())
 }
