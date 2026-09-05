@@ -15,8 +15,13 @@ pub enum MessageType {
     NewOrderSingle = 68,            // D
     ExecutionReport = 56,           // 8
     CancelOrder = 70,               // F
+    CancelReplaceRequest = 71,      // G
     CancelReject = 89,              // Y
     OrderStatusRequest = 72,        // H
+    MarketDataRequest = 86,         // V
+    MarketDataSnapshotFullRefresh = 87, // W
+    MarketDataIncrementalRefresh = 88,  // X
+    BusinessMessageReject = 106,    // j
 }
 
 impl MessageType {
@@ -32,8 +37,13 @@ impl MessageType {
             '8' => Some(MessageType::ExecutionReport),
             'D' => Some(MessageType::NewOrderSingle),
             'F' => Some(MessageType::CancelOrder),
+            'G' => Some(MessageType::CancelReplaceRequest),
             'Y' => Some(MessageType::CancelReject),
             'H' => Some(MessageType::OrderStatusRequest),
+            'V' => Some(MessageType::MarketDataRequest),
+            'W' => Some(MessageType::MarketDataSnapshotFullRefresh),
+            'X' => Some(MessageType::MarketDataIncrementalRefresh),
+            'j' => Some(MessageType::BusinessMessageReject),
             _ => None,
         }
     }
@@ -74,6 +84,16 @@ pub mod tags {
     pub const LEAVES_QTY: usize = 151;
     pub const EXEC_STATUS: usize = 150;
     pub const EXCHANGE_ID: usize = 100;
+    /// OrdStatus (39) — the order's current state as understood by the venue.
+    /// Distinct from ExecType (150/EXEC_STATUS above), which describes *this* execution report.
+    pub const ORD_STATUS: usize = 39;
+
+    // Session-level sequencing / recovery fields
+    pub const BEGIN_SEQ_NO: usize = 7;   // ResendRequest
+    pub const END_SEQ_NO: usize = 16;    // ResendRequest (0 = "to infinity")
+    pub const NEW_SEQ_NO: usize = 36;    // SequenceReset
+    pub const GAP_FILL_FLAG: usize = 123; // SequenceReset
+    pub const POSS_DUP_FLAG: usize = 43;  // PossDupFlag
 
     // SecurityListRequest fields
     pub const SECURITY_REQ_ID: usize = 320;

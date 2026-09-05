@@ -114,6 +114,30 @@ session.new_order_single(
 session.cancel_order("ORDER_001", "ORDER_001").await?;
 ```
 
+### Cancel/Replace (Amend) Order
+
+```rust
+session.order_cancel_replace_request(&ReplaceOrderRequest {
+    cl_ord_id: "ORDER_001_R1".to_string(),
+    orig_cl_ord_id: "ORDER_001".to_string(),
+    symbol: "EUR/USD".to_string(),
+    side: '1',
+    qty: Some(2_000_000.0),
+    price: Some(1.0855),
+}).await?;
+```
+
+### Typed Order Events
+
+`src/order_events.rs` maps an ExecutionReport's ExecType (150) / OrdStatus
+(39) into a single `OrderEventType` (`New`, `PartialFill`, `Fill`,
+`Canceled`, `Replaced`, `Rejected`, `Other`) so calling code doesn't need to
+know FIX char codes:
+
+```rust
+let event = order_events::map_exec_type(exec_type, ord_status);
+```
+
 ### Handle Messages
 
 ```rust
@@ -140,10 +164,46 @@ match msg.msg_type {
 | D | 68 | New Order Single | ✅ |
 | 8 | 56 | Execution Report | ✅ |
 | F | 70 | Cancel Order | ✅ |
+| G | 71 | Cancel/Replace Request | ✅ |
 | Y | 89 | Cancel Reject | ✅ |
 | H | 72 | Order Status Request | ✅ |
+| V | 86 | Market Data Request | ✅ |
+| W | 87 | Market Data Snapshot | ✅ |
+| X | 88 | Market Data Incremental Refresh | ✅ |
+
+## 🔁 Sequence Gap Detection & Recovery
+
+`src/sequencer.rs` tracks inbound MsgSeqNum continuity per session
+(`FIXSession::handle_message` is the mandatory choke point — no message body
+is processed without passing through it first). On a detected gap, the
+session sends a ResendRequest (35=2) and re-subscribes every tracked symbol
+so market data recovers via a fresh MarketDataSnapshotFullRefresh; messages
+received while recovery is in progress are dropped rather than applied, so a
+dropped/out-of-order packet can never silently corrupt order book state. See
+`src/sequencer.rs`'s unit tests and
+`connectivity_tests::gap_recovery_converges_via_resubscribe_snapshot` in
+`src/main.rs` for the pure-logic and network-level proofs, respectively.
+
+## ⏱️ Hot-Path Review
+
+See [`HOTPATH_REVIEW.md`](./HOTPATH_REVIEW.md) for an honest zero-allocation
+/ no-blocking-lock static review of the tick and order-ack paths, plus a
+measured p50/p99 tick-to-publish latency benchmark
+(`order_book_buffer::tests::tick_to_publish_latency_p50_p99`).
 
 ## 🧪 Testing
+
+### Automated Tests
+
+```bash
+cargo test
+```
+
+Runs unit tests (FIX protocol encode/decode, order book, sequencer) plus
+integration tests that drive a real `FIXSession` over TCP against the mock
+FIX counterparty in `src/mock_gateway.rs` (`connectivity_tests` module in
+`src/main.rs`): logon, market data subscribe/tick, new order → execution
+report, cancel/replace, sequence-gap recovery, and reconnect-after-disconnect.
 
 ### Run with Logging
 

@@ -26,6 +26,8 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["fs", "cors"] }
 kxkdb = { version = "0.1", features = ["ipc"] }
 regex = "1"
+# Vendored so the build doesn't depend on system OpenSSL dev headers/pkg-config being present.
+openssl = { version = "0.10", features = ["vendored"] }
 
 [[bin]]
 name = "fix_server"

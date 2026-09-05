@@ -2,6 +2,10 @@ mod fix_protocol;
 mod order_book;
 mod order_book_buffer;
 mod kdb_integration;
+mod sequencer;
+mod order_events;
+#[cfg(test)]
+mod mock_gateway;
 pub mod algo;
 
 use anyhow::{anyhow, Result};
@@ -127,6 +131,19 @@ pub struct CancelOrderRequest {
     pub orig_cl_ord_id: String,      // Tag 41: OrigClOrdID - ClOrdID of the original order to cancel
     pub symbol: String,              // Tag 55: Symbol
     pub side: String,                // Tag 54: Side ("1"=BUY, "2"=SELL) - stored as String for JSON compatibility
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ReplaceOrderRequest {
+    // Required fields
+    pub cl_ord_id: String,           // Tag 11: ClOrdID - new ID for the replacement order
+    pub orig_cl_ord_id: String,      // Tag 41: OrigClOrdID - ClOrdID of the working order being replaced
+    pub symbol: String,              // Tag 55: Symbol
+    pub side: char,                  // Tag 54: Side ('1'=BUY, '2'=SELL)
+    // At least one of qty/price should be set; both are optional so a
+    // caller can amend just the price or just the quantity.
+    pub qty: Option<f64>,            // Tag 38: OrderQty (new)
+    pub price: Option<f64>,          // Tag 44: Price (new)
 }
 
 /// Open order information extracted from execution reports
@@ -433,6 +450,9 @@ pub struct FIXSession {
     order_book_update_tx: Arc<Mutex<Option<broadcast::Sender<String>>>>,
     // kdb+ writer for order book data (shared across sessions)
     kdb_writer: Arc<KdbWriter>,
+    // Inbound MsgSeqNum gap detection / recovery state (session-level; see
+    // `sequencer` module doc). Keyed internally, one FIXSession = one FIX session.
+    sequencer: Arc<Mutex<sequencer::Sequencer>>,
     // Last market-data message timestamp (Unix ms). Zero = never received.
     // Updated atomically on every W/X message; read by the stale-feed watchdog.
     last_md_recv_ms: Arc<AtomicU64>,
@@ -502,6 +522,7 @@ impl FIXSession {
             order_update_tx: Arc::new(Mutex::new(None)),
             order_book_update_tx: Arc::new(Mutex::new(None)),
             kdb_writer,
+            sequencer: Arc::new(Mutex::new(sequencer::Sequencer::new())),
             last_md_recv_ms: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -745,10 +766,64 @@ impl FIXSession {
         Ok(())
     }
 
+    /// Order Cancel/Replace Request (35=G): amend price and/or quantity of a
+    /// working order. `new_cl_ord_id` must be a fresh ClOrdID; `orig_cl_ord_id`
+    /// identifies the order being replaced.
+    pub async fn order_cancel_replace_request(&self, request: &ReplaceOrderRequest) -> Result<()> {
+        if !self.is_ready().await {
+            return Err(anyhow!("Session not ready"));
+        }
+
+        let already_known = self.open_orders.snapshot().contains_key(&request.cl_ord_id)
+            || self.order_times.lock().await.contains_key(&request.cl_ord_id);
+        if already_known {
+            return Err(anyhow!("Duplicate ClOrdID rejected: {}", request.cl_ord_id));
+        }
+
+        let seq_num = self.next_seq_num().await;
+        let mut msg = FIXMessage::new('G', &self.sender_comp_id, &self.target_comp_id, seq_num);
+
+        msg.set_field(tags::CL_ORD_ID, &request.cl_ord_id);
+        msg.set_field(tags::ORIG_CL_ORD_ID, &request.orig_cl_ord_id);
+        msg.set_field(tags::SYMBOL, &request.symbol);
+        msg.set_field(tags::SIDE, &request.side.to_string());
+        if let Some(qty) = request.qty {
+            msg.set_field(tags::ORDER_QTY, &qty.to_string());
+        }
+        if let Some(price) = request.price {
+            msg.set_field(tags::PRICE, &price.to_string());
+        }
+        msg.set_field(tags::ORD_TYPE, "2"); // LIMIT
+        msg.set_field(tags::TRANSACT_TIME, &FIXMessage::timestamp());
+
+        info!("Sending Order Cancel/Replace Request (35=G):");
+        info!("  ClOrdID (11): {} (new)", request.cl_ord_id);
+        info!("  OrigClOrdID (41): {}", request.orig_cl_ord_id);
+        info!("  Symbol (55): {}", request.symbol);
+
+        self.order_times.lock().await.insert(request.cl_ord_id.clone(), Instant::now());
+        self.send_message(&msg).await?;
+        info!("Order Cancel/Replace Request sent successfully");
+
+        Ok(())
+    }
+
     /// Create order from OrderRequest struct (supports all FIX order fields)
     pub async fn new_order_single_from_request(&self, order: &OrderRequest) -> Result<()> {
         if !self.is_ready().await {
             return Err(anyhow!("Session not ready"));
+        }
+
+        // ClOrdId idempotency: reject before submission rather than let the
+        // venue silently treat a resent/duplicated ClOrdID as a new order.
+        // Checks both confirmed orders (open_orders, populated from
+        // ExecutionReports) and in-flight ones (order_times, populated at
+        // submission time) so a duplicate can't slip through the window
+        // before the first ExecutionReport comes back.
+        let already_known = self.open_orders.snapshot().contains_key(&order.cl_ord_id)
+            || self.order_times.lock().await.contains_key(&order.cl_ord_id);
+        if already_known {
+            return Err(anyhow!("Duplicate ClOrdID rejected: {}", order.cl_ord_id));
         }
 
         let seq_num = self.next_seq_num().await;
@@ -1233,6 +1308,61 @@ impl FIXSession {
     }
 
     pub async fn handle_message(&self, msg: &FIXMessage) -> Result<()> {
+        // Mandatory sequence-integrity choke point: no message's body is
+        // processed below without first passing through here. This is what
+        // makes AC2/AC4 (gap detection -> recovery, no silent corruption)
+        // hold for every message type, not just market data.
+        match msg.msg_type {
+            'A' => {
+                // ResetSeqNumFlag=Y (see logon_with_auth) means both sides
+                // restart at MsgSeqNum=1 on every session — (re)initialize here
+                // rather than gate the Logon ACK itself on a stale counter.
+                // The Logon ACK's own MsgSeqNum becomes the new baseline.
+                let mut seqr = self.sequencer.lock().await;
+                seqr.reset("inbound");
+                seqr.resolve_recovery("inbound", msg.seq_num);
+            }
+            '4' => {
+                // SequenceReset (plain or GapFill): NewSeqNo (36) tells us what
+                // to expect next, which resolves any in-progress recovery.
+                if let Some(new_seq_no) = msg.get_field(tags::NEW_SEQ_NO).and_then(|s| s.parse::<u32>().ok()) {
+                    self.sequencer.lock().await.resolve_recovery("inbound", new_seq_no.saturating_sub(1));
+                    info!("🔄 SequenceReset (35=4) processed: inbound sequence resynced, next expected {}", new_seq_no);
+                }
+            }
+            'W' if self.sequencer.lock().await.is_recovering("inbound") => {
+                // This venue's recovery path is a fresh full snapshot rather
+                // than historical delta replay: receiving one while recovering
+                // IS the resolution. Falls through below to actually apply it.
+                self.sequencer.lock().await.resolve_recovery("inbound", msg.seq_num);
+                info!("🔄 Sequence gap recovered via fresh MarketDataSnapshotFullRefresh (seq {})", msg.seq_num);
+            }
+            _ => {
+                let result = self.sequencer.lock().await.check("inbound", msg.seq_num);
+                match result {
+                    sequencer::SequenceResult::Accepted => {}
+                    sequencer::SequenceResult::DuplicateIgnored => {
+                        log::debug!("Duplicate inbound message (type {}, MsgSeqNum {}) ignored", msg.msg_type, msg.seq_num);
+                        return Ok(());
+                    }
+                    sequencer::SequenceResult::GapDetected { expected, received } => {
+                        warn!(
+                            "⚠️  Inbound sequence gap detected (type {}): expected {}, got {} — requesting recovery",
+                            msg.msg_type, expected, received
+                        );
+                        return self.request_recovery(expected).await;
+                    }
+                    sequencer::SequenceResult::StaleDuringRecovery => {
+                        log::debug!(
+                            "Dropping message (type {}, MsgSeqNum {}) received while recovering from a sequence gap",
+                            msg.msg_type, msg.seq_num
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         match msg.msg_type {
             'A' => info!("Logon response received"),
             '0' => log::debug!("Heartbeat received"),
@@ -1374,11 +1504,18 @@ impl FIXSession {
                         .unwrap_or(0.0);
                     let ord_status = msg.get_field(tags::EXEC_STATUS).unwrap_or_default();
                     let exec_type = msg.get_field(150).unwrap_or_default();
-                    
+
                     if leaves_qty == 0.0 || ord_status == "8" || ord_status == "4" || ord_status == "2" || exec_type == "8" {
                         self.open_orders.remove_order(&cl_ord_id_owned);
                     }
 
+                    // Typed event mapping (AC3): ExecType (150) is authoritative, with
+                    // OrdStatus (39) — distinct from the EXEC_STATUS(150) alias used
+                    // above for legacy display — as a fallback for venues that only
+                    // populate one of the two consistently.
+                    let ord_status_39 = msg.get_field(tags::ORD_STATUS).unwrap_or_default();
+                    let typed_event = order_events::map_exec_type(exec_type, ord_status_39);
+                    info!("📬 Typed order event for {}: {:?}", cl_ord_id_owned, typed_event);
                     // On every fill (partial or full), persist to kdb+ own_trades and update positions.
                     // ExecType "F" = partial fill, "2" = full fill, "1" = partial fill (some venues).
                     if exec_type == "F" || exec_type == "2" || exec_type == "1" {
@@ -2113,6 +2250,30 @@ impl FIXSession {
                 }
             }
             _ => log::debug!("Unknown message type: {} - fields: {:?}", msg.msg_type, msg.fields),
+        }
+
+        Ok(())
+    }
+
+    /// Recover from a detected inbound sequence gap (AC2/AC4): ask the venue
+    /// to fill the session-level gap, and independently re-subscribe every
+    /// symbol we currently track so market data recovers via a fresh
+    /// snapshot even if the venue's ResendRequest handling only covers
+    /// session-admin messages. Both requests are safe to send unconditionally;
+    /// on an order-management session `order_books` is simply empty.
+    async fn request_recovery(&self, begin_seq: u32) -> Result<()> {
+        let seq_num = self.next_seq_num().await;
+        let mut resend = FIXMessage::new('2', &self.sender_comp_id, &self.target_comp_id, seq_num);
+        resend.set_field(tags::BEGIN_SEQ_NO, &begin_seq.to_string());
+        resend.set_field(tags::END_SEQ_NO, "0"); // 0 = through the most recent message
+        self.send_message(&resend).await?;
+        info!("📨 ResendRequest (35=2) sent: BeginSeqNo={}", begin_seq);
+
+        let symbols: Vec<String> = self.order_books.lock().await.keys().cloned().collect();
+        for symbol in symbols {
+            if let Err(e) = self.market_data_request(&symbol, 50).await {
+                warn!("Failed to re-subscribe {} during gap recovery: {}", symbol, e);
+            }
         }
 
         Ok(())
@@ -6417,4 +6578,256 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+// ============================================================================
+// Integration tests: FIXSession driven against the in-process mock FIX
+// counterparty (src/mock_gateway.rs). These are the "verified against the
+// mock FIX counterparty" tests called for by the market-data/exchange-
+// connectivity acceptance criteria (AC2, AC3, AC4, AC6). Pure sequencing
+// logic (gap/dup/recovery, no networking) is covered separately in
+// src/sequencer.rs's own unit tests.
+// ============================================================================
+#[cfg(test)]
+mod connectivity_tests {
+    use super::*;
+
+    /// Connect, logon, and block until the Logon ACK (35=A) is processed —
+    /// mirrors what `message_loop` does in production, trimmed to what a
+    /// test needs.
+    async fn connect_and_logon(session: &FIXSession, port: u16) -> Result<()> {
+        session.connect_with_retry(&format!("127.0.0.1:{}", port), 5, 20).await?;
+        session.logon(30).await?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() > deadline {
+                return Err(anyhow!("Timed out waiting for Logon ACK"));
+            }
+            match tokio::time::timeout(Duration::from_millis(500), session.receive_message()).await {
+                Ok(Ok(msg)) => {
+                    let is_logon_ack = msg.msg_type == 'A';
+                    session.handle_message(&msg).await?;
+                    if is_logon_ack {
+                        *session.connection_state.lock().await = ConnectionState::Ready;
+                        return Ok(());
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => continue, // read timeout, keep waiting up to deadline
+            }
+        }
+    }
+
+    /// Drain and process inbound messages for up to `budget`, or until
+    /// `stop_when` returns true after processing a message. Returns the
+    /// message that satisfied `stop_when`, if any, so callers can assert on
+    /// its raw fields (e.g. ExecType/OrdStatus) independent of how
+    /// `handle_message` chooses to summarize it into other stores.
+    async fn pump_messages(session: &FIXSession, budget: Duration, mut stop_when: impl FnMut(&FIXMessage) -> bool) -> Result<Option<FIXMessage>> {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), session.receive_message()).await {
+                Ok(Ok(msg)) => {
+                    let stop = stop_when(&msg);
+                    session.handle_message(&msg).await?;
+                    if stop {
+                        return Ok(Some(msg));
+                    }
+                }
+                Ok(Err(_)) => return Ok(None), // connection closed
+                Err(_) => continue,            // read timeout, keep pumping
+            }
+        }
+        Ok(None)
+    }
+
+    fn cleanup_processed(cl_ord_id: &str) {
+        let _ = std::fs::remove_file(format!("orders/processed/{}.json", cl_ord_id));
+    }
+
+    /// AC6 (end-to-end smoke test) + AC3 (order gateway logs on, submits an
+    /// order, correctly parses the resulting ExecutionReport into a typed
+    /// event) + AC1 (feed handler connects/subscribes/publishes normalized
+    /// ticks): a stub strategy subscribes to market data, receives a tick,
+    /// submits an order through the gateway, and receives a matching
+    /// execution report — all against the mock FIX counterparty.
+    #[tokio::test]
+    async fn e2e_market_data_and_order_roundtrip() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig { md_ticks_to_stream: 2, ..Default::default() },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        session.market_data_request("BTC_USDT", 10).await?;
+        pump_messages(&session, Duration::from_secs(3), |_| false).await?;
+
+        let quote = session.get_best_quote("BTC_USDT").await;
+        assert!(quote.is_some(), "expected a normalized tick/book update to have been published");
+        let (bid, ask, _spread) = quote.unwrap();
+        assert!(bid > 0.0 && ask > bid);
+
+        let cl_ord_id = "E2E_TEST_ORDER_1";
+        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0).await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+
+        let open_orders = session.open_orders.snapshot();
+        let order = open_orders.get(cl_ord_id).expect("expected ExecutionReport to populate open_orders");
+        assert_eq!(order.cl_ord_id, cl_ord_id);
+        assert_eq!(order.exec_type, "0", "expected ExecType=New (0) for a fresh order");
+        assert_eq!(
+            order_events::map_exec_type(&order.exec_type, &order.ord_status),
+            order_events::OrderEventType::New
+        );
+
+        cleanup_processed(cl_ord_id);
+        Ok(())
+    }
+
+    /// AC3: cancel and cancel/replace round trips against the mock, verifying
+    /// ExecutionReports map to Canceled and Replaced typed events.
+    #[tokio::test]
+    async fn cancel_and_replace_round_trip() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway("127.0.0.1:0", mock_gateway::MockGatewayConfig::default()).await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        let cl_ord_id = "E2E_TEST_ORDER_CXL";
+        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0).await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+
+        let replace_id = "E2E_TEST_ORDER_REPL";
+        session
+            .order_cancel_replace_request(&ReplaceOrderRequest {
+                cl_ord_id: replace_id.to_string(),
+                orig_cl_ord_id: cl_ord_id.to_string(),
+                symbol: "BTC_USDT".to_string(),
+                side: '1',
+                qty: Some(2.0),
+                price: Some(101.0),
+            })
+            .await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+
+        {
+            let open_orders = session.open_orders.snapshot();
+            let replaced = open_orders.get(replace_id).expect("expected Replaced ExecutionReport");
+            assert_eq!(
+                order_events::map_exec_type(&replaced.exec_type, &replaced.ord_status),
+                order_events::OrderEventType::Replaced
+            );
+        }
+
+        let cancel_req = CancelOrderRequest {
+            cl_ord_id: "E2E_TEST_ORDER_CXL2".to_string(),
+            orig_cl_ord_id: replace_id.to_string(),
+            symbol: "BTC_USDT".to_string(),
+            side: "1".to_string(),
+        };
+        session.cancel_order(&cancel_req).await?;
+        let cancel_report = pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8')
+            .await?
+            .expect("expected a Canceled ExecutionReport");
+        assert_eq!(
+            order_events::map_exec_type(
+                cancel_report.get_field(150).unwrap_or_default(),
+                cancel_report.get_field(tags::ORD_STATUS).unwrap_or_default(),
+            ),
+            order_events::OrderEventType::Canceled
+        );
+        // A fully canceled order (LeavesQty=0) is removed from the
+        // open-orders store, since it's no longer open.
+        assert!(session.open_orders.snapshot().get("E2E_TEST_ORDER_CXL2").is_none());
+
+        cleanup_processed(cl_ord_id);
+        cleanup_processed(replace_id);
+        cleanup_processed("E2E_TEST_ORDER_CXL2");
+        Ok(())
+    }
+
+    /// AC4: on disconnect, the session re-establishes (logon again) without
+    /// a process restart — the mock closes the socket after one inbound
+    /// application message, then the test reconnects the same `FIXSession`.
+    #[tokio::test]
+    async fn reconnects_and_relogs_on_after_disconnect() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig { disconnect_after_messages: Some(1), ..Default::default() },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+        assert!(session.is_ready().await);
+
+        // Trip the mock's disconnect trigger and observe the connection drop.
+        // (Heartbeats don't count toward `disconnect_after_messages` — same
+        // as real FIX session-admin traffic not counting as "application
+        // activity" — so use an application message here.) The mock answers
+        // the request (a 'W' snapshot) before closing, so drain messages
+        // until the connection actually drops.
+        session.market_data_request("BTC_USDT", 10).await?;
+        let mut saw_disconnect = false;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), session.receive_message()).await {
+                Ok(Ok(_msg)) => continue,
+                Ok(Err(_)) => {
+                    saw_disconnect = true;
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+        assert!(saw_disconnect, "expected the mock to close the connection");
+
+        // Reconnect + re-logon on the SAME session, no process restart.
+        *session.connection_state.lock().await = ConnectionState::Disconnected;
+        *session.is_connected.lock().await = false;
+        connect_and_logon(&session, port).await?;
+        assert!(session.is_ready().await, "session should be Ready again after reconnect + re-logon");
+
+        Ok(())
+    }
+
+    /// AC2, wired end-to-end (network-level): the mock silently drops one
+    /// MarketDataIncrementalRefresh, inducing a real MsgSeqNum gap on the
+    /// wire. `FIXSession::handle_message` must detect it, request recovery,
+    /// and converge — proving the production gap-handling path (not just
+    /// the standalone Sequencer unit tests in src/sequencer.rs) actually
+    /// resolves and leaves the order book in a consistent state.
+    #[tokio::test]
+    async fn gap_recovery_converges_via_resubscribe_snapshot() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                md_ticks_to_stream: 3,
+                induce_gap_at_tick: Some(2),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        session.market_data_request("BTC_USDT", 10).await?;
+        // Enough budget to observe: snapshot, tick1, (gap at tick2) ->
+        // recovery request -> resubscribe -> fresh snapshot -> more ticks.
+        pump_messages(&session, Duration::from_secs(5), |_| false).await?;
+
+        assert!(
+            !session.sequencer.lock().await.is_recovering("inbound"),
+            "gap recovery should have converged by the end of the pump budget"
+        );
+
+        let quote = session.get_best_quote("BTC_USDT").await;
+        assert!(quote.is_some(), "order book must still be in a valid, non-corrupted state after recovery");
+
+        Ok(())
+    }
 }
