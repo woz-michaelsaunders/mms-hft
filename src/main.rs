@@ -6816,14 +6816,26 @@ mod connectivity_tests {
         connect_and_logon(&session, port).await?;
 
         session.market_data_request("BTC_USDT", 10).await?;
-        // Enough budget to observe: snapshot, tick1, (gap at tick2) ->
-        // recovery request -> resubscribe -> fresh snapshot -> more ticks.
-        pump_messages(&session, Duration::from_secs(5), |_| false).await?;
 
-        assert!(
-            !session.sequencer.lock().await.is_recovering("inbound"),
-            "gap recovery should have converged by the end of the pump budget"
-        );
+        // Observe: snapshot, tick1, (gap at tick2) -> recovery request ->
+        // resubscribe -> fresh snapshot. Pump in slices and stop the moment
+        // recovery converges rather than burning a fixed budget and asserting
+        // afterwards -- every other test in this suite exits early on a
+        // predicate; this one could not, so on a contended runner the 5s
+        // expired mid-round-trip and failed a test that needs ~1s on an idle
+        // box. The deadline keeps the assertion honest: genuine
+        // non-convergence still fails, it just cannot fail spuriously.
+        let recovery_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            pump_messages(&session, Duration::from_millis(250), |_| false).await?;
+            if !session.sequencer.lock().await.is_recovering("inbound") {
+                break;
+            }
+            assert!(
+                Instant::now() < recovery_deadline,
+                "gap recovery should have converged within 30s"
+            );
+        }
 
         let quote = session.get_best_quote("BTC_USDT").await;
         assert!(quote.is_some(), "order book must still be in a valid, non-corrupted state after recovery");
