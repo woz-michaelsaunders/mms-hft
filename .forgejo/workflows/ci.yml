@@ -14,6 +14,10 @@ name: SDLC Scan (no build)
 on:
   push:
     branches: [main, master]
+  # Without this, a PR carries no status at all and "green CI" can never be
+  # confirmed before merge — scans only ran after the code was already in.
+  pull_request:
+    branches: [main, master]
   workflow_dispatch:
 
 env:
@@ -59,7 +63,7 @@ jobs:
             --sarif --output=semgrep-results.sarif . || true
 
       - name: Upload SAST results to DefectDojo
-        if: always()
+        if: always() && github.event_name == 'push'
         run: |
           [ -f semgrep-results.sarif ] || exit 0
           curl -sf -X POST "https://dojo.gandetl.com/api/v2/import-scan/" \
