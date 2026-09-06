@@ -123,8 +123,11 @@ jobs:
           syft dir:. -o cyclonedx-json=sbom.cdx.json -o spdx-json=sbom.spdx.json
           echo "SBOM components: $(python3 -c "import json;print(len(json.load(open('sbom.cdx.json')).get('components',[])))")"
 
+      # v4 refuses to run here: @actions/artifact v2 rejects GHES-like backends,
+      # which is how Forgejo Actions presents. v3 uses the older artifact API
+      # that Forgejo does implement.
       - name: Publish build outputs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         continue-on-error: true
         with:
           name: fix_server-${{ github.sha }}
