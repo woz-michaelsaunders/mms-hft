@@ -76,3 +76,60 @@ jobs:
             -F "active=true" \
             -F "verified=false" \
             || echo "DefectDojo upload failed (non-blocking)"
+
+  # ── Build gates ────────────────────────────────────────────────────────────
+  # The scan job above is deliberately build-free (it also serves repos with no
+  # toolchain). This job supplies the gates that need one: a compiled artifact,
+  # a green test suite, and an SBOM of what actually went into the binary.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # zmq-sys vendors libzmq and compiles it from source, and openssl is
+      # vendored too — so a C/C++ toolchain and perl are required, but no
+      # system libzmq or libssl-dev.
+      - name: Build toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential pkg-config perl cmake curl ca-certificates
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        continue-on-error: true
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Compile the artifact
+        run: cargo build --release --locked
+
+      - name: Run the test suite
+        run: cargo test --release --locked
+
+      - name: Software bill of materials
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          syft dir:. -o cyclonedx-json=sbom.cdx.json -o spdx-json=sbom.spdx.json
+          echo "SBOM components: $(python3 -c "import json;print(len(json.load(open('sbom.cdx.json')).get('components',[])))")"
+
+      - name: Publish build outputs
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: fix_server-${{ github.sha }}
+          path: |
+            target/release/fix_server
+            target/release/fix_console
+            sbom.cdx.json
+            sbom.spdx.json

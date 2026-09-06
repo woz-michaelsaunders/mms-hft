@@ -1,0 +1,122 @@
+# Release pipeline — the two gates the scan/build workflows don't cover:
+# signing the release artifact (or its provenance) and shipping the release.
+#
+# Triggered by a version tag. Run it by hand with workflow_dispatch to produce a
+# release from the current branch head.
+#
+# Optional secret: COSIGN_PRIVATE_KEY (+ COSIGN_PASSWORD) — when present the
+# checksums and provenance are cryptographically signed. Without it the release
+# still ships with checksums and provenance, but unsigned; the signing gate is
+# only genuinely met once that secret exists.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build toolchain
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends \
+            build-essential pkg-config perl cmake curl ca-certificates jq
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain stable --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Compile the artifact
+        run: cargo build --release --locked
+
+      - name: Run the test suite
+        run: cargo test --release --locked
+
+      - name: Software bill of materials
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          syft dir:. -o cyclonedx-json=sbom.cdx.json -o spdx-json=sbom.spdx.json
+
+      - name: Stage artifacts and checksums
+        id: stage
+        run: |
+          mkdir -p dist
+          cp target/release/fix_server target/release/fix_console dist/
+          cp sbom.cdx.json sbom.spdx.json dist/
+          cd dist && sha256sum * > SHA256SUMS && cd ..
+          VERSION="${GITHUB_REF_NAME:-$(git rev-parse --short HEAD)}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          cat dist/SHA256SUMS
+
+      # Build provenance: what was built, from which commit, by which run.
+      - name: Generate provenance
+        run: |
+          cat > dist/provenance.json <<JSON
+          {
+            "_type": "https://in-toto.io/Statement/v0.1",
+            "predicateType": "https://slsa.dev/provenance/v0.2",
+            "subject": [
+              {"name": "fix_server", "digest": {"sha256": "$(sha256sum dist/fix_server | cut -d' ' -f1)"}},
+              {"name": "fix_console", "digest": {"sha256": "$(sha256sum dist/fix_console | cut -d' ' -f1)"}}
+            ],
+            "predicate": {
+              "builder": {"id": "${{ github.server_url }}/${{ github.repository }}/actions"},
+              "buildType": "forgejo-actions/release",
+              "invocation": {
+                "configSource": {
+                  "uri": "${{ github.server_url }}/${{ github.repository }}",
+                  "digest": {"sha1": "${{ github.sha }}"},
+                  "entryPoint": ".forgejo/workflows/release.yml"
+                }
+              },
+              "metadata": {"buildInvocationId": "${{ github.run_id }}"}
+            }
+          }
+          JSON
+          jq . dist/provenance.json > /dev/null && echo "provenance valid"
+
+      - name: Sign checksums and provenance
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          if [ -z "$COSIGN_PRIVATE_KEY" ]; then
+            echo "::warning::COSIGN_PRIVATE_KEY is not set — shipping unsigned."
+            echo "Add the secret to satisfy the signing gate."
+            exit 0
+          fi
+          curl -sSfL -o /usr/local/bin/cosign \
+            https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+          chmod +x /usr/local/bin/cosign
+          cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
+            --output-signature dist/SHA256SUMS.sig dist/SHA256SUMS
+          cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
+            --output-signature dist/provenance.json.sig dist/provenance.json
+          echo "signed"
+
+      - name: Ship the release
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.stage.outputs.version }}
+        run: |
+          API="${{ github.server_url }}/api/v1/repos/${{ github.repository }}"
+          ID=$(curl -sS -X POST "$API/releases" \
+            -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg t "$VERSION" --arg s "${{ github.sha }}" \
+                  '{tag_name:$t, target_commitish:$s, name:("HFT " + $t),
+                    body:"Automated release. Artifacts carry SHA256SUMS and SLSA provenance.",
+                    draft:false, prerelease:false}')" | jq -r '.id')
+          echo "release id: $ID"
+          for f in dist/*; do
+            echo "uploading $(basename "$f")"
+            curl -sS -X POST "$API/releases/$ID/assets?name=$(basename "$f")" \
+              -H "Authorization: token $TOKEN" -F "attachment=@$f" -o /dev/null
+          done
+          echo "release shipped: $VERSION"
