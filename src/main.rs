@@ -693,8 +693,18 @@ impl FIXSession {
     }
 
     pub async fn heartbeat(&self) -> Result<()> {
+        self.heartbeat_with_test_req_id(None).await
+    }
+
+    /// Send a Heartbeat (35=0). When answering a TestRequest (35=1) the
+    /// TestReqID (112) from that request MUST be echoed back, otherwise the
+    /// counterparty treats the session as unresponsive and disconnects it.
+    pub async fn heartbeat_with_test_req_id(&self, test_req_id: Option<&str>) -> Result<()> {
         let seq_num = self.next_seq_num().await;
-        let msg = FIXMessage::new('0', &self.sender_comp_id, &self.target_comp_id, seq_num);
+        let mut msg = FIXMessage::new('0', &self.sender_comp_id, &self.target_comp_id, seq_num);
+        if let Some(id) = test_req_id {
+            msg.set_field(tags::TEST_REQ_ID, id);
+        }
         self.send_message(&msg).await?;
         Ok(())
     }
@@ -1366,6 +1376,17 @@ impl FIXSession {
         match msg.msg_type {
             'A' => info!("Logon response received"),
             '0' => log::debug!("Heartbeat received"),
+            // A TestRequest is the venue asking whether we are still alive.
+            // FIX 4.4 requires a Heartbeat echoing TestReqID (112); without it
+            // the venue concludes the session is dead and logs us out. This
+            // arm was missing, which disconnected every session every 15-25s.
+            '1' => {
+                let test_req_id = msg.get_field(tags::TEST_REQ_ID).unwrap_or_default().to_string();
+                info!("TestRequest received (112={}) - answering with Heartbeat", test_req_id);
+                if let Err(e) = self.heartbeat_with_test_req_id(Some(&test_req_id)).await {
+                    warn!("Failed to answer TestRequest {}: {}", test_req_id, e);
+                }
+            }
             '8' => {
                 // Execution Report - measure latency from order submission
                 if let Some(cl_ord_id_str) = msg.get_field(tags::CL_ORD_ID) {
@@ -6682,6 +6703,46 @@ mod connectivity_tests {
         assert_eq!(
             order_events::map_exec_type(&order.exec_type, &order.ord_status),
             order_events::OrderEventType::New
+        );
+
+        cleanup_processed(cl_ord_id);
+        Ok(())
+    }
+
+    /// A TestRequest (35=1) must be answered with a Heartbeat echoing its
+    /// TestReqID (112). The live venue sends these and hangs up when they go
+    /// unanswered, which disconnected every session every 15-25 seconds for
+    /// days. The mock reproduces that: it probes after Logon and drops the
+    /// connection if the echo does not arrive.
+    #[tokio::test]
+    async fn answers_test_request_and_keeps_the_session_up() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                test_request_after_logon: Some("PROBE-1".to_string()),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        // Pump well past the mock's 2s grace period. If the TestRequest goes
+        // unanswered the mock hangs up.
+        pump_messages(&session, Duration::from_secs(4), |_| false).await?;
+
+        // is_ready() is a cached flag and stays true across a peer-side close,
+        // so prove liveness with traffic instead: an order can only be
+        // acknowledged if the connection actually survived the probe.
+        let cl_ord_id = "E2E_TEST_REQ_PROBE";
+        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0).await?;
+        let report = pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+
+        assert!(
+            report.is_some(),
+            "no ExecutionReport after the probe window: the venue hung up because \
+             the TestRequest (112) went unanswered"
         );
 
         cleanup_processed(cl_ord_id);
