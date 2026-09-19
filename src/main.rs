@@ -1281,67 +1281,88 @@ impl FIXSession {
     /// Extract a complete FIX message from the buffer
     /// Handles fragmented messages by waiting for the full message to arrive
     async fn extract_complete_message(&self) -> Result<FIXMessage> {
-        let mut msg_buffer = self.message_buffer.lock().await;
+        // Frame exactly one FIX message from the front of the buffer, using
+        // BodyLength (9), on raw bytes.
+        //
+        //   8=FIX.4.4<SOH>9=<len><SOH><body: len bytes>10=NNN<SOH>
+        //
+        // The message ends at body_start + len + 7. This used to locate the
+        // checksum with rfind("10=") over a lossy UTF-8 copy -- the LAST
+        // "10=" in the whole buffer, which also matches inside tags such as
+        // 110= -- and drain everything up to it as one message. When a TCP read
+        // carried several messages, all but one were silently lost; their
+        // MsgSeqNums then read as a gap, recovery triggered bursts that
+        // coalesced again, and the client looped in recovery dropping inbound
+        // messages (ExecutionReports included). Only the first message is
+        // consumed here; the rest stay buffered for the next call.
+        const SOH: u8 = 0x01;
+        const TRAILER_LEN: usize = 7; // "10=" + 3 digits + SOH
+        let mut buf = self.message_buffer.lock().await;
 
-        // Need at least "8=FIX.4.4" and "9=XXX" to parse
-        if msg_buffer.len() < 15 {
-            drop(msg_buffer);
-            return Err(anyhow!("Incomplete FIX message in buffer"));
-        }
-
-        // Find the body length field (tag 9)
-        // Format: 8=FIX.4.4|9=XXX|...
-        let buffer_str = String::from_utf8_lossy(&msg_buffer);
-
-        // Buffer must start with "8=" for a valid FIX message
-        if !buffer_str.starts_with("8=") {
-            drop(msg_buffer);
-            return Err(anyhow!("Incomplete FIX message - waiting for message start"));
-        }
-
-        // Look for "9=" to find body length
-        if let Some(pos) = buffer_str.find("9=") {
-            let after_tag9 = &buffer_str[pos + 2..];
-            if let Some(end_pos) = after_tag9.find('\x01') {
-                if let Ok(body_len) = after_tag9[..end_pos].parse::<usize>() {
-                    // Find the start of the body (after tag 9 and its SOH)
-                    if let Some(body_start_pos) = buffer_str[pos..].find("\x01") {
-                        let body_actual_start = pos + body_start_pos + 1;
-
-                        // Calculate where the checksum should be based on body length
-                        // Message structure: 8=FIX.4.4\x01 9=<len>\x01 <body> 10=<checksum>\x01
-                        // Expected position: body_actual_start + body_len + (at least "10=XXX\x01")
-                        let checksum_search_start = body_actual_start + body_len;
-
-                        // Now look for the LAST "10=" in the buffer (which should be the checksum)
-                        // We search backward from the end to find the true checksum field
-                        if let Some(last_10_pos) = buffer_str.rfind("10=") {
-                            // Verify this is likely the checksum (comes after body length position)
-                            if last_10_pos >= checksum_search_start {
-                                // Find the SOH after the checksum value
-                                if let Some(checksum_end) = buffer_str[last_10_pos..].find('\x01') {
-                                    let message_end = last_10_pos + checksum_end + 1;
-
-                                    // Verify this message makes sense (checksum comes after body start)
-                                    // and the remaining data after checksum is minimal (shouldn't have another message yet)
-                                    if message_end > body_actual_start && msg_buffer.len() >= message_end {
-                                        // Extract complete message
-                                        let complete_msg = msg_buffer.drain(..message_end).collect::<Vec<_>>();
-                                        drop(msg_buffer);
-
-                                        info!("✅ Extracted complete FIX message ({} bytes) from buffer", complete_msg.len());
-                                        return FIXMessage::decode(&complete_msg);
-                                    }
-                                }
-                            }
+        loop {
+            // Resync to the start of a message if there is leading junk, so a
+            // single bad frame can never wedge the stream.
+            if !buf.starts_with(b"8=") {
+                match buf.windows(5).position(|w| w == b"8=FIX") {
+                    Some(0) => {}
+                    Some(i) => {
+                        warn!("FIX framing: discarding {} bytes of leading junk", i);
+                        buf.drain(..i);
+                    }
+                    None => {
+                        // Keep a tail that could be the start of "8=FIX".
+                        let keep = buf.len().min(4);
+                        let cut = buf.len() - keep;
+                        if cut > 0 {
+                            warn!("FIX framing: discarding {} bytes with no message start", cut);
+                            buf.drain(..cut);
                         }
+                        return Err(anyhow!("Incomplete FIX message - waiting for message start"));
                     }
                 }
             }
-        }
 
-        drop(msg_buffer);
-        Err(anyhow!("Incomplete FIX message - waiting for more data"))
+            // Header: BeginString<SOH> 9=<len><SOH>
+            let Some(p1) = buf.iter().position(|&b| b == SOH) else {
+                return Err(anyhow!("Incomplete FIX message - waiting for more data"));
+            };
+            if buf.len() < p1 + 3 {
+                return Err(anyhow!("Incomplete FIX message - waiting for more data"));
+            }
+            if &buf[p1 + 1..p1 + 3] != b"9=" {
+                warn!("FIX framing: BodyLength(9) does not follow BeginString; resyncing");
+                buf.drain(..1);
+                continue;
+            }
+            let Some(rel) = buf[p1 + 3..].iter().position(|&b| b == SOH) else {
+                return Err(anyhow!("Incomplete FIX message - waiting for more data"));
+            };
+            let p2 = p1 + 3 + rel;
+            let body_len = match std::str::from_utf8(&buf[p1 + 3..p2]).ok().and_then(|v| v.parse::<usize>().ok()) {
+                Some(n) => n,
+                None => {
+                    warn!("FIX framing: unparseable BodyLength; resyncing");
+                    buf.drain(..1);
+                    continue;
+                }
+            };
+
+            let trailer_start = p2 + 1 + body_len;
+            let message_end = trailer_start + TRAILER_LEN;
+            if buf.len() < message_end {
+                return Err(anyhow!("Incomplete FIX message - waiting for more data"));
+            }
+            if &buf[trailer_start..trailer_start + 3] != b"10=" || buf[message_end - 1] != SOH {
+                warn!("FIX framing: CheckSum(10) not where BodyLength says it is; resyncing");
+                buf.drain(..1);
+                continue;
+            }
+
+            let complete_msg: Vec<u8> = buf.drain(..message_end).collect();
+            drop(buf);
+            info!("✅ Extracted complete FIX message ({} bytes) from buffer", complete_msg.len());
+            return FIXMessage::decode(&complete_msg);
+        }
     }
 
     pub async fn handle_message(&self, msg: &FIXMessage) -> Result<()> {
@@ -6788,6 +6809,46 @@ mod connectivity_tests {
         );
 
         cleanup_processed(cl_ord_id);
+        Ok(())
+    }
+
+    /// Several messages arriving in one TCP read must be extracted one at a
+    /// time. extract_complete_message used to locate the checksum with
+    /// rfind("10="), i.e. the LAST checksum in the whole buffer, then drain and
+    /// decode everything up to it as a single message -- so every message but
+    /// one in a coalesced read vanished. Their MsgSeqNums then read as a gap,
+    /// recovery triggered bursts that coalesced again, and the client looped in
+    /// recovery dropping inbound messages, ExecutionReports included.
+    #[tokio::test]
+    async fn extracts_each_of_several_messages_from_one_read() -> Result<()> {
+        let session = FIXSession::new("TEST.FRAMING", "MOCK.VENUE");
+        let mut bytes = Vec::new();
+        for seq in 1..=3u32 {
+            let mut m = FIXMessage::new('0', "MOCK.VENUE", "TEST.FRAMING", seq);
+            // Tag 110 contains "10=" -- the old parser could mistake it for a checksum.
+            m.set_field(110, "5");
+            bytes.extend(m.encode()?);
+        }
+        session.message_buffer.lock().await.extend_from_slice(&bytes);
+
+        for expected_seq in 1..=3u32 {
+            let msg = session.extract_complete_message().await?;
+            assert_eq!(msg.seq_num, expected_seq, "messages must come out one at a time, in order");
+        }
+        assert!(session.message_buffer.lock().await.is_empty(), "nothing may be left over or lost");
+        Ok(())
+    }
+
+    /// A message split across reads must wait for the rest, then extract whole.
+    #[tokio::test]
+    async fn waits_for_a_message_split_across_reads() -> Result<()> {
+        let session = FIXSession::new("TEST.FRAMING", "MOCK.VENUE");
+        let bytes = FIXMessage::new('0', "MOCK.VENUE", "TEST.FRAMING", 7).encode()?;
+        let (head, tail) = bytes.split_at(bytes.len() - 5);
+        session.message_buffer.lock().await.extend_from_slice(head);
+        assert!(session.extract_complete_message().await.is_err(), "half a message must not extract");
+        session.message_buffer.lock().await.extend_from_slice(tail);
+        assert_eq!(session.extract_complete_message().await?.seq_num, 7);
         Ok(())
     }
 
