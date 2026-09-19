@@ -2871,35 +2871,59 @@ async fn market_data_loop(
             info!("✅ SecurityListRequest sent successfully!");
         }
 
-        // Wait for the SecurityList to actually arrive, rather than guessing.
+        // Wait for the SecurityList while CONTINUING TO READ the socket.
         //
-        // This was a fixed 3s sleep. The UAT venue answers in ~5s, so on
-        // 2026-09-19 all four MD sessions checked an empty list at +3s, logged
-        // "No SecurityList received" and subscribed to nothing, while the list
-        // landed 2s later. The old hardcoded symbols never depended on the
-        // reply, which hid it. Now: poll until the list is non-empty and has
-        // stopped growing for 2s (it arrives in several fragments), up to 30s.
+        // This task is the only reader for this session, and it used to wait
+        // passively (first a fixed 3s sleep, then a 30s poll) before entering
+        // its read loop. Nothing read the socket in the meantime, so the
+        // SecurityList sat unread in the kernel buffer and was only processed
+        // ~2s AFTER each wait ended, however long the wait was -- the list
+        // could never arrive in time, by construction. (PR #9 misread this as
+        // the venue being slow and lengthened the wait, which only made the
+        // same deadlock take 30s.) Now the wait pumps messages exactly as the
+        // main loop below does, so 35=y fragments are handled as they arrive.
         let wait_started = Instant::now();
         let deadline = wait_started + Duration::from_secs(30);
         let mut last_len = 0usize;
         let mut stable_since = Instant::now();
+        let mut lost_connection = false;
         loop {
+            match tokio::time::timeout(Duration::from_millis(250), session.receive_message()).await {
+                Ok(Ok(msg)) => {
+                    if let Err(e) = session.handle_message(&msg).await {
+                        error!("Market Data message handling error: {}", e);
+                    }
+                }
+                Ok(Err(e)) => {
+                    let err_str = e.to_string();
+                    if !(err_str.contains("Incomplete FIX message") || err_str.contains("waiting for more data")) {
+                        warn!("⚠️  Market Data connection closed while awaiting SecurityList: {}", e);
+                        lost_connection = true;
+                        break;
+                    }
+                }
+                Err(_) => {} // nothing to read this tick
+            }
             let len = session.securities.lock().await.len();
             if len != last_len {
                 last_len = len;
                 stable_since = Instant::now();
             }
             if len > 0 && stable_since.elapsed() >= Duration::from_secs(2) {
-                info!("📜 SecurityList settled after {:.1}s", wait_started.elapsed().as_secs_f64());
+                info!("📜 SecurityList settled after {:.1}s ({} entries)", wait_started.elapsed().as_secs_f64(), len);
                 break;
             }
             if Instant::now() >= deadline {
                 warn!("⚠️  SecurityList not settled after 30s ({} entries so far)", len);
                 break;
             }
-            sleep(Duration::from_millis(250)).await;
         }
-        
+        if lost_connection {
+            info!("Market Data session ended. Reconnecting in 5 seconds...");
+            sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
         // Verify session is still ready before sending MarketDataRequest
         if !session.is_ready().await {
             warn!("⚠️  Session not ready, skipping MarketDataRequest");
