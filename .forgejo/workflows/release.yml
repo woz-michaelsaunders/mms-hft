@@ -120,3 +120,42 @@ jobs:
               -H "Authorization: token $TOKEN" -F "attachment=@$f" -o /dev/null
           done
           echo "release shipped: $VERSION"
+
+  # ── Deploy ────────────────────────────────────────────────────────────────
+  # Runs only for v* tags, and only after the release job is green, so the
+  # server never receives a build that failed its tests or could not ship.
+  #
+  # The key is pinned server-side to command="/home/ubuntu/deploy.sh", so this
+  # job cannot get a shell on the trading box no matter what it asks for. The
+  # server rebuilds the ref and reruns the suite before swapping the binary;
+  # if either fails it changes nothing and the sessions keep running.
+  deploy:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to the HFT server
+        env:
+          DEPLOY_KEY:  ${{ secrets.HFT_DEPLOY_KEY }}
+          DEPLOY_HOST: ${{ secrets.HFT_DEPLOY_HOST }}
+          TAG:         ${{ github.ref_name }}
+          SHA:         ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [ -n "$DEPLOY_KEY" ]  || { echo "::error::HFT_DEPLOY_KEY is not set"; exit 1; }
+          [ -n "$DEPLOY_HOST" ] || { echo "::error::HFT_DEPLOY_HOST is not set"; exit 1; }
+          command -v ssh >/dev/null || { apt-get update -qq; apt-get install -y -qq --no-install-recommends openssh-client; }
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/hft_deploy
+          chmod 600 ~/.ssh/hft_deploy
+          echo "Deploying $TAG ($SHA) to the HFT server"
+          # Pass the commit rather than the tag: a full SHA always resolves on
+          # the server, whatever its local refs look like.
+          ssh -i ~/.ssh/hft_deploy \
+              -o StrictHostKeyChecking=accept-new \
+              -o BatchMode=yes -o ConnectTimeout=20 \
+              ubuntu@"$DEPLOY_HOST" "deploy $SHA"
+
+      - name: Destroy the key material
+        if: always()
+        run: shred -u ~/.ssh/hft_deploy 2>/dev/null || rm -f ~/.ssh/hft_deploy
