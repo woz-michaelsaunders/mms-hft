@@ -92,14 +92,23 @@ jobs:
             echo "Add the secret to satisfy the signing gate."
             exit 0
           fi
+          # Pinned: this step originally fetched releases/latest, which moved to
+          # cosign v3 and broke on its first real run ("must specify --bundle
+          # with --new-bundle-format"). Change the version deliberately.
+          COSIGN_VERSION=v3.1.3
           curl -sSfL -o /usr/local/bin/cosign \
-            https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
           chmod +x /usr/local/bin/cosign
-          cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
-            --output-signature dist/SHA256SUMS.sig dist/SHA256SUMS
-          cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
-            --output-signature dist/provenance.json.sig dist/provenance.json
-          echo "signed"
+          # --tlog-upload=false keeps signatures off the PUBLIC Sigstore
+          # transparency log, which would otherwise publish every release's
+          # artifact hashes and our signing key. v3 only honours it on the
+          # legacy path, hence --use-signing-config=false.
+          for f in SHA256SUMS provenance.json; do
+            cosign sign-blob --yes --key env://COSIGN_PRIVATE_KEY \
+              --use-signing-config=false --tlog-upload=false \
+              --bundle "dist/$f.sigstore.json" "dist/$f"
+          done
+          echo "signed (bundles: dist/*.sigstore.json)"
 
       - name: Ship the release
         env:
