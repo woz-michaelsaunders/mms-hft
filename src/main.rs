@@ -2860,28 +2860,35 @@ async fn market_data_loop(
             continue;
         }
 
-        // List of symbols to subscribe to for market data
-        // Per Crypto.com docs: MDReqID format must be book.{Symbol}.{MarketDepth} or trade.{Symbol}
-        let all_symbols = vec![
-            "BTC_USDT",  // Bitcoin / Tether
-            "BTC_USD",   // Bitcoin / US Dollar
-            "BTC_EUR",   // Bitcoin / Euro
-            "SOL_BTC",   // Solana / Bitcoin
-            "XRP_BTC",   // Ripple / Bitcoin
-            "DOGE_BTC",  // Dogecoin / Bitcoin
-            "ADA_BTC",   // Cardano / Bitcoin
-            "LINK_BTC",  // Chainlink / Bitcoin
-            "AVAX_BTC",  // Avalanche / Bitcoin
-            "LTC_BTC",   // Litecoin / Bitcoin
-            "ATOM_BTC",  // Cosmos / Bitcoin
-            "ALGO_BTC",  // Algorand / Bitcoin
-        ];
-        
+        // Subscribe to what the venue actually lists, not to a fixed list.
+        //
+        // This previously held 12 hardcoded symbols, every one of them a BTC
+        // pair. The UAT venue lists none of them — it answers each request with
+        // "35=j ... 379=55 ... Symbol: BTC_USDT is not supported", 379 being
+        // RefTagID for Symbol(55). So every subscription was rejected and no
+        // order book ever populated. The SecurityList the venue sends on logon
+        // was already parsed into `securities` and written to securities.txt,
+        // then ignored.
+        //
+        // Per Crypto.com docs the MDReqID format is book.{Symbol}.{MarketDepth}
+        // or trade.{Symbol}.
+        let venue_symbols: Vec<String> = {
+            let securities = session.securities.lock().await;
+            securities.iter().map(|s| s.symbol.clone()).collect()
+        };
+
+        if venue_symbols.is_empty() {
+            warn!("⚠️  No SecurityList received — subscribing to nothing rather than \
+                   guessing at symbols the venue may not list");
+        } else {
+            info!("📜 Venue published {} securities", venue_symbols.len());
+        }
+
         // Filter symbols based on the symbol_filter function
         let symbols_to_subscribe: Vec<&str> = if let Some(filter) = &symbol_filter {
-            all_symbols.iter().filter(|s| filter(s)).copied().collect()
+            venue_symbols.iter().map(|s| s.as_str()).filter(|s| filter(s)).collect()
         } else {
-            all_symbols.iter().copied().collect()
+            venue_symbols.iter().map(|s| s.as_str()).collect()
         };
         
         info!("");
