@@ -87,6 +87,33 @@ struct ConnectionConfig {
     reconnect_backoff_ms: u64,
 }
 
+/// Append one line to `startup.log`, independent of the logging framework and
+/// of whatever pm2 is doing with our stdout/stderr.
+///
+/// On 2026-09-11 the pm2 daemon was restarted; its log pipes were torn down
+/// mid-cycle (`ERR_STREAM_DESTROYED`) and two consecutive `fix_server` starts
+/// failed with *zero* diagnostic output in either log. This file is opened,
+/// written and flushed per call, so it survives that and any future variant of
+/// it. It only records startup milestones, so it stays small — the main logs
+/// are already ~80 MB/day and must not be doubled.
+fn startup_note(msg: &str) {
+    use std::io::Write;
+    let line = format!(
+        "{} pid={} {}\n",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+        std::process::id(),
+        msg
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true).open("startup.log")
+    {
+        let _ = f.write_all(line.as_bytes());
+        let _ = f.flush();
+    }
+    let _ = std::io::stderr().write_all(line.as_bytes());
+    let _ = std::io::stderr().flush();
+}
+
 // Load configuration from file
 fn load_config() -> Result<Config> {
     let config_path = "config.toml";
@@ -6155,8 +6182,21 @@ async fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
-    // Load configuration
-    let config = load_config()?;
+    startup_note("starting");
+
+    // `main` returns Result, so a bare `?` here would print only "Error: ..."
+    // to a stderr that may not be captured, and exit 1 silently — which is
+    // exactly what happened on 2026-09-11. Say what failed, durably, first.
+    let config = match load_config() {
+        Ok(c) => {
+            startup_note("config.toml loaded");
+            c
+        }
+        Err(e) => {
+            startup_note(&format!("FATAL: could not load config.toml: {e:#}"));
+            return Err(e);
+        }
+    };
     info!("✅ Configuration loaded from config.toml");
 
     info!("╔════════════════════════════════════════════════════════════╗");
@@ -6530,6 +6570,11 @@ async fn main() -> Result<()> {
     info!("");
     info!("To use the management console, run: cargo run --bin fix_console");
     info!("Press Ctrl+C to stop the server.");
+
+    // Reaching here means every service spawned. A startup.log with "starting"
+    // but no "startup complete" is the signature of a start that died partway,
+    // which is otherwise invisible once pm2 has restarted the process.
+    startup_note("startup complete — all services active");
 
     // Keep the server running indefinitely
     // Wait for any of the critical tasks to fail (they will log errors and continue)
