@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::time::{sleep, Duration, Instant};
 
 use crate::fix_protocol::{tags, FIXMessage};
 
@@ -38,6 +38,11 @@ pub struct MockGatewayConfig {
     /// If Some(n), the mock closes the connection after processing n inbound
     /// application messages (Logon doesn't count), to exercise reconnect (AC4).
     pub disconnect_after_messages: Option<u32>,
+    /// If Some(id), the mock sends a TestRequest (35=1) carrying this TestReqID
+    /// immediately after Logon, and hangs up unless the client answers with a
+    /// Heartbeat echoing it — which is what the live venue does, and what was
+    /// disconnecting every session every 15-25 seconds.
+    pub test_request_after_logon: Option<String>,
 }
 
 impl Default for MockGatewayConfig {
@@ -47,6 +52,7 @@ impl Default for MockGatewayConfig {
             md_ticks_to_stream: 0,
             induce_gap_at_tick: None,
             disconnect_after_messages: None,
+            test_request_after_logon: None,
         }
     }
 }
@@ -99,9 +105,43 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
     // triggered by the client's own recovery flow shouldn't re-trigger it,
     // or recovery would never converge.
     let gap_already_used = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Set when we send a TestRequest; cleared by a Heartbeat echoing its
+    // TestReqID. If it is still set when the grace period expires we hang up,
+    // which is how the live venue behaves toward an unresponsive session.
+    let mut awaiting_test_req_id: Option<String> = None;
+    let probe_grace = Duration::from_secs(2);
+    let mut probe_elapsed = Duration::ZERO;
+    let mut probe_due_at: Option<Instant> = None;
 
     loop {
-        let n = socket.read(&mut read_buf).await?;
+        let n = match tokio::time::timeout(Duration::from_millis(250), socket.read(&mut read_buf)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                // Read timed out. Fire a scheduled probe if it is due.
+                if let Some(due) = probe_due_at {
+                    if Instant::now() >= due {
+                        probe_due_at = None;
+                        if let Some(id) = config.test_request_after_logon.clone() {
+                            let mut probe = next_message(&out_seq, &config, '1').await;
+                            probe.set_field(tags::TEST_REQ_ID, &id);
+                            send(&mut socket, &probe).await?;
+                            awaiting_test_req_id = Some(id);
+                            probe_elapsed = Duration::ZERO;
+                        }
+                    }
+                }
+                // If a TestRequest is outstanding past its grace period, the
+                // client never answered: drop the session.
+                if awaiting_test_req_id.is_some() {
+                    probe_elapsed += probe_grace.min(Duration::from_millis(250));
+                    if probe_elapsed >= probe_grace {
+                        info!("Mock gateway: TestRequest unanswered - closing session");
+                        return Ok(());
+                    }
+                }
+                continue;
+            }
+        };
         if n == 0 {
             info!("Mock gateway: client disconnected");
             return Ok(());
@@ -123,8 +163,23 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
                     resp.set_field(tags::ENCRYPT_METHOD, "0");
                     resp.set_field(tags::HEARTBEAT_INT, "30");
                     send(&mut socket, &resp).await?;
+
+                    // Schedule the probe rather than sending it inline: a real
+                    // venue probes an established session, and firing mid-logon
+                    // makes the client's sequencer see a gap it cannot yet act on.
+                    if config.test_request_after_logon.is_some() {
+                        probe_due_at = Some(Instant::now() + Duration::from_millis(500));
+                    }
                 }
                 '0' => {
+                    // A Heartbeat echoing our TestReqID clears the probe. One that
+                    // does not is ignored, exactly as a real venue would: the
+                    // session stays unproven and gets hung up on below.
+                    if let Some(expected) = awaiting_test_req_id.clone() {
+                        if msg.get_field(tags::TEST_REQ_ID) == Some(expected.as_str()) {
+                            awaiting_test_req_id = None;
+                        }
+                    }
                     let resp = next_message(&out_seq, &config, '0').await;
                     send(&mut socket, &resp).await?;
                 }

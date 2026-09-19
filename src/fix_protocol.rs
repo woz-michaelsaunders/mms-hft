@@ -64,6 +64,9 @@ pub mod tags {
     pub const SENDING_TIME: usize = 52;
     pub const TRANSACT_TIME: usize = 60;
     pub const ENCRYPT_METHOD: usize = 98;
+    /// TestReqID — echoed back in the Heartbeat that answers a TestRequest (35=1).
+    /// Omitting the reply makes the counterparty treat the session as dead.
+    pub const TEST_REQ_ID: usize = 112;
     pub const HEARTBEAT_INT: usize = 108;
     pub const CHECKSUM: usize = 10;
     pub const TEXT: usize = 58;
