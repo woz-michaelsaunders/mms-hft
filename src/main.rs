@@ -2850,9 +2850,34 @@ async fn market_data_loop(
             info!("✅ SecurityListRequest sent successfully!");
         }
 
-        // Wait for SecurityListResponse to complete and ensure session is ready
-        info!("Waiting 3 seconds for SecurityListResponse to be fully processed...");
-        sleep(Duration::from_secs(3)).await;
+        // Wait for the SecurityList to actually arrive, rather than guessing.
+        //
+        // This was a fixed 3s sleep. The UAT venue answers in ~5s, so on
+        // 2026-09-19 all four MD sessions checked an empty list at +3s, logged
+        // "No SecurityList received" and subscribed to nothing, while the list
+        // landed 2s later. The old hardcoded symbols never depended on the
+        // reply, which hid it. Now: poll until the list is non-empty and has
+        // stopped growing for 2s (it arrives in several fragments), up to 30s.
+        let wait_started = Instant::now();
+        let deadline = wait_started + Duration::from_secs(30);
+        let mut last_len = 0usize;
+        let mut stable_since = Instant::now();
+        loop {
+            let len = session.securities.lock().await.len();
+            if len != last_len {
+                last_len = len;
+                stable_since = Instant::now();
+            }
+            if len > 0 && stable_since.elapsed() >= Duration::from_secs(2) {
+                info!("📜 SecurityList settled after {:.1}s", wait_started.elapsed().as_secs_f64());
+                break;
+            }
+            if Instant::now() >= deadline {
+                warn!("⚠️  SecurityList not settled after 30s ({} entries so far)", len);
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
         
         // Verify session is still ready before sending MarketDataRequest
         if !session.is_ready().await {
@@ -2872,9 +2897,14 @@ async fn market_data_loop(
         //
         // Per Crypto.com docs the MDReqID format is book.{Symbol}.{MarketDepth}
         // or trade.{Symbol}.
+        // Deduplicated: the list accumulates across repeated SecurityList
+        // responses (450 entries for a venue listing 50 on 2026-09-19), and
+        // subscribing to a symbol more than once is at best noise.
         let venue_symbols: Vec<String> = {
             let securities = session.securities.lock().await;
-            securities.iter().map(|s| s.symbol.clone()).collect()
+            let unique: std::collections::BTreeSet<String> =
+                securities.iter().map(|s| s.symbol.clone()).collect();
+            unique.into_iter().collect()
         };
 
         if venue_symbols.is_empty() {
