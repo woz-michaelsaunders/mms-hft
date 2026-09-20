@@ -444,6 +444,29 @@ pub struct TickData {
     pub last_size: f64,
 }
 
+/// kdb+ side-effects deferred until `order_books` is released.
+/// Converted to kdb `char`s at push time so replay does not re-derive.
+enum PendingMdIo {
+    Level {
+        side: char,   // 'B' | 'A'
+        price: f64,
+        size: f64,
+        action: char, // 'N' | 'C' | 'D'
+    },
+    Trade {
+        price: f64,
+        size: f64,
+        timestamp: i64,
+    },
+    Snapshot {
+        best_bid: f64,
+        best_ask: f64,
+        best_bid_size: f64,
+        best_ask_size: f64,
+        spread: f64,
+    },
+}
+
 pub struct FIXSession {
     stream: Arc<Mutex<Option<TcpStream>>>,
     sender_comp_id: String,
@@ -2115,98 +2138,98 @@ impl FIXSession {
                     let symbol = msg.get_field(tags::SYMBOL).map(|s| s.to_string()).unwrap_or_else(|| "UNKNOWN".to_string());
                     let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-                    // Get or create double-buffered order book for this symbol
-                    let mut books = self.order_books.lock().await;
-                    let book = books.entry(symbol.clone())
-                        .or_insert_with(|| DoubleBufferedOrderBook::new(symbol.clone(), 100_000)); // $1k dense range (reduced for memory)
-                    
-                    // For snapshot, clear the active book first (full refresh)
-                    book.get_active_mut().clear();
+                    // Mutate the book under `order_books`, then drop the guard
+                    // before any kdb / tick / CSV I/O (those `.await`s used to
+                    // pin this mutex for the entire snapshot, hanging /api/market-data-status).
+                    let (pending, combined_tick, best_bid, best_ask, best_bid_size, best_ask_size) = {
+                        let mut pending: Vec<PendingMdIo> =
+                            Vec::with_capacity(repeating_groups.len() + 1);
+                        let mut combined_tick = TickData {
+                            timestamp,
+                            symbol: symbol.clone(),
+                            bid: 0.0,
+                            ask: 0.0,
+                            bid_size: 0.0,
+                            ask_size: 0.0,
+                            last_price: 0.0,
+                            last_size: 0.0,
+                        };
 
-                    // Combine Bid and Ask from same snapshot into single tick
-                    let mut combined_tick = TickData {
-                        timestamp,
-                        symbol: symbol.clone(),
-                        bid: 0.0,
-                        ask: 0.0,
-                        bid_size: 0.0,
-                        ask_size: 0.0,
-                        last_price: 0.0,
-                        last_size: 0.0,
-                    };
+                        let mut books = self.order_books.lock().await;
+                        let book = books.entry(symbol.clone())
+                            .or_insert_with(|| DoubleBufferedOrderBook::new(symbol.clone(), 100_000)); // $1k dense range (reduced for memory)
 
-                    for (idx, entry) in repeating_groups.iter().enumerate() {
-                        if let Some(entry_type) = entry.get(&269) {
-                            // 0 = Bid, 1 = Ask, 2 = Trade, 4 = Opening Price, etc.
-                            let entry_type_name = match entry_type.as_str() {
-                                "0" => "Bid",
-                                "1" => "Ask",
-                                "2" => "Trade",
-                                "4" => "Opening",
-                                _ => "Other",
-                            };
-                            info!("  [{}] {} (type: {})", idx, entry_type_name, entry_type);
+                        // For snapshot, clear the active book first (full refresh)
+                        book.get_active_mut().clear();
 
-                            // Extract price (tag 270) and size (tag 271)
-                            if let Some(price_str) = entry.get(&270) {
-                                if let Ok(price) = price_str.parse::<f64>() {
-                                    let size = entry.get(&271).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                                    info!("      Price: {}, Size: {}", price, size);
+                        {
+                            let active_book = book.get_active_mut();
+                            for (idx, entry) in repeating_groups.iter().enumerate() {
+                                if let Some(entry_type) = entry.get(&269) {
+                                    // 0 = Bid, 1 = Ask, 2 = Trade, 4 = Opening Price, etc.
+                                    let entry_type_name = match entry_type.as_str() {
+                                        "0" => "Bid",
+                                        "1" => "Ask",
+                                        "2" => "Trade",
+                                        "4" => "Opening",
+                                        _ => "Other",
+                                    };
+                                    info!("  [{}] {} (type: {})", idx, entry_type_name, entry_type);
 
-                                    // Update active order book (snapshot = New action)
-                                    let active_book = book.get_active_mut();
-                                    match entry_type.as_str() {
-                                        "0" => {
-                                            // Bid update
-                                            active_book.update_level(Side::Bid, price, size, UpdateAction::New);
-                                            combined_tick.bid = price;
-                                            combined_tick.bid_size = size;
-                                            // Write to kdb+
-                                            let _ = self.kdb_writer.write_order_book_level(&symbol, 'B', price, size, 'N').await;
-                                        }
-                                        "1" => {
-                                            // Ask update
-                                            active_book.update_level(Side::Ask, price, size, UpdateAction::New);
-                                            combined_tick.ask = price;
-                                            combined_tick.ask_size = size;
-                                            // Write to kdb+
-                                            let _ = self.kdb_writer.write_order_book_level(&symbol, 'A', price, size, 'N').await;
-                                        }
-                                        "2" => {
-                                            // Trade/Last price - add to order book trade history
-                                            active_book.add_trade(price, size, timestamp);
-                                            combined_tick.last_price = price;
-                                            combined_tick.last_size = size;
-                                            // Write to kdb+
-                                            let _ = self.kdb_writer.write_trade(&symbol, price, size, timestamp).await;
-                                        }
-                                        _ => {
-                                            // Unknown entry type - skip
+                                    // Extract price (tag 270) and size (tag 271)
+                                    if let Some(price_str) = entry.get(&270) {
+                                        if let Ok(price) = price_str.parse::<f64>() {
+                                            let size = entry.get(&271).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                            info!("      Price: {}, Size: {}", price, size);
+
+                                            // Update active order book (snapshot = New action)
+                                            match entry_type.as_str() {
+                                                "0" => {
+                                                    // Bid update
+                                                    active_book.update_level(Side::Bid, price, size, UpdateAction::New);
+                                                    combined_tick.bid = price;
+                                                    combined_tick.bid_size = size;
+                                                    pending.push(PendingMdIo::Level { side: 'B', price, size, action: 'N' });
+                                                }
+                                                "1" => {
+                                                    // Ask update
+                                                    active_book.update_level(Side::Ask, price, size, UpdateAction::New);
+                                                    combined_tick.ask = price;
+                                                    combined_tick.ask_size = size;
+                                                    pending.push(PendingMdIo::Level { side: 'A', price, size, action: 'N' });
+                                                }
+                                                "2" => {
+                                                    // Trade/Last price - add to order book trade history
+                                                    active_book.add_trade(price, size, timestamp);
+                                                    combined_tick.last_price = price;
+                                                    combined_tick.last_size = size;
+                                                    pending.push(PendingMdIo::Trade { price, size, timestamp });
+                                                }
+                                                _ => {
+                                                    // Unknown entry type - skip
+                                                }
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Log best bid/ask from active order book
-                    let active_book = book.get_active();
-                    let best_bid = active_book.best_bid();
-                    let best_ask = active_book.best_ask();
-                    let spread = active_book.spread();
-                    info!("  📊 Order Book: Bid={:.2}, Ask={:.2}, Spread={:.2}", best_bid, best_ask, spread);
+                        let (best_bid, best_ask, spread, best_bid_size, best_ask_size) = {
+                            let a = book.get_active();
+                            (a.best_bid(), a.best_ask(), a.spread(), a.best_bid_size(), a.best_ask_size())
+                        };
+                        info!("  📊 Order Book: Bid={:.2}, Ask={:.2}, Spread={:.2}", best_bid, best_ask, spread);
 
-                    // Get snapshot values before swapping
-                    let best_bid_size = active_book.best_bid_size();
-                    let best_ask_size = active_book.best_ask_size();
-                    
-                    // CRITICAL: Swap snapshot after snapshot processing to make updates visible
-                    book.swap_snapshot();
+                        // CRITICAL: Swap snapshot after snapshot processing to make updates visible
+                        book.swap_snapshot();
+                        pending.push(PendingMdIo::Snapshot {
+                            best_bid, best_ask, best_bid_size, best_ask_size, spread,
+                        });
+                        (pending, combined_tick, best_bid, best_ask, best_bid_size, best_ask_size)
+                    }; // order_books MutexGuard dropped here — no kdb/tick await above
 
-                    // Write snapshot to kdb+ and persist to CSV for backtest fallback
-                    let _ = self.kdb_writer.write_snapshot(&symbol, best_bid, best_ask, 
-                        best_bid_size, best_ask_size, spread).await;
-                    append_snapshot_to_csv_with_sizes(&symbol, best_bid, best_ask, best_bid_size, best_ask_size);
+                    self.replay_pending_md_io(&symbol, pending).await;
 
                     // Only add tick if we have at least bid or ask data
                     if combined_tick.bid > 0.0 || combined_tick.ask > 0.0 || combined_tick.last_price > 0.0 {
@@ -2214,6 +2237,7 @@ impl FIXSession {
                               combined_tick.bid, combined_tick.ask, combined_tick.bid_size, combined_tick.ask_size);
                         self.add_tick(combined_tick).await;
                     }
+                    append_snapshot_to_csv_with_sizes(&symbol, best_bid, best_ask, best_bid_size, best_ask_size);
                 }
 
                 info!("═══════════════════════════════════════════════════════════");
@@ -2265,160 +2289,167 @@ impl FIXSession {
                     };
                     let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
 
-                    // Get or create double-buffered order book for this symbol
-                    let mut books = self.order_books.lock().await;
-                    let book = books.entry(symbol.clone())
-                        .or_insert_with(|| DoubleBufferedOrderBook::new(symbol.clone(), 100_000)); // $1k dense range (reduced for memory)
+                    // Mutate the book under `order_books`, then drop the guard
+                    // before kdb / ticks / CSV / ZMQ. Inner `continue` cannot skip
+                    // the drop because the guard's lifetime is this block.
+                    let (pending, ticks, best_bid, best_ask, best_bid_size, best_ask_size, zmq_symbol) = {
+                        let mut pending: Vec<PendingMdIo> =
+                            Vec::with_capacity(repeating_groups.len() + 1);
+                        let mut ticks: Vec<TickData> = Vec::with_capacity(repeating_groups.len());
 
-                    for (idx, entry) in repeating_groups.iter().enumerate() {
-                        if let Some(entry_type) = entry.get(&269) {
-                            // Check for special case: 'J' = Empty Book (clear entire order book)
-                            if entry_type == "J" {
-                                warn!("⚠️  EMPTY BOOK (269=J) - Clearing entire order book for {}", symbol);
-                                book.get_active_mut().clear();
-                                continue;
-                            }
-                            
-                            // 0 = Bid, 1 = Ask, 2 = Trade, 4 = Opening Price, etc.
-                            let entry_type_name = match entry_type.as_str() {
-                                "0" => "Bid",
-                                "1" => "Ask",
-                                "2" => "Trade",
-                                "4" => "Opening",
-                                _ => "Other",
-                            };
-                            
-                            // Check MDUpdateAction (tag 279) - 0=New, 1=Change, 2=Delete
-                            let update_action_str = entry.get(&279).map(|s| s.as_str()).unwrap_or("0");
-                            let update_action = UpdateAction::from(update_action_str);
-                            let action_name = match update_action {
-                                UpdateAction::New => "New",
-                                UpdateAction::Change => "Change",
-                                UpdateAction::Delete => "Delete",
-                            };
-                            
-                            info!("  [{}] {} {} (type: {})", idx, action_name, entry_type_name, entry_type);
+                        let mut books = self.order_books.lock().await;
+                        let book = books.entry(symbol.clone())
+                            .or_insert_with(|| DoubleBufferedOrderBook::new(symbol.clone(), 100_000)); // $1k dense range (reduced for memory)
 
-                            // Extract price (tag 270) and size (tag 271)
-                            if let Some(price_str) = entry.get(&270) {
-                                if let Ok(price) = price_str.parse::<f64>() {
-                                    let size = entry.get(&271).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                                    info!("      Price: {}, Size: {}", price, size);
-
-                                    // Update active order book based on entry type and action
-                                    let active_book = book.get_active_mut();
-                                    let action_char = match update_action {
-                                        UpdateAction::New => 'N',
-                                        UpdateAction::Change => 'C',
-                                        UpdateAction::Delete => 'D',
-                                    };
-                                    match entry_type.as_str() {
-                                        "0" => {
-                                            // Bid update
-                                            info!("📝 Processing Bid update: {} {} {} {}", symbol, price, size, action_char);
-                                            active_book.update_level(Side::Bid, price, size, update_action);
-                                            // Write to kdb+
-                                            info!("📝 Calling write_order_book_level for Bid");
-                                            let _ = self.kdb_writer.write_order_book_level(&symbol, 'B', price, size, action_char).await;
-                                        }
-                                        "1" => {
-                                            // Ask update
-                                            info!("📝 Processing Ask update: {} {} {} {}", symbol, price, size, action_char);
-                                            active_book.update_level(Side::Ask, price, size, update_action);
-                                            // Write to kdb+
-                                            info!("📝 Calling write_order_book_level for Ask");
-                                            let _ = self.kdb_writer.write_order_book_level(&symbol, 'A', price, size, action_char).await;
-                                        }
-                                        "2" => {
-                                            // Trade/Last price - add to order book trade history
-                                            info!("💹 Adding trade to order book: Price={}, Size={}, Symbol={}", price, size, symbol);
-                                            active_book.add_trade(price, size, timestamp);
-                                            info!("💹 Trade added! Total trades in book: {}", active_book.trade_count());
-                                            // Write to kdb+
-                                            info!("📝 Calling write_trade");
-                                            let _ = self.kdb_writer.write_trade(&symbol, price, size, timestamp).await;
-                                        }
-                                        _ => {
-                                            // Unknown entry type - skip
-                                            continue;
-                                        }
+                        {
+                            let active_book = book.get_active_mut();
+                            for (idx, entry) in repeating_groups.iter().enumerate() {
+                                if let Some(entry_type) = entry.get(&269) {
+                                    // Check for special case: 'J' = Empty Book (clear entire order book)
+                                    if entry_type == "J" {
+                                        warn!("⚠️  EMPTY BOOK (269=J) - Clearing entire order book for {}", symbol);
+                                        active_book.clear();
+                                        continue;
                                     }
 
-                                    // Create tick data for CSV export
-                                    let tick = match entry_type.as_str() {
-                                        "0" => {
-                                            // Bid update
-                                            TickData {
-                                                timestamp,
-                                                symbol: symbol.clone(),
-                                                bid: price,
-                                                ask: 0.0,
-                                                bid_size: size,
-                                                ask_size: 0.0,
-                                                last_price: 0.0,
-                                                last_size: 0.0,
-                                            }
-                                        }
-                                        "1" => {
-                                            // Ask update
-                                            TickData {
-                                                timestamp,
-                                                symbol: symbol.clone(),
-                                                bid: 0.0,
-                                                ask: price,
-                                                bid_size: 0.0,
-                                                ask_size: size,
-                                                last_price: 0.0,
-                                                last_size: 0.0,
-                                            }
-                                        }
-                                        "2" => {
-                                            // Trade/Last price
-                                            TickData {
-                                                timestamp,
-                                                symbol: symbol.clone(),
-                                                bid: 0.0,
-                                                ask: 0.0,
-                                                bid_size: 0.0,
-                                                ask_size: 0.0,
-                                                last_price: price,
-                                                last_size: size,
-                                            }
-                                        }
-                                        _ => {
-                                            // Unknown entry type - skip
-                                            continue;
-                                        }
+                                    // 0 = Bid, 1 = Ask, 2 = Trade, 4 = Opening Price, etc.
+                                    let entry_type_name = match entry_type.as_str() {
+                                        "0" => "Bid",
+                                        "1" => "Ask",
+                                        "2" => "Trade",
+                                        "4" => "Opening",
+                                        _ => "Other",
                                     };
 
-                                    // Add tick to buffer
-                                    self.add_tick(tick).await;
+                                    // Check MDUpdateAction (tag 279) - 0=New, 1=Change, 2=Delete
+                                    let update_action_str = entry.get(&279).map(|s| s.as_str()).unwrap_or("0");
+                                    let update_action = UpdateAction::from(update_action_str);
+                                    let action_name = match update_action {
+                                        UpdateAction::New => "New",
+                                        UpdateAction::Change => "Change",
+                                        UpdateAction::Delete => "Delete",
+                                    };
+
+                                    info!("  [{}] {} {} (type: {})", idx, action_name, entry_type_name, entry_type);
+
+                                    // Extract price (tag 270) and size (tag 271)
+                                    if let Some(price_str) = entry.get(&270) {
+                                        if let Ok(price) = price_str.parse::<f64>() {
+                                            let size = entry.get(&271).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                                            info!("      Price: {}, Size: {}", price, size);
+
+                                            let action_char = match update_action {
+                                                UpdateAction::New => 'N',
+                                                UpdateAction::Change => 'C',
+                                                UpdateAction::Delete => 'D',
+                                            };
+                                            match entry_type.as_str() {
+                                                "0" => {
+                                                    // Bid update
+                                                    info!("📝 Processing Bid update: {} {} {} {}", symbol, price, size, action_char);
+                                                    active_book.update_level(Side::Bid, price, size, update_action);
+                                                    info!("📝 Calling write_order_book_level for Bid");
+                                                    pending.push(PendingMdIo::Level { side: 'B', price, size, action: action_char });
+                                                }
+                                                "1" => {
+                                                    // Ask update
+                                                    info!("📝 Processing Ask update: {} {} {} {}", symbol, price, size, action_char);
+                                                    active_book.update_level(Side::Ask, price, size, update_action);
+                                                    info!("📝 Calling write_order_book_level for Ask");
+                                                    pending.push(PendingMdIo::Level { side: 'A', price, size, action: action_char });
+                                                }
+                                                "2" => {
+                                                    // Trade/Last price - add to order book trade history
+                                                    info!("💹 Adding trade to order book: Price={}, Size={}, Symbol={}", price, size, symbol);
+                                                    active_book.add_trade(price, size, timestamp);
+                                                    info!("💹 Trade added! Total trades in book: {}", active_book.trade_count());
+                                                    info!("📝 Calling write_trade");
+                                                    pending.push(PendingMdIo::Trade { price, size, timestamp });
+                                                }
+                                                _ => {
+                                                    // Unknown entry type - skip
+                                                    continue;
+                                                }
+                                            }
+
+                                            // Create tick data for CSV export
+                                            let tick = match entry_type.as_str() {
+                                                "0" => {
+                                                    // Bid update
+                                                    TickData {
+                                                        timestamp,
+                                                        symbol: symbol.clone(),
+                                                        bid: price,
+                                                        ask: 0.0,
+                                                        bid_size: size,
+                                                        ask_size: 0.0,
+                                                        last_price: 0.0,
+                                                        last_size: 0.0,
+                                                    }
+                                                }
+                                                "1" => {
+                                                    // Ask update
+                                                    TickData {
+                                                        timestamp,
+                                                        symbol: symbol.clone(),
+                                                        bid: 0.0,
+                                                        ask: price,
+                                                        bid_size: 0.0,
+                                                        ask_size: size,
+                                                        last_price: 0.0,
+                                                        last_size: 0.0,
+                                                    }
+                                                }
+                                                "2" => {
+                                                    // Trade/Last price
+                                                    TickData {
+                                                        timestamp,
+                                                        symbol: symbol.clone(),
+                                                        bid: 0.0,
+                                                        ask: 0.0,
+                                                        bid_size: 0.0,
+                                                        ask_size: 0.0,
+                                                        last_price: price,
+                                                        last_size: size,
+                                                    }
+                                                }
+                                                _ => {
+                                                    // Unknown entry type - skip
+                                                    continue;
+                                                }
+                                            };
+                                            ticks.push(tick);
+                                        }
+                                    }
                                 }
                             }
                         }
+
+                        let (best_bid, best_ask, spread, best_bid_size, best_ask_size) = {
+                            let a = book.get_active();
+                            (a.best_bid(), a.best_ask(), a.spread(), a.best_bid_size(), a.best_ask_size())
+                        };
+
+                        // CRITICAL: Swap snapshot after incremental update to make updates visible
+                        book.swap_snapshot();
+
+                        info!("  📊 Order Book: Bid={:.2}, Ask={:.2}, Spread={:.2}", best_bid, best_ask, spread);
+
+                        pending.push(PendingMdIo::Snapshot {
+                            best_bid, best_ask, best_bid_size, best_ask_size, spread,
+                        });
+                        (pending, ticks, best_bid, best_ask, best_bid_size, best_ask_size, symbol.clone())
+                    }; // order_books MutexGuard dropped here — no kdb/tick/ZMQ await above
+
+                    self.replay_pending_md_io(&symbol, pending).await;
+                    for t in ticks {
+                        self.add_tick(t).await;
                     }
-
-                    // Get snapshot values before swapping
-                    let active_book_before_swap = book.get_active();
-                    let best_bid = active_book_before_swap.best_bid();
-                    let best_ask = active_book_before_swap.best_ask();
-                    let spread = active_book_before_swap.spread();
-                    let best_bid_size = active_book_before_swap.best_bid_size();
-                    let best_ask_size = active_book_before_swap.best_ask_size();
-                    
-                    // CRITICAL: Swap snapshot after incremental update to make updates visible
-                    book.swap_snapshot();
-
-                    info!("  📊 Order Book: Bid={:.2}, Ask={:.2}, Spread={:.2}", best_bid, best_ask, spread);
-                    
-                    // Write snapshot to kdb+ and persist to CSV for backtest fallback
-                    let _ = self.kdb_writer.write_snapshot(&symbol, best_bid, best_ask, 
-                        best_bid_size, best_ask_size, spread).await;
                     append_snapshot_to_csv_with_sizes(&symbol, best_bid, best_ask, best_bid_size, best_ask_size);
-                    
+
                     // Signal ZeroMQ update ONCE per incremental refresh (after all entries processed)
                     if let Some(tx) = self.order_book_update_tx.lock().await.as_ref() {
-                        let _ = tx.send(symbol.clone());
+                        let _ = tx.send(zmq_symbol);
                     }
                 } else {
                     info!("⚠️  No market data entries found in message");
@@ -2628,6 +2659,30 @@ impl FIXSession {
         }
     }
 
+    /// Replay deferred kdb writes after `order_books` has been dropped.
+    /// Error policy matches the previous in-lock call sites: kdb failure is ignored.
+    async fn replay_pending_md_io(&self, symbol: &str, pending: Vec<PendingMdIo>) {
+        for io in pending {
+            match io {
+                PendingMdIo::Level { side, price, size, action } => {
+                    let _ = self.kdb_writer
+                        .write_order_book_level(symbol, side, price, size, action)
+                        .await;
+                }
+                PendingMdIo::Trade { price, size, timestamp } => {
+                    let _ = self.kdb_writer
+                        .write_trade(symbol, price, size, timestamp)
+                        .await;
+                }
+                PendingMdIo::Snapshot { best_bid, best_ask, best_bid_size, best_ask_size, spread } => {
+                    let _ = self.kdb_writer
+                        .write_snapshot(symbol, best_bid, best_ask, best_bid_size, best_ask_size, spread)
+                        .await;
+                }
+            }
+        }
+    }
+
     // Private helper methods
     async fn send_message(&self, msg: &FIXMessage) -> Result<()> {
         // CRITICAL: Only allow logon (A) and logout (5) messages before session is ready
@@ -2744,6 +2799,105 @@ impl FIXSession {
                 ConnectionState::Ready
             )
     }
+}
+
+const STATUS_READ_SKIPPED_LOCK_CONTENDED: &str = "skipped_lock_contended";
+
+fn connection_state_status_str(state: ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Disconnected => "DISCONNECTED",
+        ConnectionState::Connecting => "CONNECTING",
+        ConnectionState::Connected => "CONNECTED",
+        ConnectionState::Logging => "LOGGING_IN",
+        ConnectionState::Ready => "READY",
+        ConnectionState::Disconnecting => "DISCONNECTING",
+    }
+}
+
+/// Non-blocking per-session status sample for `GET /api/market-data-status`.
+/// Plain `fn` so it cannot `.await` a session mutex. Contended fields are JSON
+/// `null` (keys always present); `status_read` is emitted only on contention.
+fn market_data_session_status(
+    session: &FIXSession,
+    description: &str,
+    port: u16,
+) -> serde_json::Value {
+    let mut contended = false;
+
+    let is_connected: Option<bool> = match session.is_connected.try_lock() {
+        Ok(g) => Some(*g),
+        Err(_) => {
+            contended = true;
+            None
+        }
+    };
+
+    let connection_state: Option<ConnectionState> = match session.connection_state.try_lock() {
+        Ok(g) => Some(*g),
+        Err(_) => {
+            contended = true;
+            None
+        }
+    };
+
+    let is_ready: Option<bool> = match (is_connected, connection_state) {
+        (Some(c), Some(s)) => Some(c && matches!(s, ConnectionState::Ready)),
+        _ => None,
+    };
+
+    let seq_num: Option<u32> = match session.seq_num.try_lock() {
+        Ok(g) => Some(*g),
+        Err(_) => {
+            contended = true;
+            None
+        }
+    };
+
+    let (book_count, total_trades, symbols): (Option<usize>, Option<usize>, Option<Vec<String>>) =
+        match session.order_books.try_lock() {
+            Ok(books) => {
+                let count = books.len();
+                let trades = books.values().map(|b| b.get_active().trade_count()).sum();
+                let syms = books.keys().cloned().collect();
+                (Some(count), Some(trades), Some(syms))
+            }
+            Err(_) => {
+                contended = true;
+                (None, None, None)
+            }
+        };
+
+    let securities_count: Option<usize> = match session.securities.try_lock() {
+        Ok(sec) => Some(sec.len()),
+        Err(_) => {
+            contended = true;
+            None
+        }
+    };
+
+    let connection_state_str: Option<&'static str> =
+        connection_state.map(connection_state_status_str);
+
+    let mut body = serde_json::json!({
+        "description": description,
+        "port": port,
+        "sender_comp_id": session.sender_comp_id,
+        "target_comp_id": session.target_comp_id,
+        "is_connected": is_connected,
+        "is_ready": is_ready,
+        "connection_state": connection_state_str,
+        "sequence_number": seq_num,
+        "order_books": book_count,
+        "total_trades": total_trades,
+        "symbols": symbols,
+        "securities_count": securities_count,
+    });
+    if contended {
+        body["status_read"] = serde_json::Value::String(
+            STATUS_READ_SKIPPED_LOCK_CONTENDED.to_string(),
+        );
+    }
+    body
 }
 
 /// Message processing loop with persistent connection support
@@ -3984,54 +4138,11 @@ async fn order_book_web_server(
     async fn get_all_market_data_status_api(
         axum::extract::State(state): axum::extract::State<AppState>,
     ) -> Result<Json<serde_json::Value>, StatusCode> {
-        let mut statuses = Vec::new();
-        
+        let mut statuses = Vec::with_capacity(state.market_data_sessions.len());
         for (session, description, port) in &state.market_data_sessions {
-                    let is_connected = *session.is_connected.lock().await;
-                    let connection_state = *session.connection_state.lock().await;
-                    let is_ready = session.is_ready().await;
-                    let seq_num = *session.seq_num.lock().await;
-                    
-                    let order_books = session.order_books.lock().await;
-                    let symbol_count = order_books.len();
-                    let total_trades: usize = order_books.values()
-                        .map(|book| book.get_active().trade_count())
-                        .sum();
-                    let symbols: Vec<String> = order_books.keys().cloned().collect();
-                    drop(order_books);
-                    
-                    let securities = session.securities.lock().await;
-                    let securities_count = securities.len();
-                    drop(securities);
-                    
-                    let state_str = match connection_state {
-                        ConnectionState::Disconnected => "DISCONNECTED",
-                        ConnectionState::Connecting => "CONNECTING",
-                        ConnectionState::Connected => "CONNECTED",
-                        ConnectionState::Logging => "LOGGING_IN",
-                        ConnectionState::Ready => "READY",
-                        ConnectionState::Disconnecting => "DISCONNECTING",
-                    };
-                    
-                    statuses.push(serde_json::json!({
-                        "description": description,
-                        "port": port,
-                        "sender_comp_id": session.sender_comp_id,
-                        "target_comp_id": session.target_comp_id,
-                        "is_connected": is_connected,
-                        "is_ready": is_ready,
-                        "connection_state": state_str,
-                        "sequence_number": seq_num,
-                        "order_books": symbol_count,
-                        "total_trades": total_trades,
-                        "symbols": symbols,
-                        "securities_count": securities_count,
-                    }));
-                }
-                
-        Ok(Json(serde_json::json!({
-            "servers": statuses
-        })))
+            statuses.push(market_data_session_status(session, description, *port));
+        }
+        Ok(Json(serde_json::json!({ "servers": statuses })))
     }
     
     // API endpoint to subscribe to all symbols on a specific server
@@ -5939,5 +6050,74 @@ mod connectivity_tests {
             ],
         );
         assert!(contents.contains(&marker));
+    }
+
+    /// Status helper must not share fate with a held `order_books` mutex.
+    /// Exercises the lock/await layer directly (no FIX wire / mock_gateway).
+    #[tokio::test]
+    async fn market_data_session_status_returns_fast_when_order_books_lock_held() {
+        let session = Arc::new(FIXSession::new_with_credentials(
+            "TEST.STATUS",
+            "MOCK.VENUE",
+            "LEAK_API_KEY_XYZ",
+            "LEAK_API_SECRET_XYZ",
+        ));
+
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let holder_session = Arc::clone(&session);
+        let holder = tokio::spawn(async move {
+            let _g = holder_session.order_books.lock().await;
+            let _ = held_tx.send(());
+            sleep(Duration::from_secs(2)).await;
+        });
+
+        held_rx.await.expect("holder took order_books lock");
+
+        let start = Instant::now();
+        let value = market_data_session_status(&session, "BTC Market Data", 34402);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "status helper blocked for {:?} (must be <100ms under a held order_books lock)",
+            elapsed
+        );
+        assert_eq!(
+            value.get("status_read").and_then(|v| v.as_str()),
+            Some(STATUS_READ_SKIPPED_LOCK_CONTENDED)
+        );
+        assert_eq!(
+            value.get("description").and_then(|v| v.as_str()),
+            Some("BTC Market Data")
+        );
+        assert_eq!(value.get("port").and_then(|v| v.as_u64()), Some(34402));
+        assert_eq!(
+            value.get("sender_comp_id").and_then(|v| v.as_str()),
+            Some("TEST.STATUS")
+        );
+        assert_eq!(
+            value.get("target_comp_id").and_then(|v| v.as_str()),
+            Some("MOCK.VENUE")
+        );
+        assert!(value.get("order_books").expect("order_books key").is_null());
+        assert!(value.get("total_trades").expect("total_trades key").is_null());
+        assert!(value.get("symbols").expect("symbols key").is_null());
+        assert!(value.get("is_connected").expect("is_connected key").is_boolean());
+        assert!(value.get("is_ready").expect("is_ready key").is_boolean());
+        assert!(value.get("connection_state").expect("connection_state key").is_string());
+        assert!(value.get("sequence_number").expect("sequence_number key").is_number());
+        assert!(value.get("securities_count").expect("securities_count key").is_number());
+
+        let dump = value.to_string();
+        assert!(
+            !dump.contains("LEAK_API_KEY_XYZ")
+                && !dump.contains("LEAK_API_SECRET_XYZ")
+                && !dump.contains("api_key")
+                && !dump.contains("api_secret"),
+            "status JSON must not leak credentials: {}",
+            dump
+        );
+
+        holder.abort();
     }
 }
