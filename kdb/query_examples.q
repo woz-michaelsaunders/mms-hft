@@ -31,6 +31,18 @@ show h"select count by symbol from orderbook_levels"
 show h"select sum size by symbol from trades"
 show h"select last best_bid, last best_ask, last spread by symbol from orderbook_snapshots"
 
+show "=== capture_gaps ==="
+show h"count capture_gaps"
+show h"meta capture_gaps"
+show h"select from capture_gaps"
+show h"select from capture_gaps where expected_seq=0"   / buffer overflow during kdb outage
+show h"select from capture_gaps where expected_seq>0"   / FIX sequence gaps
+
+show "=== seq_num live vs history ==="
+show h"select seq_num, time, symbol from orderbook_snapshots where symbol=`BTC_USDT"
+show h"select from orderbook_snapshots where symbol=`BTC_USDT, not null seq_num"  / live
+show h"select from orderbook_snapshots where symbol=`BTC_USDT, null seq_num"       / history
+
 // Recent data
 show "=== Recent Data (last 10) ==="
 show h"10#`time xdesc orderbook_levels"

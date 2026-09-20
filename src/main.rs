@@ -13,7 +13,7 @@ use fix_protocol::{FIXMessage, tags};
 use log::{info, error, warn};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, broadcast};
@@ -452,11 +452,13 @@ enum PendingMdIo {
         price: f64,
         size: f64,
         action: char, // 'N' | 'C' | 'D'
+        seq_num: Option<u32>,
     },
     Trade {
         price: f64,
         size: f64,
         timestamp: i64,
+        seq_num: Option<u32>,
     },
     Snapshot {
         best_bid: f64,
@@ -464,6 +466,7 @@ enum PendingMdIo {
         best_bid_size: f64,
         best_ask_size: f64,
         spread: f64,
+        seq_num: Option<u32>,
     },
 }
 
@@ -511,6 +514,9 @@ pub struct FIXSession {
     // Last market-data message timestamp (Unix ms). Zero = never received.
     // Updated atomically on every W/X message; read by the stale-feed watchdog.
     last_md_recv_ms: Arc<AtomicU64>,
+    // Persistence allow-list for kdb capture (CAPTURE_SYMBOLS). Does not
+    // affect FIX subscription or the in-memory Live book.
+    capture_symbols: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -617,6 +623,36 @@ fn append_command_log_entry(path: &Path, entry: String, max_bytes: u64) {
     });
 }
 
+/// Parse CAPTURE_SYMBOLS. Unset → {BTC_USDT}. Empty/whitespace → kill switch (no persist).
+/// Invalid tokens (non ASCII alnum/underscore) are dropped with a warning.
+fn parse_capture_symbols(raw: Option<&str>) -> HashSet<String> {
+    match raw {
+        None => {
+            let mut s = HashSet::new();
+            s.insert("BTC_USDT".to_string());
+            s
+        }
+        Some(v) if v.trim().is_empty() => {
+            HashSet::new()
+        }
+        Some(v) => {
+            let mut set = HashSet::new();
+            for tok in v.split(',') {
+                let t = tok.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    set.insert(t.to_string());
+                } else {
+                    warn!("CAPTURE_SYMBOLS: dropping invalid token {:?}", t);
+                }
+            }
+            set
+        }
+    }
+}
+
 impl FIXSession {
     pub fn new(sender: &str, target: &str) -> Self {
         Self::new_with_credentials(sender, target, "", "")
@@ -673,7 +709,19 @@ impl FIXSession {
             kdb_writer,
             sequencer: Arc::new(Mutex::new(sequencer::Sequencer::new())),
             last_md_recv_ms: Arc::new(AtomicU64::new(0)),
+            capture_symbols: parse_capture_symbols(std::env::var("CAPTURE_SYMBOLS").ok().as_deref()),
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_capture_symbols(mut self, symbols: HashSet<String>) -> Self {
+        self.capture_symbols = symbols;
+        self
+    }
+
+    #[cfg(test)]
+    pub fn drain_capture_probe(&self) -> Vec<kdb_integration::ProbeEvent> {
+        self.kdb_writer.drain_probe()
     }
     
     /// Set event-driven update channels
@@ -1553,6 +1601,20 @@ impl FIXSession {
                             "⚠️  Inbound sequence gap detected (type {}): expected {}, got {} — requesting recovery",
                             msg.msg_type, expected, received
                         );
+                        let symbol: &str = msg
+                            .get_field(tags::SYMBOL)
+                            .unwrap_or(self.sender_comp_id.as_str());
+                        let gap_size = received.saturating_sub(expected);
+                        let _ = self.kdb_writer
+                            .write_capture_gap(symbol, expected, received)
+                            .await;
+                        #[cfg(test)]
+                        self.kdb_writer.record_probe(kdb_integration::ProbeEvent::CaptureGap {
+                            symbol: symbol.to_string(),
+                            expected,
+                            received,
+                            gap_size,
+                        });
                         return self.request_recovery(expected).await;
                     }
                     sequencer::SequenceResult::StaleDuringRecovery => {
@@ -2189,21 +2251,21 @@ impl FIXSession {
                                                     active_book.update_level(Side::Bid, price, size, UpdateAction::New);
                                                     combined_tick.bid = price;
                                                     combined_tick.bid_size = size;
-                                                    pending.push(PendingMdIo::Level { side: 'B', price, size, action: 'N' });
+                                                    pending.push(PendingMdIo::Level { side: 'B', price, size, action: 'N', seq_num: Some(msg.seq_num) });
                                                 }
                                                 "1" => {
                                                     // Ask update
                                                     active_book.update_level(Side::Ask, price, size, UpdateAction::New);
                                                     combined_tick.ask = price;
                                                     combined_tick.ask_size = size;
-                                                    pending.push(PendingMdIo::Level { side: 'A', price, size, action: 'N' });
+                                                    pending.push(PendingMdIo::Level { side: 'A', price, size, action: 'N', seq_num: Some(msg.seq_num) });
                                                 }
                                                 "2" => {
                                                     // Trade/Last price - add to order book trade history
                                                     active_book.add_trade(price, size, timestamp);
                                                     combined_tick.last_price = price;
                                                     combined_tick.last_size = size;
-                                                    pending.push(PendingMdIo::Trade { price, size, timestamp });
+                                                    pending.push(PendingMdIo::Trade { price, size, timestamp, seq_num: Some(msg.seq_num) });
                                                 }
                                                 _ => {
                                                     // Unknown entry type - skip
@@ -2225,6 +2287,7 @@ impl FIXSession {
                         book.swap_snapshot();
                         pending.push(PendingMdIo::Snapshot {
                             best_bid, best_ask, best_bid_size, best_ask_size, spread,
+                            seq_num: Some(msg.seq_num),
                         });
                         (pending, combined_tick, best_bid, best_ask, best_bid_size, best_ask_size)
                     }; // order_books MutexGuard dropped here — no kdb/tick await above
@@ -2349,14 +2412,14 @@ impl FIXSession {
                                                     info!("📝 Processing Bid update: {} {} {} {}", symbol, price, size, action_char);
                                                     active_book.update_level(Side::Bid, price, size, update_action);
                                                     info!("📝 Calling write_order_book_level for Bid");
-                                                    pending.push(PendingMdIo::Level { side: 'B', price, size, action: action_char });
+                                                    pending.push(PendingMdIo::Level { side: 'B', price, size, action: action_char, seq_num: Some(msg.seq_num) });
                                                 }
                                                 "1" => {
                                                     // Ask update
                                                     info!("📝 Processing Ask update: {} {} {} {}", symbol, price, size, action_char);
                                                     active_book.update_level(Side::Ask, price, size, update_action);
                                                     info!("📝 Calling write_order_book_level for Ask");
-                                                    pending.push(PendingMdIo::Level { side: 'A', price, size, action: action_char });
+                                                    pending.push(PendingMdIo::Level { side: 'A', price, size, action: action_char, seq_num: Some(msg.seq_num) });
                                                 }
                                                 "2" => {
                                                     // Trade/Last price - add to order book trade history
@@ -2364,7 +2427,7 @@ impl FIXSession {
                                                     active_book.add_trade(price, size, timestamp);
                                                     info!("💹 Trade added! Total trades in book: {}", active_book.trade_count());
                                                     info!("📝 Calling write_trade");
-                                                    pending.push(PendingMdIo::Trade { price, size, timestamp });
+                                                    pending.push(PendingMdIo::Trade { price, size, timestamp, seq_num: Some(msg.seq_num) });
                                                 }
                                                 _ => {
                                                     // Unknown entry type - skip
@@ -2437,6 +2500,7 @@ impl FIXSession {
 
                         pending.push(PendingMdIo::Snapshot {
                             best_bid, best_ask, best_bid_size, best_ask_size, spread,
+                            seq_num: Some(msg.seq_num),
                         });
                         (pending, ticks, best_bid, best_ask, best_bid_size, best_ask_size, symbol.clone())
                     }; // order_books MutexGuard dropped here — no kdb/tick/ZMQ await above
@@ -2661,22 +2725,38 @@ impl FIXSession {
 
     /// Replay deferred kdb writes after `order_books` has been dropped.
     /// Error policy matches the previous in-lock call sites: kdb failure is ignored.
+    /// Persistence is gated by CAPTURE_SYMBOLS; the in-memory book is already applied.
     async fn replay_pending_md_io(&self, symbol: &str, pending: Vec<PendingMdIo>) {
+        if !self.capture_symbols.contains(symbol) {
+            return;
+        }
         for io in pending {
             match io {
-                PendingMdIo::Level { side, price, size, action } => {
+                PendingMdIo::Level { side, price, size, action, seq_num } => {
+                    #[cfg(test)]
+                    self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
+                        kind: "level", symbol: symbol.to_string(), seq_num,
+                    });
                     let _ = self.kdb_writer
-                        .write_order_book_level(symbol, side, price, size, action)
+                        .write_order_book_level(symbol, side, price, size, action, seq_num)
                         .await;
                 }
-                PendingMdIo::Trade { price, size, timestamp } => {
+                PendingMdIo::Trade { price, size, timestamp, seq_num } => {
+                    #[cfg(test)]
+                    self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
+                        kind: "trade", symbol: symbol.to_string(), seq_num,
+                    });
                     let _ = self.kdb_writer
-                        .write_trade(symbol, price, size, timestamp)
+                        .write_trade(symbol, price, size, timestamp, seq_num)
                         .await;
                 }
-                PendingMdIo::Snapshot { best_bid, best_ask, best_bid_size, best_ask_size, spread } => {
+                PendingMdIo::Snapshot { best_bid, best_ask, best_bid_size, best_ask_size, spread, seq_num } => {
+                    #[cfg(test)]
+                    self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
+                        kind: "snapshot", symbol: symbol.to_string(), seq_num,
+                    });
                     let _ = self.kdb_writer
-                        .write_snapshot(symbol, best_bid, best_ask, best_bid_size, best_ask_size, spread)
+                        .write_snapshot(symbol, best_bid, best_ask, best_bid_size, best_ask_size, spread, seq_num)
                         .await;
                 }
             }
@@ -4202,14 +4282,10 @@ async fn order_book_web_server(
         }
     }
     
-    fn escape_kdb_string(value: &str) -> String {
-        value.replace('\\', "\\\\").replace('"', "\\\"")
-    }
-
     // Build a WHERE predicate that safely handles symbols with punctuation by
     // constructing a symbol atom via `$"..."` instead of raw backtick literals.
     fn build_kdb_symbol_predicate(symbol: &str) -> String {
-        format!("symbol=`$\"{}\"", escape_kdb_string(symbol))
+        format!("symbol=`$\"{}\"", kdb_integration::escape_kdb_string(symbol))
     }
 
     // GET /api/history/:symbol — last 500 best-bid/ask snapshots for a symbol (from kdb+)
@@ -6119,5 +6195,204 @@ mod connectivity_tests {
         );
 
         holder.abort();
+    }
+
+    #[test]
+    fn capture_symbols_unset_defaults_btc_usdt() {
+        let set = parse_capture_symbols(None);
+        assert_eq!(set, HashSet::from(["BTC_USDT".to_string()]));
+    }
+
+    #[test]
+    fn capture_symbols_empty_is_kill_switch() {
+        assert!(parse_capture_symbols(Some("")).is_empty());
+    }
+
+    #[test]
+    fn capture_symbols_whitespace_is_kill_switch() {
+        assert!(parse_capture_symbols(Some("  \t")).is_empty());
+    }
+
+    #[test]
+    fn capture_symbols_comma_trim() {
+        let set = parse_capture_symbols(Some("BTC_USDT, BTC_USD"));
+        assert!(set.contains("BTC_USDT") && set.contains("BTC_USD"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn capture_symbols_empty_token_not_kill() {
+        let set = parse_capture_symbols(Some("BTC_USDT,,BTC_USD"));
+        assert!(set.contains("BTC_USDT") && set.contains("BTC_USD"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn capture_symbols_invalid_charset_dropped() {
+        assert!(parse_capture_symbols(Some("BTC-USDT")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_probes_seq_num_for_default_capture_symbol() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig { md_ticks_to_stream: 2, ..Default::default() },
+        ).await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        let _ = session.drain_capture_probe();
+        connect_and_logon(&session, port).await?;
+        session.market_data_request("BTC_USDT", 10).await?;
+        pump_messages(&session, Duration::from_secs(3), |_| false).await?;
+        let evs = session.drain_capture_probe();
+        assert!(
+            evs.iter().any(|e| matches!(e,
+                kdb_integration::ProbeEvent::PendingMdIo { kind: "snapshot", symbol, seq_num: Some(_) }
+                if symbol == "BTC_USDT")),
+            "expected snapshot probe with Some(seq) for BTC_USDT, got {:?}", evs
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn kill_switch_applies_book_but_does_not_probe_persist() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig { md_ticks_to_stream: 2, ..Default::default() },
+        ).await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE")
+            .with_capture_symbols(HashSet::new());
+        let _ = session.drain_capture_probe();
+        connect_and_logon(&session, port).await?;
+        session.market_data_request("BTC_USDT", 10).await?;
+        pump_messages(&session, Duration::from_secs(3), |_| false).await?;
+        assert!(session.get_best_quote("BTC_USDT").await.is_some(), "Live book independent of CAPTURE_SYMBOLS");
+        let evs = session.drain_capture_probe();
+        assert!(
+            !evs.iter().any(|e| matches!(e, kdb_integration::ProbeEvent::PendingMdIo { .. })),
+            "kill switch must not persist, got {:?}", evs
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn symbol_not_in_allowlist_skips_persist() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig { md_ticks_to_stream: 2, ..Default::default() },
+        ).await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE")
+            .with_capture_symbols(HashSet::from(["BTC_USDT".to_string()]));
+        let _ = session.drain_capture_probe();
+        connect_and_logon(&session, port).await?;
+        session.market_data_request("ETH_USDT", 10).await?;
+        pump_messages(&session, Duration::from_secs(3), |_| false).await?;
+        assert!(session.get_best_quote("ETH_USDT").await.is_some(), "book for ETH_USDT must still apply");
+        let evs = session.drain_capture_probe();
+        assert!(
+            !evs.iter().any(|e| matches!(e,
+                kdb_integration::ProbeEvent::PendingMdIo { symbol, .. } if symbol == "ETH_USDT")),
+            "ETH_USDT must not persist when allowlist is BTC_USDT, got {:?}", evs
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn induce_gap_enqueues_capture_gap_probe() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                md_ticks_to_stream: 3,
+                induce_gap_at_tick: Some(2),
+                ..Default::default()
+            },
+        ).await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        let _ = session.drain_capture_probe();
+        connect_and_logon(&session, port).await?;
+        session.market_data_request("BTC_USDT", 10).await?;
+
+        let recovery_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            pump_messages(&session, Duration::from_millis(250), |_| false).await?;
+            if !session.sequencer.lock().await.is_recovering("inbound") {
+                break;
+            }
+            assert!(Instant::now() < recovery_deadline, "gap recovery should have converged within 30s");
+        }
+
+        let evs = session.drain_capture_probe();
+        let gaps: Vec<_> = evs.iter().filter_map(|e| match e {
+            kdb_integration::ProbeEvent::CaptureGap { symbol, expected, received, gap_size } =>
+                Some((symbol.clone(), *expected, *received, *gap_size)),
+            _ => None,
+        }).collect();
+        assert!(
+            gaps.iter().any(|(s, e, r, g)| s == "BTC_USDT" && *e == 4 && *r == 5 && *g == 1),
+            "expected FIX gap probe (BTC_USDT, expected=4, received=5, gap_size=1), got {:?}",
+            gaps
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn capture_resumes_after_disconnect_with_per_session_seq_restart() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                md_ticks_to_stream: 3,
+                disconnect_after_messages: Some(1),
+                ..Default::default()
+            },
+        ).await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        let _ = session.drain_capture_probe();
+        connect_and_logon(&session, port).await?;
+        session.market_data_request("BTC_USDT", 10).await?;
+
+        let mut saw_disconnect = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), session.receive_message()).await {
+                Ok(Ok(msg)) => { session.handle_message(&msg).await?; }
+                Ok(Err(_)) => { saw_disconnect = true; break; }
+                Err(_) => continue,
+            }
+        }
+        assert!(saw_disconnect, "expected the mock to close the connection");
+
+        let session1 = session.drain_capture_probe();
+        let seqs1: Vec<u32> = session1.iter().filter_map(|e| match e {
+            kdb_integration::ProbeEvent::PendingMdIo { symbol, seq_num: Some(n), .. } if symbol == "BTC_USDT" => Some(*n),
+            _ => None,
+        }).collect();
+        assert!(!seqs1.is_empty(), "session-1 ticks must have been enqueued (probe)");
+        assert!(seqs1.iter().all(|n| *n >= 1), "FIX seqs start at 1, got {:?}", seqs1);
+        let session1_count = seqs1.len();
+
+        *session.connection_state.lock().await = ConnectionState::Disconnected;
+        *session.is_connected.lock().await = false;
+        connect_and_logon(&session, port).await?;
+        assert!(session.is_ready().await);
+        session.market_data_request("BTC_USDT", 10).await?;
+        pump_messages(&session, Duration::from_secs(3), |_| false).await?;
+
+        let session2 = session.drain_capture_probe();
+        let seqs2: Vec<u32> = session2.iter().filter_map(|e| match e {
+            kdb_integration::ProbeEvent::PendingMdIo { symbol, seq_num: Some(n), .. } if symbol == "BTC_USDT" => Some(*n),
+            _ => None,
+        }).collect();
+        assert!(!seqs2.is_empty(), "session-2 ticks must be enqueued after re-logon");
+        assert!(seqs2.iter().all(|n| *n >= 1), "ResetSeqNumFlag=Y restarts at 1, got {:?}", seqs2);
+        let max1 = *seqs1.iter().max().unwrap();
+        assert!(
+            seqs2.iter().any(|n| *n <= max1),
+            "per-session restart: expected some session-2 seq <= session-1 max {}, got {:?}",
+            max1, seqs2
+        );
+        assert_eq!(session.drain_capture_probe().len(), 0, "drain is destructive; second drain empty");
+        let _ = session1_count;
+        Ok(())
     }
 }

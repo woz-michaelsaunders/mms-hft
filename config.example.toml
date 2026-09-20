@@ -48,6 +48,9 @@ reconnect_backoff_ms    = 1000
 # ─── kdb+ Connection (environment variables — not in this file) ──────────────
 # KDB_HOST  (default: localhost)
 # KDB_PORT  (default: 5001)
+# KDB_RECONNECT_BACKOFF_MS  (default: 1000; doubles to 30000 on failure)
+# CAPTURE_SYMBOLS  (default: BTC_USDT; empty/whitespace = capture nothing)
+# KDB_LISTEN  (kdb process; default 127.0.0.1; set 0.0.0.0 to bind all interfaces)
 # Start the kdb+ server first:  q kdb/start_kdb_server.q
 
 # ─── Trading Algorithm Defaults ──────────────────────────────────────────────
