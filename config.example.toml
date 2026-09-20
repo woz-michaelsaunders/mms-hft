@@ -2,6 +2,15 @@
 # Copy this file to config.toml and fill in your actual credentials.
 # config.toml is git-ignored — never commit it.
 
+# ─── Market-data subscriptions ───────────────────────────────────────────────
+# Instruments to subscribe to. Each session subscribes to the symbols listed
+# here that its own port carries. Empty means subscribe to nothing.
+# Do not subscribe to everything the venue lists: each port lists ~1,100
+# instruments and every reconnect re-sends an order-book and a trade request
+# for each, which floods the venue and breaks the session.
+[subscriptions]
+symbols = ["BTC_USDT", "BTC_USD", "BTCUSD-PERP"]
+
 # ─── Order Management Session ────────────────────────────────────────────────
 [order_management]
 # FIX gateway TCP endpoint for order submission / execution reports

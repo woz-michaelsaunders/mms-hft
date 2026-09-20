@@ -48,12 +48,41 @@ const COMMAND_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB; rotate iff len
 // Configuration structure
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Config {
+    #[serde(default)]
+    subscriptions: SubscriptionsConfig,
     order_management: OrderManagementConfig,
     market_data_btc: MarketDataConfig,
     market_data_others: MarketDataOthersConfig,
     api: ApiConfig,
     connection: ConnectionConfig,
 }
+
+/// Which instruments to subscribe to for market data.
+///
+/// Subscribing to everything the venue lists was self-defeating: each port
+/// lists ~1,100 instruments and every reconnect re-sent an order-book AND a
+/// trade request for each, ~24,600 requests in 36 minutes on 2026-09-20. That
+/// flood broke the socket mid-send, which forced another reconnect, which sent
+/// the flood again. Subscribe to what is actually traded.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct SubscriptionsConfig {
+    /// Symbols to subscribe to. Empty means subscribe to nothing, loudly:
+    /// silently defaulting to "everything" is what caused the flood.
+    #[serde(default)]
+    symbols: Vec<String>,
+}
+
+/// Intersect the venue's list for this port with the configured allowlist.
+/// Kept separate from the loop so it can be tested.
+fn subscriptions_for_port(venue_symbols: &[String], allowlist: &[String]) -> Vec<String> {
+    venue_symbols
+        .iter()
+        .filter(|s| allowlist.iter().any(|a| a == *s))
+        .cloned()
+        .collect()
+}
+
+static SUBSCRIPTION_ALLOWLIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct OrderManagementConfig {
@@ -3206,6 +3235,18 @@ async fn market_data_loop(
             info!("📜 Venue published {} securities", venue_symbols.len());
         }
 
+        // Only what is configured: see SubscriptionsConfig.
+        let allowlist = SUBSCRIPTION_ALLOWLIST.get().cloned().unwrap_or_default();
+        let venue_symbols: Vec<String> = if allowlist.is_empty() {
+            warn!("⚠️  [subscriptions].symbols is empty in config.toml — subscribing to nothing. \
+                   Set the instruments to trade; subscribing to every listed symbol floods the venue.");
+            Vec::new()
+        } else {
+            let picked = subscriptions_for_port(&venue_symbols, &allowlist);
+            info!("📜 Subscribing to {} of {} configured symbols listed on this port", picked.len(), allowlist.len());
+            picked
+        };
+
         // Filter symbols based on the symbol_filter function
         let symbols_to_subscribe: Vec<&str> = if let Some(filter) = &symbol_filter {
             venue_symbols.iter().map(|s| s.as_str()).filter(|s| filter(s)).collect()
@@ -4987,6 +5028,8 @@ async fn main() -> Result<()> {
         }
     };
     info!("✅ Configuration loaded from config.toml");
+    let _ = SUBSCRIPTION_ALLOWLIST.set(config.subscriptions.symbols.clone());
+    info!("📜 Subscription allowlist: {:?}", config.subscriptions.symbols);
 
     info!("╔════════════════════════════════════════════════════════════╗");
     info!("║  MULTI-CONNECTION FIX SERVER - ORDER + MARKET DATA           ║");
@@ -5520,6 +5563,19 @@ mod connectivity_tests {
 
         cleanup_processed(cl_ord_id);
         Ok(())
+    }
+
+    /// Only configured symbols are subscribed to, and only if this port lists
+    /// them. Subscribing to every listed symbol flooded the venue with ~2,200
+    /// requests per reconnect and broke the socket, causing another reconnect.
+    #[test]
+    fn subscribes_only_to_configured_symbols_listed_on_the_port() {
+        let listed: Vec<String> = ["BTC_USDT", "ATOM_USDT", "SXTUSD-PERP"].iter().map(|s| s.to_string()).collect();
+        let allow: Vec<String> = ["BTC_USDT", "ETH_USD"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(subscriptions_for_port(&listed, &allow), vec!["BTC_USDT".to_string()],
+                   "only the configured symbol that this port lists");
+        assert!(subscriptions_for_port(&listed, &[]).is_empty(),
+                "an empty allowlist must subscribe to nothing, never to everything");
     }
 
     /// Several messages arriving in one TCP read must be extracted one at a
