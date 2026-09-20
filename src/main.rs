@@ -82,6 +82,30 @@ fn subscriptions_for_port(venue_symbols: &[String], allowlist: &[String]) -> Vec
         .collect()
 }
 
+/// What the stale-feed watchdog should do about a session.
+#[derive(Debug, PartialEq, Eq)]
+enum FeedHealth {
+    /// Traffic is flowing.
+    Ok,
+    /// The connection is alive (heartbeats arriving) but no market data for a
+    /// while. On UAT most instruments are genuinely quiet -- 1,114 of 1,118
+    /// snapshots were empty on 2026-09-19 -- so this is worth saying, never
+    /// worth tearing a healthy session down for.
+    QuietFeed { md_silent_ms: u64 },
+    /// Nothing inbound at all, not even a heartbeat: the stream really is stalled.
+    Stalled { silent_ms: u64 },
+}
+
+fn feed_health(now_ms: u64, last_inbound_ms: u64, last_md_ms: u64, stall_ms: u64, quiet_ms: u64) -> FeedHealth {
+    if last_inbound_ms > 0 && now_ms.saturating_sub(last_inbound_ms) > stall_ms {
+        return FeedHealth::Stalled { silent_ms: now_ms.saturating_sub(last_inbound_ms) };
+    }
+    if last_md_ms > 0 && now_ms.saturating_sub(last_md_ms) > quiet_ms {
+        return FeedHealth::QuietFeed { md_silent_ms: now_ms.saturating_sub(last_md_ms) };
+    }
+    FeedHealth::Ok
+}
+
 static SUBSCRIPTION_ALLOWLIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -543,6 +567,10 @@ pub struct FIXSession {
     // Last market-data message timestamp (Unix ms). Zero = never received.
     // Updated atomically on every W/X message; read by the stale-feed watchdog.
     last_md_recv_ms: Arc<AtomicU64>,
+    /// Timestamp (Unix ms) of the LAST INBOUND MESSAGE OF ANY TYPE, heartbeats
+    /// included. Liveness of the TCP stream, as distinct from last_md_recv_ms
+    /// which only tracks market data.
+    last_inbound_ms: Arc<AtomicU64>,
     // Persistence allow-list for kdb capture (CAPTURE_SYMBOLS). Does not
     // affect FIX subscription or the in-memory Live book.
     capture_symbols: HashSet<String>,
@@ -738,6 +766,7 @@ impl FIXSession {
             kdb_writer,
             sequencer: Arc::new(Mutex::new(sequencer::Sequencer::new())),
             last_md_recv_ms: Arc::new(AtomicU64::new(0)),
+            last_inbound_ms: Arc::new(AtomicU64::new(0)),
             capture_symbols: parse_capture_symbols(std::env::var("CAPTURE_SYMBOLS").ok().as_deref()),
         }
     }
@@ -1588,6 +1617,8 @@ impl FIXSession {
     }
 
     pub async fn handle_message(&self, msg: &FIXMessage) -> Result<()> {
+        // Liveness: any inbound message proves the stream is alive.
+        self.last_inbound_ms.store(chrono::Utc::now().timestamp_millis() as u64, Ordering::Relaxed);
         // Mandatory sequence-integrity choke point: no message's body is
         // processed below without first passing through here. This is what
         // makes AC2/AC4 (gap detection -> recovery, no silent corruption)
@@ -5381,19 +5412,29 @@ async fn main() -> Result<()> {
         Arc::clone(&market_data_others_34407),
     ];
     let _stale_feed_watchdog = tokio::spawn(async move {
-        const STALE_THRESHOLD_MS: u64 = 30_000;
+        const STALE_THRESHOLD_MS: u64 = 30_000;   // nothing inbound at all -> reconnect
+        const QUIET_FEED_LOG_MS: u64 = 60_000;   // no market data -> just say so
         let mut check_interval = interval(Duration::from_secs(15));
         check_interval.tick().await; // skip immediate first tick
         loop {
             check_interval.tick().await;
             let now_ms = chrono::Utc::now().timestamp_millis() as u64;
             for sess in &stale_sessions {
-                let last = sess.last_md_recv_ms.load(Ordering::Relaxed);
-                // Only flag as stale once we've received at least one message
-                if last == 0 { continue; }
-                if sess.is_ready().await && (now_ms - last) > STALE_THRESHOLD_MS {
-                    warn!("⚠️  Stale market data feed detected for {} — last message {}ms ago, forcing reconnect",
-                        sess.sender_comp_id, now_ms - last);
+                if !sess.is_ready().await { continue; }
+                let health = feed_health(
+                    now_ms,
+                    sess.last_inbound_ms.load(Ordering::Relaxed),
+                    sess.last_md_recv_ms.load(Ordering::Relaxed),
+                    STALE_THRESHOLD_MS,
+                    QUIET_FEED_LOG_MS,
+                );
+                if let FeedHealth::QuietFeed { md_silent_ms } = health {
+                    info!("📭 No market data on {} for {}ms — connection alive (heartbeats arriving), not reconnecting",
+                        sess.sender_comp_id, md_silent_ms);
+                }
+                if let FeedHealth::Stalled { silent_ms } = health {
+                    warn!("⚠️  Stalled stream on {} — nothing inbound for {}ms, forcing reconnect",
+                        sess.sender_comp_id, silent_ms);
                     // Drop the stream; the message_loop error path will reconnect.
                     let mut stream = sess.stream.lock().await;
                     *stream = None;
@@ -5402,6 +5443,7 @@ async fn main() -> Result<()> {
                     *sess.is_connected.lock().await = false;
                     // Reset so we don't spam reconnects before the loop fires
                     sess.last_md_recv_ms.store(0, Ordering::Relaxed);
+                    sess.last_inbound_ms.store(0, Ordering::Relaxed);
                 }
             }
         }
@@ -5639,6 +5681,30 @@ mod connectivity_tests {
 
         cleanup_processed(cl_ord_id);
         Ok(())
+    }
+
+    /// A session whose instruments are quiet must NOT be torn down. The
+    /// watchdog used to measure only market data, so on UAT -- where 1,114 of
+    /// 1,118 snapshots were empty -- it killed healthy sessions every 30s
+    /// while 1,210 heartbeats were arriving, ~20 reconnects an hour.
+    #[test]
+    fn quiet_market_data_is_not_a_stalled_stream() {
+        let now = 1_000_000u64;
+        let (stall, quiet) = (30_000u64, 60_000u64);
+
+        // Heartbeats 1s ago, no market data for 5 minutes: alive, just quiet.
+        assert_eq!(feed_health(now, now - 1_000, now - 300_000, stall, quiet),
+                   FeedHealth::QuietFeed { md_silent_ms: 300_000 });
+
+        // Nothing inbound at all for 45s: genuinely stalled.
+        assert_eq!(feed_health(now, now - 45_000, now - 45_000, stall, quiet),
+                   FeedHealth::Stalled { silent_ms: 45_000 });
+
+        // Both flowing.
+        assert_eq!(feed_health(now, now - 500, now - 500, stall, quiet), FeedHealth::Ok);
+
+        // Nothing seen yet (fresh session): never force a reconnect.
+        assert_eq!(feed_health(now, 0, 0, stall, quiet), FeedHealth::Ok);
     }
 
     /// Only configured symbols are subscribed to, and only if this port lists
