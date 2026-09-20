@@ -108,7 +108,8 @@
             line-height: 1.5;
         }
         :focus-visible {
-            outline: none;
+            outline: 2px solid var(--accent);
+            outline-offset: 2px;
             box-shadow: var(--focus-ring);
             border-radius: var(--radius-control);
         }
@@ -565,6 +566,81 @@
         }
         .inline-status { color: var(--text-muted); font-size: var(--text-sm); }
 
+        /* Market-data session health — operator console for GET /api/market-data-status */
+        .md-strip {
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            padding: var(--space-3) var(--space-4);
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-3);
+            flex-shrink: 0;
+        }
+        .md-strip-head {
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: var(--space-3);
+            flex-wrap: wrap;
+        }
+        .md-strip-title {
+            font-size: var(--text-base);
+            font-weight: 600;
+            margin: 0;
+            color: var(--text);
+        }
+        .md-strip-lead {
+            margin: var(--space-1) 0 0;
+            color: var(--text-muted);
+            font-size: var(--text-sm);
+            max-width: 70ch;
+        }
+        .md-chips {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: var(--space-2);
+        }
+        .md-chip {
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-card);
+            padding: var(--space-3);
+            display: flex;
+            flex-direction: column;
+            align-items: flex-start;
+            gap: var(--space-2);
+            min-width: 0;
+        }
+        .md-chip-title {
+            font-weight: 600;
+            font-size: var(--text-sm);
+            color: var(--text);
+            overflow-wrap: anywhere;
+        }
+        .md-chip-meta {
+            margin: 0;
+            font-size: var(--text-xs);
+            color: var(--text-muted);
+            font-family: var(--font-mono);
+            overflow-wrap: anywhere;
+        }
+        .md-chip .status {
+            white-space: normal;
+            align-self: flex-start;
+        }
+        .status.skipped {
+            background: var(--warning-bg);
+            border-color: var(--warning);
+            color: var(--warning);
+        }
+        .status.skipped::before { background: var(--warning); }
+        .status.pending {
+            background: var(--info-bg);
+            border-color: var(--info);
+            color: var(--info);
+        }
+        .status.pending::before { background: var(--info); }
+
         .bt-summary-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -580,14 +656,28 @@
             .stats { grid-template-columns: repeat(2, 1fr); }
             .panel-header { flex-direction: column; }
             .house-btn-primary { width: 100%; justify-content: center; }
+            .md-strip { padding: var(--space-2) var(--space-3); gap: var(--space-2); }
+            .md-strip-head { flex-direction: column; }
+            .md-strip-lead { display: none; }
+            .md-chips { grid-template-columns: 1fr; }
+            .md-chip {
+                flex-direction: row;
+                flex-wrap: wrap;
+                align-items: center;
+                padding: var(--space-2) var(--space-3);
+            }
+            .md-chip-title { flex: 1; min-width: 0; }
+            .md-chip-meta { display: none; }
         }
         @media (min-width: 768px) and (max-width: 1279px) {
             .live-main { flex-wrap: wrap; }
             .order-book-side { flex: 1 1 45%; }
             .trades-panel { flex: 1 1 100%; }
+            .md-chips { grid-template-columns: 1fr 1fr; }
         }
         @media (min-width: 1280px) {
             .live-main { flex-wrap: nowrap; }
+            .md-chips { grid-template-columns: repeat(4, 1fr); }
         }
     </style>
 </head>
@@ -612,6 +702,27 @@
                 </div>
             </div>
         </header>
+
+        <section class="md-strip" aria-label="Market data sessions">
+            <div class="md-strip-head">
+                <div>
+                    <h2 class="md-strip-title">Market data sessions</h2>
+                    <p class="md-strip-lead">Live session health, sampled without waiting on book locks. A skipped sample is not a down session — poll again.</p>
+                </div>
+                <button type="button" class="house-btn house-btn-primary" id="mdStatusRefreshBtn">Check sessions</button>
+            </div>
+            <div id="mdStatusBanner" class="house-banner house-banner-info" role="status">
+                <p class="house-banner-title">Loading market-data sessions</p>
+                <p class="house-banner-text">Checking FIX session health now.</p>
+            </div>
+            <div id="mdStatusChips" class="md-chips" role="list">
+                <article class="md-chip" role="listitem">
+                    <div class="md-chip-title">Sampling sessions</div>
+                    <div class="status pending">Loading</div>
+                    <p class="md-chip-meta">Books — · Trades — · Seq —</p>
+                </article>
+            </div>
+        </section>
 
         <div class="tab-nav" role="tablist" aria-label="Platform views" id="tabNav">
             <button type="button" class="tab-btn active" role="tab" id="tabbtn-live" aria-controls="tab-live" aria-selected="true" tabindex="0" data-tab="live">Live</button>
@@ -1641,10 +1752,110 @@
         document.getElementById('secRefreshBtn').addEventListener('click', loadSecurities);
         document.getElementById('secSearch').addEventListener('input', filterSecurities);
 
+        function escapeHtml(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+        function fmtSample(value) {
+            return (value === null || value === undefined) ? '—' : String(value);
+        }
+        function mdConnectionLabel(state) {
+            const map = {
+                DISCONNECTED: 'Disconnected',
+                CONNECTING: 'Connecting',
+                CONNECTED: 'Connected',
+                LOGGING_IN: 'Logging in',
+                READY: 'Ready',
+                DISCONNECTING: 'Disconnecting'
+            };
+            return map[state] || 'Not ready';
+        }
+        function mdChipState(session) {
+            if (session.status_read === 'skipped_lock_contended') {
+                return { cls: 'skipped', label: 'Sample skipped — retrying' };
+            }
+            if (session.is_ready === true) {
+                return { cls: 'connected', label: 'Ready' };
+            }
+            if (session.is_ready === false) {
+                return { cls: 'error', label: 'Not ready · ' + mdConnectionLabel(session.connection_state) };
+            }
+            return { cls: 'pending', label: 'State unknown' };
+        }
+        function renderMdSession(session) {
+            const state = mdChipState(session);
+            const desc = session.description || 'Session';
+            const portStr = session.port != null ? String(session.port) : '';
+            const title = portStr && desc.indexOf(portStr) === -1 ? desc + ' · ' + portStr : desc;
+            const symbols = session.symbols === null || session.symbols === undefined
+                ? '—'
+                : (session.symbols.length ? session.symbols.join(', ') : 'None');
+            return '<article class="md-chip" role="listitem">' +
+                '<div class="md-chip-title">' + escapeHtml(title) + '</div>' +
+                '<div class="status ' + state.cls + '">' + escapeHtml(state.label) + '</div>' +
+                '<p class="md-chip-meta">Books ' + escapeHtml(fmtSample(session.order_books)) +
+                    ' · Trades ' + escapeHtml(fmtSample(session.total_trades)) +
+                    ' · Seq ' + escapeHtml(fmtSample(session.sequence_number)) + '</p>' +
+                '<p class="md-chip-meta">' + escapeHtml(session.sender_comp_id || '—') +
+                    ' → ' + escapeHtml(session.target_comp_id || '—') + '</p>' +
+                '<p class="md-chip-meta">Symbols ' + escapeHtml(symbols) + '</p>' +
+                '</article>';
+        }
+        let mdStatusInFlight = false;
+        function loadMdStatus() {
+            if (mdStatusInFlight) return;
+            const banner = document.getElementById('mdStatusBanner');
+            const chips = document.getElementById('mdStatusChips');
+            const btn = document.getElementById('mdStatusRefreshBtn');
+            mdStatusInFlight = true;
+            btn.disabled = true;
+            setBanner(banner, 'info', 'Loading market-data sessions', 'Checking FIX session health now.');
+            fetch('/api/market-data-status')
+                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+                .then(data => {
+                    const servers = data.servers || [];
+                    if (!servers.length) {
+                        chips.innerHTML = '';
+                        setBanner(banner, 'neutral', 'No market-data sessions',
+                            'No sessions are registered. They appear here when the server starts.');
+                        return;
+                    }
+                    const skipped = servers.filter(s => s.status_read === 'skipped_lock_contended');
+                    chips.innerHTML = servers.map(renderMdSession).join('');
+                    if (skipped.length === servers.length) {
+                        setBanner(banner, 'warning', 'Sample skipped — retrying',
+                            'The server answered quickly, but every session lock was busy. Identity is still valid. This is not a down session.');
+                    } else if (skipped.length) {
+                        setBanner(banner, 'warning', 'Incomplete sample',
+                            'At least one session skipped a lock. Trust filled fields; skipped counts show as —. Checking again shortly.');
+                    } else {
+                        const ready = servers.filter(s => s.is_ready === true).length;
+                        setBanner(banner, 'success', 'Sessions sampled',
+                            ready + ' of ' + servers.length + ' ready.');
+                    }
+                })
+                .catch(err => {
+                    chips.innerHTML = '';
+                    setBanner(banner, 'error', 'Cannot reach market-data status',
+                        'The process may be down or not listening. ' + err.message + '. Do not restart UAT by hand — deploy is by v* tag only.');
+                })
+                .finally(() => {
+                    mdStatusInFlight = false;
+                    btn.disabled = false;
+                });
+        }
+        document.getElementById('mdStatusRefreshBtn').addEventListener('click', loadMdStatus);
+
         updateTotalMarkets();
         updateOrderBook();
+        loadMdStatus();
         setInterval(updateTotalMarkets, 5000);
         updateInterval = setInterval(updateOrderBook, 500);
+        setInterval(loadMdStatus, 2000);
     </script>
 </body>
 </html>
