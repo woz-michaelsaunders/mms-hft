@@ -671,13 +671,25 @@ fn open_command_log(path: &Path) -> std::io::Result<std::fs::File> {
 
 fn append_command_log_entry(path: &Path, entry: String, max_bytes: u64) {
     let path = path.to_path_buf();
-    std::thread::spawn(move || {
+    let write = move || {
         rotate_log_if_needed(&path, max_bytes);
         if let Ok(mut file) = open_command_log(&path) {
             let _ = writeln!(file, "{}", entry);
             let _ = file.flush();
         }
-    });
+    };
+    // Tests assert on log contents immediately after send/receive. The
+    // fire-and-forget thread is a release-mode race: inbound ExecutionReport
+    // can flush before the earlier outbound NewOrderSingle, which made
+    // `inbound_fix_commands_logged_in_full` fail under `cargo test --release`.
+    #[cfg(test)]
+    {
+        write();
+    }
+    #[cfg(not(test))]
+    {
+        std::thread::spawn(write);
+    }
 }
 
 /// Parse CAPTURE_SYMBOLS. Unset → {BTC_USDT}. Empty/whitespace → kill switch (no persist).
@@ -6759,14 +6771,16 @@ mod connectivity_tests {
             .await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
-        // Wait for the inbound ExecutionReport stanza itself — not the bare
-        // ClOrdID, which is already present in the earlier outbound
-        // NewOrderSingle and would return before the IN stanza is flushed
-        // (release-mode race under `cargo test --release --locked`).
+        // Wait for both the outbound NewOrderSingle *and* the inbound
+        // ExecutionReport. Logging is async in production; waiting only for
+        // the IN stanza (or only for a bare ClOrdID shared with the OUT
+        // stanza) is a release-mode race under `cargo test --release --locked`.
         let om_after_er = wait_for_new_log_contains(
             COMMAND_LOG_OM,
             before_order,
             &[
+                "FIX OUT NewOrderSingle (35=D)",
+                " UTC] FIX OUT NewOrderSingle",
                 "FIX IN ExecutionReport (35=8)",
                 &format!("11={}", cl_ord_id),
                 "Sender=",
