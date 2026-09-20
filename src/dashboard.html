@@ -1,0 +1,1650 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Wozinga HFT platform</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    <style>
+        /*
+          House UI & UX Standard — design tokens.
+          Palette and 4px spacing scale match the House token sheet.
+          No raw hex in component rules; no off-scale spacing.
+        */
+        :root {
+            color-scheme: dark;
+
+            --bg: #161c22;
+            --surface: #1c242c;
+            --surface-2: #232d37;
+            --text: #e8eef2;
+            --text-muted: #a9b6c2;
+            --text-faint: #8b98a4;
+            --border: #333d47;
+
+            --accent: #4c8dff;
+            --accent-contrast: #08131f;
+            --accent-hover: #6ba0ff;
+
+            --success: #3fbf60;
+            --success-bg: #10301d;
+            --warning: #e0ac1f;
+            --warning-bg: #332707;
+            --danger: #ff6b6b;
+            --danger-bg: #3a1414;
+            --info: #58a6ff;
+            --info-bg: #10233d;
+
+            --font-body: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+            --text-xs: 12px;
+            --text-sm: 14px;
+            --text-base: 16px;
+            --text-lg: 20px;
+            --text-xl: 25px;
+
+            --space-1: 4px;
+            --space-2: 8px;
+            --space-3: 12px;
+            --space-4: 16px;
+            --space-5: 24px;
+            --space-6: 32px;
+            --space-7: 48px;
+            --space-8: 64px;
+
+            --radius-control: 6px;
+            --radius-card: 10px;
+            --radius-pill: 999px;
+
+            --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.45);
+            --focus-ring: 0 0 0 3px rgba(76, 141, 255, 0.55);
+        }
+
+        @media (prefers-color-scheme: light) {
+            :root {
+                color-scheme: light;
+                --bg: #f5f7fa;
+                --surface: #ffffff;
+                --surface-2: #eef1f5;
+                --text: #1b2430;
+                --text-muted: #4c5a68;
+                --text-faint: #5f6d7a;
+                --border: #d7dde3;
+                --accent: #1f5fd6;
+                --accent-contrast: #ffffff;
+                --accent-hover: #164ab0;
+                --success: #1a7f37;
+                --success-bg: #e5f6ea;
+                --warning: #8a6400;
+                --warning-bg: #fbf1d6;
+                --danger: #b4232a;
+                --danger-bg: #fbe6e6;
+                --info: #0969da;
+                --info-bg: #e6f0fd;
+                --focus-ring: 0 0 0 3px rgba(31, 95, 214, 0.4);
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            * {
+                animation-duration: 0.001ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.001ms !important;
+            }
+        }
+
+        *, *::before, *::after { box-sizing: border-box; }
+        html, body {
+            margin: 0;
+            height: 100%;
+            overflow-x: hidden;
+        }
+        body {
+            font-family: var(--font-body);
+            background: var(--bg);
+            color: var(--text);
+            font-size: var(--text-sm);
+            line-height: 1.5;
+        }
+        :focus-visible {
+            outline: none;
+            box-shadow: var(--focus-ring);
+            border-radius: var(--radius-control);
+        }
+
+        .visually-hidden {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 100%;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background: var(--bg);
+        }
+
+        .header {
+            background: var(--surface);
+            color: var(--text);
+            padding: var(--space-2) var(--space-4);
+            flex-shrink: 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .header-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: var(--space-4);
+            flex-wrap: wrap;
+        }
+        .header h1 {
+            font-size: var(--text-lg);
+            font-weight: 600;
+            margin: 0;
+            letter-spacing: 0;
+            white-space: nowrap;
+        }
+        .header-controls {
+            display: flex;
+            align-items: center;
+            gap: var(--space-2);
+            flex-wrap: wrap;
+        }
+        .menu-item {
+            background: var(--surface-2);
+            padding: var(--space-1) var(--space-3);
+            border-radius: var(--radius-pill);
+            font-size: var(--text-xs);
+            font-weight: 600;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            white-space: nowrap;
+        }
+        .menu-item-value {
+            font-family: var(--font-mono);
+            font-size: var(--text-sm);
+            font-weight: 600;
+            margin-left: var(--space-1);
+            color: var(--text);
+        }
+        .field-inline {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-1);
+        }
+        .field-inline label {
+            font-size: var(--text-xs);
+            font-weight: 600;
+            color: var(--text);
+        }
+        .header select,
+        .house-select,
+        .house-input,
+        .search-bar {
+            font: inherit;
+            font-size: var(--text-sm);
+            color: var(--text);
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-control);
+            padding: var(--space-2) var(--space-3);
+            min-height: 40px;
+        }
+        .header select { cursor: pointer; }
+        .house-input:disabled,
+        .house-select:disabled,
+        .header select:disabled,
+        .search-bar:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+        .search-bar {
+            width: 100%;
+            max-width: 420px;
+            margin-bottom: var(--space-3);
+            flex-shrink: 0;
+        }
+        .search-bar::placeholder { color: var(--text-faint); }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: var(--space-2);
+            padding: var(--space-2) var(--space-4);
+            background: var(--surface);
+            flex-shrink: 0;
+            border-bottom: 1px solid var(--border);
+        }
+        .stat-card {
+            background: var(--surface-2);
+            padding: var(--space-2) var(--space-3);
+            border-radius: var(--radius-card);
+            text-align: center;
+            border: 1px solid var(--border);
+        }
+        .stat-label {
+            font-size: var(--text-xs);
+            color: var(--text-muted);
+            margin-bottom: var(--space-1);
+            letter-spacing: 0.03em;
+            font-weight: 600;
+        }
+        .stat-value {
+            font-family: var(--font-mono);
+            font-size: var(--text-lg);
+            font-weight: 700;
+            color: var(--text);
+        }
+        .stat-value.bid, .side-buy, .pnl-pos { color: var(--success); }
+        .stat-value.ask, .side-sell, .pnl-neg { color: var(--danger); }
+        .stat-value.spread { color: var(--accent); }
+
+        .live-main {
+            display: flex;
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            gap: var(--space-2);
+            padding: var(--space-2);
+        }
+        .order-book-side, .trades-panel {
+            flex: 1;
+            min-width: 0;
+            background: var(--surface);
+            border-radius: var(--radius-card);
+            border: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 0;
+        }
+        .order-book-header, .trades-header {
+            padding: var(--space-2) var(--space-3);
+            font-weight: 700;
+            text-align: center;
+            font-size: var(--text-xs);
+            letter-spacing: 0.03em;
+            flex-shrink: 0;
+            color: var(--text);
+            background: var(--surface-2);
+            border-bottom: 1px solid var(--border);
+        }
+        .order-book-header.bids { color: var(--success); background: var(--success-bg); }
+        .order-book-header.asks { color: var(--danger); background: var(--danger-bg); }
+        .trades-header { text-align: left; color: var(--accent); }
+
+        ::-webkit-scrollbar { width: var(--space-2); height: var(--space-2); }
+        ::-webkit-scrollbar-track { background: var(--surface); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: var(--radius-pill); }
+
+        .order-book-scroll, .trades-scroll {
+            flex: 1;
+            overflow-y: auto;
+            min-height: 0;
+            scrollbar-width: thin;
+            scrollbar-color: var(--border) var(--surface);
+        }
+        .order-book-table, .trades-table, .data-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .order-book-table th, .trades-table th, .data-table th {
+            padding: var(--space-2) var(--space-3);
+            text-align: left;
+            background: var(--surface-2);
+            font-weight: 600;
+            font-size: var(--text-xs);
+            text-transform: uppercase;
+            color: var(--text-faint);
+            letter-spacing: 0.03em;
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            z-index: 1;
+        }
+        .order-book-table th:not(:first-child),
+        .trades-table th:not(:first-child) { text-align: right; }
+        .order-book-table td, .trades-table td, .data-table td {
+            padding: var(--space-2) var(--space-3);
+            font-family: var(--font-mono);
+            font-size: var(--text-xs);
+            border-bottom: 1px solid var(--border);
+            color: var(--text);
+        }
+        .order-book-table td:not(:first-child),
+        .trades-table td:not(:first-child) { text-align: right; }
+        .order-book-table tbody tr:nth-child(odd),
+        .trades-table tbody tr:nth-child(odd),
+        .data-table tbody tr:nth-child(odd) { background: var(--surface-2); }
+        .price { font-weight: 700; color: var(--text); }
+        .size { color: var(--text-muted); }
+        .table-msg {
+            text-align: center !important;
+            padding: var(--space-5) !important;
+            font-family: var(--font-body) !important;
+            color: var(--text-muted);
+        }
+        .table-msg-error { color: var(--danger); }
+        .table-msg-loading { color: var(--info); }
+
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: var(--space-2);
+            padding: var(--space-1) var(--space-3);
+            border-radius: var(--radius-pill);
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            font-size: var(--text-xs);
+            font-weight: 600;
+            white-space: nowrap;
+            min-height: 40px;
+        }
+        .status::before {
+            content: '';
+            width: var(--space-2);
+            height: var(--space-2);
+            border-radius: 50%;
+            background: var(--text-faint);
+            flex-shrink: 0;
+        }
+        .status.connected {
+            background: var(--success-bg);
+            border-color: var(--success);
+            color: var(--success);
+        }
+        .status.connected::before { background: var(--success); }
+        .status.error {
+            background: var(--danger-bg);
+            border-color: var(--danger);
+            color: var(--danger);
+        }
+        .status.error::before { background: var(--danger); }
+
+        .tab-nav {
+            display: flex;
+            gap: var(--space-1);
+            padding: var(--space-2) var(--space-4) 0;
+            background: var(--surface);
+            border-bottom: 1px solid var(--border);
+            flex-shrink: 0;
+            overflow-x: auto;
+            overflow-y: hidden;
+        }
+        .tab-btn {
+            padding: var(--space-2) var(--space-4);
+            min-height: 40px;
+            border: 1px solid transparent;
+            border-bottom: none;
+            border-radius: var(--radius-control) var(--radius-control) 0 0;
+            background: transparent;
+            color: var(--text-muted);
+            font-family: var(--font-body);
+            font-size: var(--text-sm);
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .tab-btn:hover { color: var(--text); background: var(--surface-2); }
+        .tab-btn.active {
+            background: var(--accent);
+            color: var(--accent-contrast);
+        }
+        .tab-panel { display: none; flex-direction: column; flex: 1; overflow: hidden; min-height: 0; }
+        .tab-panel.active { display: flex; }
+
+        .history-section, .data-section {
+            padding: var(--space-3) var(--space-4);
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            min-height: 0;
+            gap: var(--space-3);
+        }
+        .data-section-scroll {
+            padding: var(--space-3) var(--space-4);
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow-y: auto;
+            overflow-x: hidden;
+            min-height: 0;
+            gap: var(--space-4);
+        }
+        .history-controls, .panel-header, .btn-row {
+            display: flex;
+            gap: var(--space-3);
+            align-items: center;
+            flex-wrap: wrap;
+            flex-shrink: 0;
+        }
+        .panel-header { justify-content: space-between; align-items: flex-start; }
+        .panel-header .lead {
+            margin: 0;
+            color: var(--text-muted);
+            font-size: var(--text-sm);
+            max-width: 70ch;
+        }
+        .form-grid + .btn-row { margin-top: var(--space-4); }
+        .tab-panel[hidden],
+        .house-field[hidden],
+        [hidden] { display: none !important; }
+
+        .house-btn {
+            font: inherit;
+            font-size: var(--text-sm);
+            font-weight: 600;
+            min-height: 40px;
+            padding: var(--space-2) var(--space-4);
+            border-radius: var(--radius-control);
+            border: 1px solid transparent;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: var(--space-2);
+        }
+        .house-btn:disabled { cursor: not-allowed; opacity: 0.55; }
+        .house-btn-primary {
+            background: var(--accent);
+            color: var(--accent-contrast);
+            border-color: var(--accent);
+        }
+        .house-btn-primary:hover:not(:disabled) {
+            background: var(--accent-hover);
+            border-color: var(--accent-hover);
+        }
+        .house-btn-secondary {
+            background: transparent;
+            color: var(--text);
+            border-color: var(--border);
+        }
+        .house-btn-secondary:hover:not(:disabled) { border-color: var(--text-muted); }
+        .house-btn-danger {
+            background: transparent;
+            color: var(--danger);
+            border-color: var(--danger);
+        }
+        .house-btn-danger:hover:not(:disabled) { background: var(--danger-bg); }
+        .house-btn-success {
+            background: var(--success);
+            color: var(--accent-contrast);
+            border-color: var(--success);
+        }
+
+        .chart-wrap {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-card);
+            padding: var(--space-4);
+            position: relative;
+            flex: 1;
+            min-height: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        .chart-wrap canvas { flex: 1; min-height: 0; }
+        .chart-caption {
+            color: var(--accent);
+            font-size: var(--text-xs);
+            font-weight: 600;
+            margin-bottom: var(--space-2);
+        }
+
+        .data-table-wrap, .data-table-fill, .house-table-scroll {
+            overflow-x: auto;
+            min-height: 0;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-card);
+            background: var(--surface);
+        }
+        .data-table-fill { flex: 1; overflow-y: auto; }
+        .data-table { min-width: 480px; }
+        .data-table th, .data-table td { text-align: left; }
+        .section-title {
+            font-size: var(--text-xl);
+            font-weight: 600;
+            color: var(--text);
+            margin: 0;
+        }
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: var(--space-3);
+        }
+        .house-field {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-1);
+            font-size: var(--text-sm);
+            color: var(--text-muted);
+        }
+        .house-field > span, .house-field > label {
+            font-size: var(--text-sm);
+            font-weight: 600;
+            color: var(--text);
+        }
+
+        .house-banner {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-1);
+            border-radius: var(--radius-card);
+            padding: var(--space-3) var(--space-4);
+            font-size: var(--text-sm);
+            line-height: 1.5;
+            flex-shrink: 0;
+        }
+        .house-banner[hidden] { display: none !important; }
+        .house-banner-title { font-weight: 600; margin: 0; }
+        .house-banner-text { margin: 0; }
+        .house-banner-success { background: var(--success-bg); color: var(--success); border: 1px solid var(--success); }
+        .house-banner-error { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); }
+        .house-banner-info { background: var(--info-bg); color: var(--info); border: 1px solid var(--info); }
+        .house-banner-warning { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning); }
+        .house-banner-neutral { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
+        .house-empty {
+            border: 1px dashed var(--border);
+            border-radius: var(--radius-card);
+            padding: var(--space-6) var(--space-5);
+            text-align: center;
+            color: var(--text-muted);
+        }
+        .inline-status { color: var(--text-muted); font-size: var(--text-sm); }
+
+        .bt-summary-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: var(--space-3);
+        }
+        .chart-fixed { height: 260px; flex: none; margin-bottom: var(--space-4); }
+
+        @media (max-width: 767px) {
+            .live-main { flex-direction: column; padding: var(--space-2); }
+            .order-book-side { flex: none; height: 33%; }
+            .header h1 { font-size: var(--text-base); }
+            .data-table { min-width: 360px; }
+            .stats { grid-template-columns: repeat(2, 1fr); }
+            .panel-header { flex-direction: column; }
+            .house-btn-primary { width: 100%; justify-content: center; }
+        }
+        @media (min-width: 768px) and (max-width: 1279px) {
+            .live-main { flex-wrap: wrap; }
+            .order-book-side { flex: 1 1 45%; }
+            .trades-panel { flex: 1 1 100%; }
+        }
+        @media (min-width: 1280px) {
+            .live-main { flex-wrap: nowrap; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="header-row">
+                <h1>Wozinga HFT platform</h1>
+                <div class="header-controls">
+                    <div class="menu-item">Markets <span class="menu-item-value" id="totalMarkets">—</span></div>
+                    <div class="field-inline">
+                        <label for="symbolSelect">Symbol</label>
+                        <select id="symbolSelect">
+                            <option value="BTC_USDT">BTC_USDT</option>
+                            <option value="BTC_USD">BTC_USD</option>
+                            <option value="SOL_BTC">SOL_BTC</option>
+                            <option value="XRP_BTC">XRP_BTC</option>
+                            <option value="DOGE_BTC">DOGE_BTC</option>
+                        </select>
+                    </div>
+                    <div class="status" id="status" role="status">Connecting</div>
+                </div>
+            </div>
+        </header>
+
+        <div class="tab-nav" role="tablist" aria-label="Platform views" id="tabNav">
+            <button type="button" class="tab-btn active" role="tab" id="tabbtn-live" aria-controls="tab-live" aria-selected="true" tabindex="0" data-tab="live">Live</button>
+            <button type="button" class="tab-btn" role="tab" id="tabbtn-history" aria-controls="tab-history" aria-selected="false" tabindex="-1" data-tab="history">History</button>
+            <button type="button" class="tab-btn" role="tab" id="tabbtn-orders" aria-controls="tab-orders" aria-selected="false" tabindex="-1" data-tab="orders">Orders</button>
+            <button type="button" class="tab-btn" role="tab" id="tabbtn-positions" aria-controls="tab-positions" aria-selected="false" tabindex="-1" data-tab="positions">Positions</button>
+            <button type="button" class="tab-btn" role="tab" id="tabbtn-algo" aria-controls="tab-algo" aria-selected="false" tabindex="-1" data-tab="algo">Algo</button>
+            <button type="button" class="tab-btn" role="tab" id="tabbtn-backtest" aria-controls="tab-backtest" aria-selected="false" tabindex="-1" data-tab="backtest">Backtest</button>
+            <button type="button" class="tab-btn" role="tab" id="tabbtn-securities" aria-controls="tab-securities" aria-selected="false" tabindex="-1" data-tab="securities">Securities</button>
+        </div>
+
+        <div id="tab-live" class="tab-panel active" role="tabpanel" aria-labelledby="tabbtn-live">
+            <div class="stats">
+                <div class="stat-card">
+                    <div class="stat-label">Best bid</div>
+                    <div class="stat-value bid" id="bestBid">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Best ask</div>
+                    <div class="stat-value ask" id="bestAsk">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Spread</div>
+                    <div class="stat-value spread" id="spread">—</div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-label">Trade count</div>
+                    <div class="stat-value" id="tradeCount">0</div>
+                </div>
+            </div>
+            <div id="liveBanner" class="house-banner house-banner-info" role="status">Loading the order book for the selected symbol.</div>
+            <div class="live-main">
+                <div class="order-book-side">
+                    <div class="order-book-header bids">Bids</div>
+                    <div class="order-book-scroll">
+                        <table class="order-book-table">
+                            <thead><tr><th>Price</th><th>Size</th></tr></thead>
+                            <tbody id="bidsTable">
+                                <tr><td colspan="2" class="table-msg table-msg-loading">Loading bids</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="order-book-side">
+                    <div class="order-book-header asks">Asks</div>
+                    <div class="order-book-scroll">
+                        <table class="order-book-table">
+                            <thead><tr><th>Price</th><th>Size</th></tr></thead>
+                            <tbody id="asksTable">
+                                <tr><td colspan="2" class="table-msg table-msg-loading">Loading asks</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="trades-panel">
+                    <div class="trades-header">Recent trades</div>
+                    <div class="trades-scroll">
+                        <table class="trades-table">
+                            <thead><tr><th>Price</th><th>Size</th><th>Time</th></tr></thead>
+                            <tbody id="tradesTable">
+                                <tr><td colspan="3" class="table-msg">No trades yet. Prints appear here as the book trades.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-history" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-history" hidden>
+            <div class="history-section">
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">Bid / ask history</h2>
+                        <p class="lead">Load kdb snapshots for a symbol to plot best bid and best ask.</p>
+                    </div>
+                    <div class="history-controls">
+                        <div class="field-inline">
+                            <label for="histSymbolSelect">Symbol</label>
+                            <select id="histSymbolSelect" class="house-select"></select>
+                        </div>
+                        <button type="button" class="house-btn house-btn-primary" id="histLoadBtn">Load history</button>
+                    </div>
+                </div>
+                <div id="histBanner" class="house-banner house-banner-neutral" role="status">Choose a symbol, then load history.</div>
+                <div class="chart-wrap">
+                    <canvas id="histChart" aria-label="Bid and ask history chart"></canvas>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-orders" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-orders" hidden>
+            <div class="data-section">
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">Orders</h2>
+                        <p class="lead">Working orders from the venue, followed by processed history. After reconnect, local ghosts drop once the venue answers the status request.</p>
+                    </div>
+                    <button type="button" class="house-btn house-btn-primary" id="ordersRefreshBtn">Refresh orders</button>
+                </div>
+                <div id="ordersBanner" class="house-banner house-banner-info" role="status">Loading orders.</div>
+                <div class="data-table-fill">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Client order id</th>
+                                <th>Symbol</th>
+                                <th>Side</th>
+                                <th>Qty</th>
+                                <th>Price</th>
+                                <th>Status</th>
+                                <th>Cum qty</th>
+                                <th>Avg px</th>
+                                <th>Time</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ordersTable">
+                            <tr><td colspan="9" class="table-msg table-msg-loading">Loading orders</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-positions" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-positions" hidden>
+            <div class="data-section">
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">Positions</h2>
+                        <p class="lead">Net quantity and P&amp;L from fills. Status snapshots do not change positions.</p>
+                    </div>
+                    <button type="button" class="house-btn house-btn-primary" id="positionsRefreshBtn">Refresh positions</button>
+                </div>
+                <div id="positionsBanner" class="house-banner house-banner-info" role="status">Loading positions.</div>
+                <div class="data-table-fill">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Net qty</th>
+                                <th>Avg entry</th>
+                                <th>Last mid</th>
+                                <th>Unreal P&amp;L</th>
+                                <th>Real P&amp;L</th>
+                                <th>Total P&amp;L</th>
+                                <th>Trades</th>
+                            </tr>
+                        </thead>
+                        <tbody id="positionsTable">
+                            <tr><td colspan="8" class="table-msg table-msg-loading">Loading positions</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-algo" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-algo" hidden>
+            <div class="data-section-scroll">
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">Trading algorithm</h2>
+                        <p class="lead">Configure the strategy, then enable it. Enable is the primary action when the algo is off.</p>
+                    </div>
+                    <div class="btn-row">
+                        <button type="button" class="house-btn house-btn-success" id="algoEnableBtn">Enable algorithm</button>
+                        <button type="button" class="house-btn house-btn-danger" id="algoDisableBtn" disabled>Disable algorithm</button>
+                        <button type="button" class="house-btn house-btn-secondary" id="algoRefreshBtn">Refresh status</button>
+                    </div>
+                </div>
+                <div id="algoStatusBanner" class="house-banner house-banner-neutral" role="status">Loading algorithm status.</div>
+                <div>
+                    <h3 class="chart-caption">Configuration</h3>
+                    <div class="form-grid">
+                        <label class="house-field">
+                            <span>Strategy</span>
+                            <select id="algoCfgStrategy" class="house-select">
+                                <option value="spread_capture">Spread capture</option>
+                                <option value="market_imbalance">Market imbalance</option>
+                            </select>
+                        </label>
+                        <label class="house-field">
+                            <span>Symbol</span>
+                            <input id="algoCfgSymbol" class="house-input" type="text" autocomplete="off">
+                        </label>
+                        <label class="house-field">
+                            <span>Order qty (base units)</span>
+                            <input id="algoCfgQty" class="house-input" type="number" step="0.0001">
+                        </label>
+                        <label class="house-field">
+                            <span>Min spread (bps)</span>
+                            <input id="algoCfgSpread" class="house-input" type="number" step="0.1">
+                        </label>
+                        <label class="house-field">
+                            <span>Max position (base units)</span>
+                            <input id="algoCfgMaxPos" class="house-input" type="number" step="0.001">
+                        </label>
+                        <label class="house-field">
+                            <span>Poll interval (ms)</span>
+                            <input id="algoCfgPoll" class="house-input" type="number" step="100">
+                        </label>
+                        <label class="house-field">
+                            <span>Time in force (0 = day, 3 = IOC, 4 = FOK)</span>
+                            <input id="algoCfgTIF" class="house-input" type="text" maxlength="1" autocomplete="off">
+                        </label>
+                        <label class="house-field" id="algoCfgImbalanceThresholdWrap" hidden>
+                            <span>Imbalance threshold (0.5–1.0)</span>
+                            <input id="algoCfgImbalanceThreshold" class="house-input" type="number" step="0.01" min="0.5" max="1.0">
+                        </label>
+                        <label class="house-field" id="algoCfgImbalanceDepthWrap" hidden>
+                            <span>Imbalance depth levels</span>
+                            <input id="algoCfgImbalanceDepth" class="house-input" type="number" step="1" min="1" max="20">
+                        </label>
+                    </div>
+                    <div class="btn-row">
+                        <button type="button" class="house-btn house-btn-secondary" id="algoSaveBtn">Save configuration</button>
+                        <span id="algoCfgMsg" class="inline-status" role="status"></span>
+                    </div>
+                </div>
+                <div>
+                    <h3 class="chart-caption">Recent signals</h3>
+                    <div id="algoSignalsEmpty" class="house-empty" hidden>
+                        <p>No signals yet. Enable the algorithm to start quoting.</p>
+                    </div>
+                    <div class="house-table-scroll">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Symbol</th>
+                                    <th>Side</th>
+                                    <th>Price</th>
+                                    <th>Qty</th>
+                                    <th>Reason</th>
+                                </tr>
+                            </thead>
+                            <tbody id="algoSignalLog">
+                                <tr><td colspan="6" class="table-msg">No signals yet. Enable the algorithm to start quoting.</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                    <p class="inline-status">Signals fired: <span id="algoSigCount">0</span> · Orders placed: <span id="algoOrdCount">0</span></p>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-backtest" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-backtest" hidden>
+            <div class="data-section-scroll">
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">Strategy backtester</h2>
+                        <p class="lead">Replay snapshots for a symbol. Run backtest is the primary action.</p>
+                    </div>
+                    <button type="button" class="house-btn house-btn-primary" id="btRunBtn">Run backtest</button>
+                </div>
+                <div id="btBanner" class="house-banner house-banner-neutral" role="status">Set parameters, then run a backtest.</div>
+                <div class="form-grid">
+                    <label class="house-field">
+                        <span>Strategy</span>
+                        <select id="btStrategy" class="house-select">
+                            <option value="spread_capture">Spread capture</option>
+                            <option value="market_imbalance">Market imbalance</option>
+                        </select>
+                    </label>
+                    <label class="house-field">
+                        <span>Symbol</span>
+                        <select id="btSymbol" class="house-select"></select>
+                    </label>
+                    <label class="house-field">
+                        <span>Snapshots</span>
+                        <input id="btLimit" class="house-input" type="number" value="5000" min="100" max="50000">
+                    </label>
+                    <label class="house-field">
+                        <span>Min spread (bps)</span>
+                        <input id="btSpread" class="house-input" type="number" value="5" step="0.1">
+                    </label>
+                    <label class="house-field">
+                        <span>Order qty</span>
+                        <input id="btQty" class="house-input" type="number" value="0.001" step="0.0001">
+                    </label>
+                    <label class="house-field">
+                        <span>Max position</span>
+                        <input id="btMaxPos" class="house-input" type="number" value="0.01" step="0.001">
+                    </label>
+                    <label class="house-field">
+                        <span>Tick size</span>
+                        <input id="btTick" class="house-input" type="number" value="0.01" step="0.001">
+                    </label>
+                    <label class="house-field" id="btImbalanceThresholdWrap" hidden>
+                        <span>Imbalance threshold (0.5–1.0)</span>
+                        <input id="btImbalanceThreshold" class="house-input" type="number" value="0.6" step="0.01" min="0.5" max="1.0">
+                    </label>
+                    <label class="house-field" id="btImbalanceDepthWrap" hidden>
+                        <span>Imbalance depth levels</span>
+                        <input id="btImbalanceDepth" class="house-input" type="number" value="1" step="1" min="1" max="1" title="Backtest uses top-of-book only (depth = 1)">
+                    </label>
+                </div>
+                <span id="btStatus" class="visually-hidden"></span>
+
+                <div id="btSummary" hidden>
+                    <div class="bt-summary-grid">
+                        <div class="stat-card"><div class="stat-label">Total P&amp;L</div><div class="stat-value" id="btStatPnl">—</div></div>
+                        <div class="stat-card"><div class="stat-label">Total trades</div><div class="stat-value" id="btStatTrades">—</div></div>
+                        <div class="stat-card"><div class="stat-label">Win rate</div><div class="stat-value" id="btStatWinRate">—</div></div>
+                        <div class="stat-card"><div class="stat-label">Max drawdown</div><div class="stat-value" id="btStatDrawdown">—</div></div>
+                        <div class="stat-card"><div class="stat-label">Sharpe ratio</div><div class="stat-value" id="btStatSharpe">—</div></div>
+                        <div class="stat-card"><div class="stat-label">Final position</div><div class="stat-value" id="btStatPos">—</div></div>
+                    </div>
+                    <div class="chart-wrap chart-fixed">
+                        <div class="chart-caption">Price and trade signals</div>
+                        <canvas id="btPriceChart" aria-label="Price and trade signals chart"></canvas>
+                    </div>
+                    <div class="chart-wrap chart-fixed">
+                        <div class="chart-caption">Equity curve (cumulative P&amp;L)</div>
+                        <canvas id="btEquityChart" aria-label="Equity curve chart"></canvas>
+                    </div>
+                    <div>
+                        <div class="chart-caption">Trade log <span id="btTradeCount"></span></div>
+                        <div class="data-table-wrap">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>Time</th>
+                                        <th>Side</th>
+                                        <th>Fill price</th>
+                                        <th>Qty</th>
+                                        <th>Trade P&amp;L</th>
+                                        <th>Cumul. P&amp;L</th>
+                                        <th>Net pos after</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="btTradeLog">
+                                    <tr><td colspan="7" class="table-msg">Run a backtest to see trades.</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="tab-securities" class="tab-panel" role="tabpanel" aria-labelledby="tabbtn-securities" hidden>
+            <div class="data-section">
+                <div class="panel-header">
+                    <div>
+                        <h2 class="section-title">Securities</h2>
+                        <p class="lead">Venue security list. Filter by symbol; nothing here is sent to the venue.</p>
+                    </div>
+                    <button type="button" class="house-btn house-btn-primary" id="secRefreshBtn">Refresh securities</button>
+                </div>
+                <div id="secBanner" class="house-banner house-banner-info" role="status">Loading securities.</div>
+                <div class="field-inline">
+                    <label for="secSearch">Search securities</label>
+                    <input class="search-bar" id="secSearch" type="search" placeholder="Filter by symbol">
+                </div>
+                <div class="data-table-fill">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Symbol</th>
+                                <th>Security id</th>
+                                <th>Exchange</th>
+                                <th>Attributes</th>
+                            </tr>
+                        </thead>
+                        <tbody id="securitiesTable">
+                            <tr><td colspan="4" class="table-msg table-msg-loading">Loading securities</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentSymbol = 'BTC_USDT';
+        let updateInterval = null;
+        let histChartInstance = null;
+        let allSecurities = [];
+
+        function token(name) {
+            return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+        }
+        function setBanner(el, kind, title, text) {
+            if (!el) return;
+            el.hidden = false;
+            el.className = 'house-banner house-banner-' + kind;
+            el.innerHTML = '<p class="house-banner-title">' + title + '</p>' +
+                (text ? '<p class="house-banner-text">' + text + '</p>' : '');
+        }
+        function tableMsg(colspan, text, kind) {
+            const cls = kind ? ' table-msg-' + kind : '';
+            return '<tr><td colspan="' + colspan + '" class="table-msg' + cls + '">' + text + '</td></tr>';
+        }
+        function setDisabled(id, on) {
+            const el = document.getElementById(id);
+            if (el) el.disabled = !!on;
+        }
+
+        function switchTab(name, btn) {
+            document.querySelectorAll('.tab-panel').forEach(p => {
+                const on = p.id === 'tab-' + name;
+                p.classList.toggle('active', on);
+                p.hidden = !on;
+            });
+            document.querySelectorAll('.tab-btn').forEach(b => {
+                const on = b === btn;
+                b.classList.toggle('active', on);
+                b.setAttribute('aria-selected', on ? 'true' : 'false');
+                b.tabIndex = on ? 0 : -1;
+            });
+            if (name === 'orders') loadOrders();
+            if (name === 'positions') loadPositions();
+            if (name === 'algo') loadAlgoStatus();
+            if (name === 'backtest') initBacktestSymbols();
+            if (name === 'securities') loadSecurities();
+            if (btn) btn.focus();
+        }
+
+        document.getElementById('tabNav').addEventListener('click', e => {
+            const btn = e.target.closest('.tab-btn');
+            if (!btn) return;
+            switchTab(btn.dataset.tab, btn);
+        });
+        document.getElementById('tabNav').addEventListener('keydown', e => {
+            const tabs = Array.from(document.querySelectorAll('.tab-btn'));
+            const i = tabs.indexOf(document.activeElement);
+            if (i < 0) return;
+            let next = i;
+            if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = (i + 1) % tabs.length;
+            else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = (i - 1 + tabs.length) % tabs.length;
+            else if (e.key === 'Home') next = 0;
+            else if (e.key === 'End') next = tabs.length - 1;
+            else return;
+            e.preventDefault();
+            switchTab(tabs[next].dataset.tab, tabs[next]);
+        });
+
+        const symbolSelect = document.getElementById('symbolSelect');
+        symbolSelect.addEventListener('change', e => {
+            currentSymbol = e.target.value;
+            updateOrderBook();
+        });
+
+        function formatNumber(num) {
+            if (num === null || num === undefined || isNaN(num)) return '—';
+            return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 8 });
+        }
+        function formatTime(timestamp) {
+            if (!timestamp) return '—';
+            const KDB_EPOCH_OFFSET_NS = 946684800000000000n;
+            try {
+                const ns = BigInt(Math.round(timestamp));
+                const ms = Number((ns + KDB_EPOCH_OFFSET_NS) / 1000000n);
+                return new Date(ms).toLocaleString();
+            } catch(_) {
+                return new Date(timestamp / 1000000).toLocaleTimeString();
+            }
+        }
+        function formatKdbTime(ts) {
+            if (!ts && ts !== 0) return '—';
+            try {
+                const ms = (typeof ts === 'number') ? ts : Date.parse(ts);
+                return new Date(ms).toLocaleString();
+            } catch(_) { return String(ts); }
+        }
+        function chartColors() {
+            return {
+                success: token('--success'),
+                danger: token('--danger'),
+                muted: token('--text-muted'),
+                text: token('--text'),
+                accent: token('--accent'),
+                border: token('--border'),
+                info: token('--info'),
+            };
+        }
+
+        function updateTotalMarkets() {
+            fetch('/api/symbols')
+                .then(r => r.json())
+                .then(data => {
+                    document.getElementById('totalMarkets').textContent = data.symbols ? data.symbols.length : 0;
+                    const sel = document.getElementById('symbolSelect');
+                    const cur = sel.value;
+                    sel.innerHTML = '';
+                    const syms = (data.symbols && data.symbols.length > 0) ? data.symbols : ['BTC_USDT'];
+                    syms.forEach(s => {
+                        const o = document.createElement('option');
+                        o.value = s; o.textContent = s;
+                        if (s === cur) o.selected = true;
+                        sel.appendChild(o);
+                    });
+                    const hSel = document.getElementById('histSymbolSelect');
+                    hSel.innerHTML = '';
+                    syms.forEach(s => {
+                        const o = document.createElement('option');
+                        o.value = s; o.textContent = s;
+                        if (s === currentSymbol) o.selected = true;
+                        hSel.appendChild(o);
+                    });
+                })
+                .catch(err => console.error('Error fetching symbols:', err));
+        }
+
+        function updateOrderBook() {
+            const banner = document.getElementById('liveBanner');
+            setDisabled('symbolSelect', true);
+            fetch('/api/orderbook/' + currentSymbol)
+                .then(r => { if (!r.ok) throw new Error('fetch failed'); return r.json(); })
+                .then(data => {
+                    setDisabled('symbolSelect', false);
+                    document.getElementById('status').textContent = 'Connected';
+                    document.getElementById('status').className = 'status connected';
+                    document.getElementById('bestBid').textContent = formatNumber(data.best_bid);
+                    document.getElementById('bestAsk').textContent = formatNumber(data.best_ask);
+                    document.getElementById('spread').textContent = formatNumber(data.spread);
+                    document.getElementById('tradeCount').textContent = data.trade_count || 0;
+                    const hasBook = (data.bids && data.bids.length) || (data.asks && data.asks.length);
+                    if (hasBook) {
+                        setBanner(banner, 'success', 'Order book updated', currentSymbol + ' is live.');
+                    } else {
+                        setBanner(banner, 'neutral', 'Empty book', 'No bid or ask levels for ' + currentSymbol + ' yet. Wait for market data or pick another symbol.');
+                    }
+                    const bids = document.getElementById('bidsTable');
+                    bids.innerHTML = data.bids && data.bids.length
+                        ? data.bids.map(l => '<tr><td class="price">' + formatNumber(l.price) + '</td><td class="size">' + formatNumber(l.size) + '</td></tr>').join('')
+                        : tableMsg(2, 'No bids yet for this symbol.');
+                    const asks = document.getElementById('asksTable');
+                    asks.innerHTML = data.asks && data.asks.length
+                        ? data.asks.map(l => '<tr><td class="price">' + formatNumber(l.price) + '</td><td class="size">' + formatNumber(l.size) + '</td></tr>').join('')
+                        : tableMsg(2, 'No asks yet for this symbol.');
+                    const trades = document.getElementById('tradesTable');
+                    trades.innerHTML = data.trades && data.trades.length
+                        ? data.trades.map(t => '<tr><td class="price">' + formatNumber(t.price) + '</td><td class="size">' + formatNumber(t.size) + '</td><td>' + formatTime(t.timestamp) + '</td></tr>').join('')
+                        : tableMsg(3, 'No trades yet. Prints appear here as the book trades.');
+                })
+                .catch(err => {
+                    setDisabled('symbolSelect', false);
+                    document.getElementById('status').textContent = 'Disconnected';
+                    document.getElementById('status').className = 'status error';
+                    setBanner(banner, 'error', 'Cannot load the order book', err.message + '. Check the market-data session.');
+                    document.getElementById('bidsTable').innerHTML = tableMsg(2, 'Cannot load bids.', 'error');
+                    document.getElementById('asksTable').innerHTML = tableMsg(2, 'Cannot load asks.', 'error');
+                    document.getElementById('tradesTable').innerHTML = tableMsg(3, 'Cannot load trades.', 'error');
+                });
+        }
+
+        function loadHistory() {
+            const sym = document.getElementById('histSymbolSelect').value || currentSymbol;
+            const banner = document.getElementById('histBanner');
+            const btn = document.getElementById('histLoadBtn');
+            btn.disabled = true;
+            setBanner(banner, 'info', 'Loading snapshots', 'Fetching bid/ask history for ' + sym + '.');
+            fetch('/api/history/' + sym)
+                .then(r => r.json())
+                .then(rows => {
+                    btn.disabled = false;
+                    if (!Array.isArray(rows) || rows.length === 0) {
+                        setBanner(banner, 'neutral', 'No snapshot data', 'No kdb snapshots for ' + sym + '. Subscribe to the symbol and wait for writes, then load again.');
+                        return;
+                    }
+                    setBanner(banner, 'success', 'History loaded', rows.length + ' snapshots for ' + sym + '.');
+                    const c = chartColors();
+                    const labels = rows.map(r => formatKdbTime(r.time));
+                    const bids   = rows.map(r => r.best_bid);
+                    const asks   = rows.map(r => r.best_ask);
+                    if (histChartInstance) histChartInstance.destroy();
+                    histChartInstance = new Chart(document.getElementById('histChart'), {
+                        type: 'line',
+                        data: {
+                            labels,
+                            datasets: [
+                                { label: 'Best bid', data: bids, borderColor: c.success, backgroundColor: c.success, tension: 0.2, pointRadius: 0 },
+                                { label: 'Best ask', data: asks, borderColor: c.danger, backgroundColor: c.danger, tension: 0.2, pointRadius: 0 }
+                            ]
+                        },
+                        options: {
+                            responsive: true,
+                            interaction: { mode: 'index', intersect: false },
+                            plugins: { legend: { labels: { color: c.text } } },
+                            scales: {
+                                x: { ticks: { color: c.muted, maxTicksLimit: 10 }, grid: { color: c.border } },
+                                y: { ticks: { color: c.muted }, grid: { color: c.border } }
+                            }
+                        }
+                    });
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    setBanner(banner, 'error', 'Cannot load history', err.message);
+                });
+        }
+        document.getElementById('histLoadBtn').addEventListener('click', loadHistory);
+
+        function loadOrders() {
+            const tbody = document.getElementById('ordersTable');
+            const banner = document.getElementById('ordersBanner');
+            const btn = document.getElementById('ordersRefreshBtn');
+            btn.disabled = true;
+            tbody.innerHTML = tableMsg(9, 'Loading orders', 'loading');
+            setBanner(banner, 'info', 'Loading orders', 'Fetching the working set and processed history.');
+            fetch('/api/orders/history')
+                .then(r => r.json())
+                .then(data => {
+                    btn.disabled = false;
+                    const orders = data.orders || [];
+                    if (!orders.length) {
+                        tbody.innerHTML = tableMsg(9, 'No orders to show. Working orders appear here after the venue acknowledges them.');
+                        setBanner(banner, 'neutral', 'No orders', 'The working set is empty. After reconnect, only venue-confirmed orders remain.');
+                        return;
+                    }
+                    setBanner(banner, 'success', 'Orders loaded', 'Showing ' + orders.length + ' order' + (orders.length === 1 ? '' : 's') + '. Live rows follow the venue after the last reconnect.');
+                    tbody.innerHTML = orders.map(o => {
+                        const sideCls = o.side === '1' ? 'side-buy' : 'side-sell';
+                        const sideLbl = o.side === '1' ? 'Buy' : 'Sell';
+                        return '<tr>' +
+                            '<td>' + (o.cl_ord_id || '—') + '</td>' +
+                            '<td>' + (o.symbol || '—') + '</td>' +
+                            '<td class="' + sideCls + '">' + sideLbl + '</td>' +
+                            '<td>' + (o.order_qty || '—') + '</td>' +
+                            '<td>' + (o.price || '—') + '</td>' +
+                            '<td>' + (o.ord_status || '—') + '</td>' +
+                            '<td>' + (o.cum_qty || '—') + '</td>' +
+                            '<td>' + (o.avg_px || '—') + '</td>' +
+                            '<td>' + (o.transact_time || '—') + '</td>' +
+                            '</tr>';
+                    }).join('');
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    tbody.innerHTML = tableMsg(9, 'Cannot load orders: ' + err.message, 'error');
+                    setBanner(banner, 'error', 'Cannot load orders', err.message);
+                });
+        }
+        document.getElementById('ordersRefreshBtn').addEventListener('click', loadOrders);
+
+        function loadPositions() {
+            const tbody = document.getElementById('positionsTable');
+            const banner = document.getElementById('positionsBanner');
+            const btn = document.getElementById('positionsRefreshBtn');
+            btn.disabled = true;
+            tbody.innerHTML = tableMsg(8, 'Loading positions', 'loading');
+            setBanner(banner, 'info', 'Loading positions', 'Fetching live positions and P&amp;L.');
+            fetch('/api/positions')
+                .then(r => r.json())
+                .then(data => {
+                    btn.disabled = false;
+                    const positions = data.positions || [];
+                    if (!positions.length) {
+                        tbody.innerHTML = tableMsg(8, 'No positions yet. Fills from executed orders appear here.');
+                        setBanner(banner, 'neutral', 'No positions', 'Place and fill orders to see net quantity and P&amp;L.');
+                        return;
+                    }
+                    setBanner(banner, 'success', 'Positions loaded', 'Last updated ' + new Date().toLocaleTimeString() + '.');
+                    tbody.innerHTML = positions.map(p => {
+                        const totalPnl = (p.unrealized_pnl || 0) + (p.realized_pnl || 0);
+                        const pnlCls = v => v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
+                        const sideCls = p.net_qty > 0 ? 'side-buy' : p.net_qty < 0 ? 'side-sell' : '';
+                        const fmt = v => v === undefined || v === null ? '—' : Number(v).toFixed(6);
+                        const fmtPnl = v => v === undefined || v === null ? '—' : (v >= 0 ? '+' : '') + Number(v).toFixed(4);
+                        return '<tr>' +
+                            '<td>' + p.symbol + '</td>' +
+                            '<td class="' + sideCls + '">' + fmt(p.net_qty) + '</td>' +
+                            '<td>' + fmt(p.avg_entry_px) + '</td>' +
+                            '<td>' + fmt(p.last_mid_px) + '</td>' +
+                            '<td class="' + pnlCls(p.unrealized_pnl) + '">' + fmtPnl(p.unrealized_pnl) + '</td>' +
+                            '<td class="' + pnlCls(p.realized_pnl) + '">' + fmtPnl(p.realized_pnl) + '</td>' +
+                            '<td class="' + pnlCls(totalPnl) + '">' + fmtPnl(totalPnl) + '</td>' +
+                            '<td>' + p.trade_count + '</td>' +
+                            '</tr>';
+                    }).join('');
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    tbody.innerHTML = tableMsg(8, 'Cannot load positions: ' + err.message, 'error');
+                    setBanner(banner, 'error', 'Cannot load positions', err.message);
+                });
+        }
+        document.getElementById('positionsRefreshBtn').addEventListener('click', loadPositions);
+
+        let _algoCfgCache = null;
+
+        function loadAlgoStatus() {
+            const banner = document.getElementById('algoStatusBanner');
+            setDisabled('algoRefreshBtn', true);
+            fetch('/api/algo/status')
+                .then(r => r.json())
+                .then(data => {
+                    setDisabled('algoRefreshBtn', false);
+                    const cfg = data.config || {};
+                    _algoCfgCache = cfg;
+                    if (cfg.enabled) {
+                        setBanner(banner, 'success', 'Algorithm is on',
+                            'Trading ' + (cfg.symbol || 'the configured symbol') +
+                            '. Qty ' + (cfg.order_qty || '—') +
+                            ', min spread ' + (cfg.min_spread_bps || '—') + ' bps.');
+                        setDisabled('algoEnableBtn', true);
+                        setDisabled('algoDisableBtn', false);
+                    } else {
+                        setBanner(banner, 'warning', 'Algorithm is off',
+                            'Configure it, then enable to start quoting.');
+                        setDisabled('algoEnableBtn', false);
+                        setDisabled('algoDisableBtn', true);
+                    }
+                    document.getElementById('algoCfgStrategy').value = cfg.strategy || 'spread_capture';
+                    document.getElementById('algoCfgSymbol').value = cfg.symbol || '';
+                    document.getElementById('algoCfgQty').value = cfg.order_qty || '';
+                    document.getElementById('algoCfgSpread').value = cfg.min_spread_bps || '';
+                    document.getElementById('algoCfgMaxPos').value = cfg.max_position || '';
+                    document.getElementById('algoCfgPoll').value = cfg.poll_interval_ms || '';
+                    document.getElementById('algoCfgTIF').value = cfg.time_in_force || '';
+                    document.getElementById('algoCfgImbalanceThreshold').value = cfg.imbalance_threshold != null ? cfg.imbalance_threshold : 0.6;
+                    document.getElementById('algoCfgImbalanceDepth').value = cfg.imbalance_depth_levels != null ? cfg.imbalance_depth_levels : 5;
+                    algoStrategyChanged();
+                    document.getElementById('algoSigCount').textContent = data.signals_fired || 0;
+                    document.getElementById('algoOrdCount').textContent = data.orders_placed || 0;
+                    const signals = data.recent_signals || [];
+                    const logBody = document.getElementById('algoSignalLog');
+                    if (!signals.length) {
+                        logBody.innerHTML = tableMsg(6, 'No signals yet. Enable the algorithm to start quoting.');
+                    } else {
+                        logBody.innerHTML = signals.map(s => {
+                            const t = new Date(s.timestamp_ms).toLocaleTimeString();
+                            const sideCls = s.side === '1' ? 'side-buy' : 'side-sell';
+                            const sideLbl = s.side === '1' ? 'Buy' : 'Sell';
+                            return '<tr><td>' + t + '</td><td>' + s.symbol + '</td>' +
+                                '<td class="' + sideCls + '">' + sideLbl + '</td>' +
+                                '<td>' + Number(s.price).toFixed(4) + '</td>' +
+                                '<td>' + s.qty + '</td>' +
+                                '<td title="' + s.reason + '">' + s.reason + '</td></tr>';
+                        }).join('');
+                    }
+                })
+                .catch(err => {
+                    setDisabled('algoRefreshBtn', false);
+                    setDisabled('algoEnableBtn', true);
+                    setDisabled('algoDisableBtn', true);
+                    setBanner(banner, 'error', 'Cannot load algorithm status', err.message);
+                });
+        }
+        function algoEnable() {
+            setDisabled('algoEnableBtn', true);
+            fetch('/api/algo/enable', {method:'POST'}).then(() => loadAlgoStatus());
+        }
+        function algoDisable() {
+            setDisabled('algoDisableBtn', true);
+            fetch('/api/algo/disable', {method:'POST'}).then(() => loadAlgoStatus());
+        }
+        function algoStrategyChanged() {
+            const isImbalance = document.getElementById('algoCfgStrategy').value === 'market_imbalance';
+            document.getElementById('algoCfgImbalanceThresholdWrap').hidden = !isImbalance;
+            document.getElementById('algoCfgImbalanceDepthWrap').hidden = !isImbalance;
+        }
+        function algoSaveConfig() {
+            const msg = document.getElementById('algoCfgMsg');
+            const btn = document.getElementById('algoSaveBtn');
+            btn.disabled = true;
+            const cfg = Object.assign({}, _algoCfgCache || {}, {
+                strategy:               document.getElementById('algoCfgStrategy').value,
+                symbol:                 document.getElementById('algoCfgSymbol').value,
+                order_qty:              parseFloat(document.getElementById('algoCfgQty').value),
+                min_spread_bps:         parseFloat(document.getElementById('algoCfgSpread').value),
+                max_position:           parseFloat(document.getElementById('algoCfgMaxPos').value),
+                poll_interval_ms:       parseInt(document.getElementById('algoCfgPoll').value),
+                time_in_force:          document.getElementById('algoCfgTIF').value,
+                imbalance_threshold:    parseFloat(document.getElementById('algoCfgImbalanceThreshold').value),
+                imbalance_depth_levels: parseInt(document.getElementById('algoCfgImbalanceDepth').value),
+            });
+            fetch('/api/algo/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(cfg)})
+                .then(r => r.json())
+                .then(() => {
+                    btn.disabled = false;
+                    msg.textContent = 'Configuration saved.';
+                    setTimeout(() => { msg.textContent = ''; }, 3000);
+                    loadAlgoStatus();
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    msg.textContent = 'Cannot save configuration: ' + err.message;
+                });
+        }
+        document.getElementById('algoEnableBtn').addEventListener('click', algoEnable);
+        document.getElementById('algoDisableBtn').addEventListener('click', algoDisable);
+        document.getElementById('algoRefreshBtn').addEventListener('click', loadAlgoStatus);
+        document.getElementById('algoSaveBtn').addEventListener('click', algoSaveConfig);
+        document.getElementById('algoCfgStrategy').addEventListener('change', algoStrategyChanged);
+
+        let btPriceChartInst = null;
+        let btEquityChartInst = null;
+
+        function btStrategyChanged() {
+            const isImbalance = document.getElementById('btStrategy').value === 'market_imbalance';
+            document.getElementById('btImbalanceThresholdWrap').hidden = !isImbalance;
+            document.getElementById('btImbalanceDepthWrap').hidden = !isImbalance;
+        }
+        document.getElementById('btStrategy').addEventListener('change', btStrategyChanged);
+
+        function initBacktestSymbols() {
+            const sel = document.getElementById('btSymbol');
+            if (sel.options.length > 0) return;
+            fetch('/api/symbols')
+                .then(r => r.json())
+                .then(data => {
+                    const syms = data.symbols || [];
+                    if (!syms.length) {
+                        setBanner(document.getElementById('btBanner'), 'neutral', 'No symbols', 'No symbols to backtest yet.');
+                        setDisabled('btRunBtn', true);
+                        return;
+                    }
+                    setDisabled('btRunBtn', false);
+                    syms.forEach(s => {
+                        const o = document.createElement('option');
+                        o.value = s; o.textContent = s;
+                        sel.appendChild(o);
+                    });
+                    if (!sel.value && syms.length) sel.value = syms[0];
+                })
+                .catch(() => {
+                    setBanner(document.getElementById('btBanner'), 'error', 'Cannot load symbols', 'The symbol list is unavailable.');
+                    setDisabled('btRunBtn', true);
+                });
+        }
+
+        function runBacktest() {
+            const btn = document.getElementById('btRunBtn');
+            const banner = document.getElementById('btBanner');
+            const status = document.getElementById('btStatus');
+            const symbol    = document.getElementById('btSymbol').value;
+            const limit     = document.getElementById('btLimit').value || 5000;
+            const spread    = document.getElementById('btSpread').value || 5;
+            const qty       = document.getElementById('btQty').value || 0.001;
+            const maxPos    = document.getElementById('btMaxPos').value || 0.01;
+            const tick      = document.getElementById('btTick').value || 0.01;
+            const strategy  = document.getElementById('btStrategy').value || 'spread_capture';
+            const threshold = document.getElementById('btImbalanceThreshold').value || 0.6;
+            const depth     = document.getElementById('btImbalanceDepth').value || 1;
+
+            if (!symbol) {
+                setBanner(banner, 'warning', 'Select a symbol', 'Pick a symbol, then run the backtest.');
+                status.textContent = 'Select a symbol first.';
+                return;
+            }
+
+            btn.disabled = true;
+            btn.textContent = 'Running…';
+            status.textContent = 'Fetching data and simulating…';
+            setBanner(banner, 'info', 'Running backtest', 'Fetching snapshots and simulating ' + symbol + '.');
+            document.getElementById('btSummary').hidden = true;
+
+            const url = '/api/backtest?symbol=' + encodeURIComponent(symbol) + '&limit=' + limit + '&min_spread_bps=' + spread + '&order_qty=' + qty + '&max_position=' + maxPos + '&tick_size=' + tick + '&strategy=' + strategy + '&imbalance_threshold=' + threshold + '&imbalance_depth_levels=' + depth;
+
+            fetch(url)
+                .then(r => r.json())
+                .then(data => {
+                    btn.disabled = false;
+                    btn.textContent = 'Run backtest';
+                    if (data.error) {
+                        setBanner(banner, 'error', 'Backtest failed', data.error);
+                        status.textContent = 'Error: ' + data.error;
+                        return;
+                    }
+                    renderBacktestResults(data, symbol);
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    btn.textContent = 'Run backtest';
+                    setBanner(banner, 'error', 'Cannot run backtest', err.message);
+                    status.textContent = 'Error: ' + err.message;
+                });
+        }
+        document.getElementById('btRunBtn').addEventListener('click', runBacktest);
+
+        function renderBacktestResults(data, symbol) {
+            const s = data.summary || {};
+            const status = document.getElementById('btStatus');
+            const banner = document.getElementById('btBanner');
+            status.textContent = 'Processed ' + (s.snapshots_processed || 0) + ' snapshots for ' + symbol;
+            setBanner(banner, 'success', 'Backtest complete', 'Processed ' + (s.snapshots_processed || 0) + ' snapshots for ' + symbol + '.');
+            document.getElementById('btSummary').hidden = false;
+
+            const pnlCls = v => v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
+            const fmtPnl = v => (v >= 0 ? '+' : '') + Number(v).toFixed(6);
+            const pnlEl = document.getElementById('btStatPnl');
+            pnlEl.textContent = fmtPnl(s.total_pnl || 0);
+            pnlEl.className = 'stat-value ' + pnlCls(s.total_pnl || 0);
+            document.getElementById('btStatTrades').textContent = s.total_trades || 0;
+            document.getElementById('btStatWinRate').textContent = (s.win_rate_pct || 0).toFixed(1) + '%';
+            const dd = document.getElementById('btStatDrawdown');
+            dd.textContent = fmtPnl(-(s.max_drawdown || 0));
+            dd.className = 'stat-value pnl-neg';
+            const sh = document.getElementById('btStatSharpe');
+            sh.textContent = (s.sharpe_ratio || 0).toFixed(3);
+            sh.className = 'stat-value ' + pnlCls(s.sharpe_ratio || 0);
+            document.getElementById('btStatPos').textContent = Number(s.final_position || 0).toFixed(6);
+
+            const trades = data.trades || [];
+            document.getElementById('btTradeCount').textContent = '(' + trades.length + ' trades shown)';
+            const logBody = document.getElementById('btTradeLog');
+            if (!trades.length) {
+                logBody.innerHTML = tableMsg(7, 'No trades fired. Try lowering min spread or increasing snapshots.');
+            } else {
+                const display = trades.slice(-200);
+                logBody.innerHTML = display.map(t => {
+                    const dt = new Date(t.timestamp_ms).toLocaleString();
+                    const sideCls = t.side === '1' ? 'side-buy' : 'side-sell';
+                    const sideLbl = t.side === '1' ? 'Buy' : 'Sell';
+                    const pnlStr = t.pnl !== 0 ? fmtPnl(t.pnl) : '—';
+                    return '<tr><td>' + dt + '</td>' +
+                        '<td class="' + sideCls + '">' + sideLbl + '</td>' +
+                        '<td>' + Number(t.price).toFixed(4) + '</td>' +
+                        '<td>' + t.qty + '</td>' +
+                        '<td class="' + pnlCls(t.pnl) + '">' + pnlStr + '</td>' +
+                        '<td class="' + pnlCls(t.cumulative_pnl) + '">' + fmtPnl(t.cumulative_pnl) + '</td>' +
+                        '<td>' + Number(t.net_qty_after).toFixed(6) + '</td></tr>';
+                }).join('');
+            }
+
+            const c = chartColors();
+            const priceSeries = data.price_series || [];
+            const priceLabels = priceSeries.map(p => new Date(p[0]).toLocaleTimeString());
+            const bidData  = priceSeries.map(p => p[1]);
+            const askData  = priceSeries.map(p => p[2]);
+            const buyPoints  = [];
+            const sellPoints = [];
+            trades.forEach(t => {
+                const label = new Date(t.timestamp_ms).toLocaleTimeString();
+                const point = { x: label, y: t.price };
+                if (t.side === '1') buyPoints.push(point);
+                else sellPoints.push(point);
+            });
+
+            if (btPriceChartInst) btPriceChartInst.destroy();
+            btPriceChartInst = new Chart(document.getElementById('btPriceChart'), {
+                type: 'line',
+                data: {
+                    labels: priceLabels,
+                    datasets: [
+                        { label: 'Best bid', data: bidData, borderColor: c.success, backgroundColor: c.success, tension: 0.2, pointRadius: 0, borderWidth: 1.5 },
+                        { label: 'Best ask', data: askData, borderColor: c.danger, backgroundColor: c.danger, tension: 0.2, pointRadius: 0, borderWidth: 1.5 },
+                        { label: 'Buy', data: buyPoints, type: 'scatter', borderColor: c.success, backgroundColor: c.success, pointStyle: 'triangle', pointRadius: 6, showLine: false },
+                        { label: 'Sell', data: sellPoints, type: 'scatter', borderColor: c.danger, backgroundColor: c.danger, pointStyle: 'triangle', rotation: 180, pointRadius: 6, showLine: false }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'index', intersect: false },
+                    plugins: { legend: { labels: { color: c.text } } },
+                    scales: {
+                        x: { ticks: { color: c.muted, maxTicksLimit: 10 }, grid: { color: c.border } },
+                        y: { ticks: { color: c.muted }, grid: { color: c.border } }
+                    }
+                }
+            });
+
+            const equityCurve = data.equity_curve || [];
+            const eqLabels = equityCurve.map(p => new Date(p[0]).toLocaleTimeString());
+            const eqData   = equityCurve.map(p => p[1]);
+            if (btEquityChartInst) btEquityChartInst.destroy();
+            btEquityChartInst = new Chart(document.getElementById('btEquityChart'), {
+                type: 'line',
+                data: {
+                    labels: eqLabels,
+                    datasets: [{
+                        label: 'Cumulative P&L',
+                        data: eqData,
+                        borderColor: c.accent,
+                        backgroundColor: c.info,
+                        tension: 0.3,
+                        pointRadius: 0,
+                        fill: true,
+                        borderWidth: 2
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { labels: { color: c.text } } },
+                    scales: {
+                        x: { ticks: { color: c.muted, maxTicksLimit: 10 }, grid: { color: c.border } },
+                        y: { ticks: { color: c.muted }, grid: { color: c.border } }
+                    }
+                }
+            });
+        }
+
+        function loadSecurities() {
+            const tbody = document.getElementById('securitiesTable');
+            const banner = document.getElementById('secBanner');
+            const btn = document.getElementById('secRefreshBtn');
+            btn.disabled = true;
+            tbody.innerHTML = tableMsg(4, 'Loading securities', 'loading');
+            setBanner(banner, 'info', 'Loading securities', 'Fetching the venue security list.');
+            fetch('/api/securities')
+                .then(r => r.json())
+                .then(data => {
+                    btn.disabled = false;
+                    allSecurities = data.securities || [];
+                    renderSecurities(allSecurities);
+                })
+                .catch(err => {
+                    btn.disabled = false;
+                    tbody.innerHTML = tableMsg(4, 'Cannot load securities: ' + err.message, 'error');
+                    setBanner(banner, 'error', 'Cannot load securities', err.message);
+                });
+        }
+        function renderSecurities(list) {
+            const tbody = document.getElementById('securitiesTable');
+            const banner = document.getElementById('secBanner');
+            const q = document.getElementById('secSearch').value;
+            if (!list.length) {
+                tbody.innerHTML = tableMsg(4, q ? 'No securities match this search. Clear the filter or try another symbol.' : 'No securities listed yet.');
+                setBanner(banner, 'neutral', q ? 'No matches' : 'Empty list', q ? 'No securities match “' + q + '”.' : 'The venue has not published a security list yet.');
+                return;
+            }
+            setBanner(banner, 'success', 'Securities loaded', 'Showing ' + list.length + ' symbol' + (list.length === 1 ? '' : 's') + '.');
+            tbody.innerHTML = list.map(s =>
+                '<tr><td>' + (s.symbol || '') + '</td>' +
+                '<td>' + (s.security_id || '') + '</td>' +
+                '<td>' + (s.exchange || '') + '</td>' +
+                '<td title="' + (s.attributes_json || '').replace(/"/g, '&quot;') + '">' + (s.attributes_json || '') + '</td></tr>'
+            ).join('');
+        }
+        function filterSecurities() {
+            const q = document.getElementById('secSearch').value.toLowerCase();
+            renderSecurities(q ? allSecurities.filter(s => (s.symbol || '').toLowerCase().includes(q)) : allSecurities);
+        }
+        document.getElementById('secRefreshBtn').addEventListener('click', loadSecurities);
+        document.getElementById('secSearch').addEventListener('input', filterSecurities);
+
+        updateTotalMarkets();
+        updateOrderBook();
+        setInterval(updateTotalMarkets, 5000);
+        updateInterval = setInterval(updateOrderBook, 500);
+    </script>
+</body>
+</html>
