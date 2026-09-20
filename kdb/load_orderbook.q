@@ -14,7 +14,7 @@ load_csv:{[filepath;coltypes]
 
 // Load order book levels
 if[()~key hsym `$string[data_dir],"/orderbook_levels.csv";
-    orderbook_levels: ([] time:`timestamp$(); symbol:`symbol$(); side:`char$(); price:`float$(); size:`float$(); action:`char$());
+    orderbook_levels: ([] time:`timestamp$(); symbol:`symbol$(); side:`char$(); price:`float$(); size:`float$(); action:`char$(); seq_num:`long$());
     ];
 if[not ()~key hsym `$string[data_dir],"/orderbook_levels.csv";
     info:("SSCFC"; enlist ",") 0: hsym `$string[data_dir],"/orderbook_levels.csv";
@@ -29,11 +29,12 @@ if[not ()~key hsym `$string[data_dir],"/orderbook_levels.csv";
     info[;5]:`$info[;5];
     // Create table
     orderbook_levels: `time`symbol`side`price`size`action xcol flip info;
+    orderbook_levels: update seq_num:0Nj from orderbook_levels;
     ];
 
 // Load trades
 if[()~key hsym `$string[data_dir],"/trades.csv";
-    trades: ([] time:`timestamp$(); symbol:`symbol$(); price:`float$(); size:`float$());
+    trades: ([] time:`timestamp$(); symbol:`symbol$(); price:`float$(); size:`float$(); seq_num:`long$());
     ];
 if[not ()~key hsym `$string[data_dir],"/trades.csv";
     info:("SSFF"; enlist ",") 0: hsym `$string[data_dir],"/trades.csv";
@@ -46,11 +47,12 @@ if[not ()~key hsym `$string[data_dir],"/trades.csv";
     info[;3]:"F"$info[;3];
     // Create table
     trades: `time`symbol`price`size xcol flip info;
+    trades: update seq_num:0Nj from trades;
     ];
 
 // Load snapshots
 if[()~key hsym `$string[data_dir],"/orderbook_snapshots.csv";
-    orderbook_snapshots: ([] time:`timestamp$(); symbol:`symbol$(); best_bid:`float$(); best_ask:`float$(); best_bid_size:`float$(); best_ask_size:`float$(); spread:`float$());
+    orderbook_snapshots: ([] time:`timestamp$(); symbol:`symbol$(); best_bid:`float$(); best_ask:`float$(); best_bid_size:`float$(); best_ask_size:`float$(); spread:`float$(); seq_num:`long$());
     ];
 if[not ()~key hsym `$string[data_dir],"/orderbook_snapshots.csv";
     info:("SSFFFFFF"; enlist ",") 0: hsym `$string[data_dir],"/orderbook_snapshots.csv";
@@ -66,6 +68,7 @@ if[not ()~key hsym `$string[data_dir],"/orderbook_snapshots.csv";
     info[;6]:"F"$info[;6];
     // Create table
     orderbook_snapshots: `time`symbol`best_bid`best_ask`best_bid_size`best_ask_size`spread xcol flip info;
+    orderbook_snapshots: update seq_num:0Nj from orderbook_snapshots;
     ];
 
 // Display summary
