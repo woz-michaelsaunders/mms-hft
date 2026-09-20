@@ -1045,7 +1045,7 @@
                 <div class="panel-header">
                     <div>
                         <h2 class="section-title">Strategy backtester</h2>
-                        <p class="lead">Replay snapshots for a symbol. Run backtest is the primary action.</p>
+                        <p class="lead">Replay snapshots for a symbol. Run backtest is the primary action. Fee and adverse-selection thresholds are in-code placeholders until an operator runs GET /api/backtest/calibrate; this tab does not apply calibrated fees to live config.</p>
                     </div>
                     <button type="button" class="house-btn house-btn-primary" id="btRunBtn" disabled>Run backtest</button>
                 </div>
@@ -1069,7 +1069,7 @@
                         <span>Snapshots</span>
                         <input id="btLimit" class="house-input" type="number" value="5000" min="100" max="50000">
                     </label>
-                    <label class="house-field">
+                    <label class="house-field" id="btSpreadWrap">
                         <span>Min spread (bps)</span>
                         <input id="btSpread" class="house-input" type="number" value="5" step="0.1">
                     </label>
@@ -1645,6 +1645,7 @@
             const isImbalance = document.getElementById('btStrategy').value === 'market_imbalance';
             document.getElementById('btImbalanceThresholdWrap').hidden = !isImbalance;
             document.getElementById('btImbalanceDepthWrap').hidden = !isImbalance;
+            document.getElementById('btSpreadWrap').hidden = isImbalance;
         }
         document.getElementById('btStrategy').addEventListener('change', btStrategyChanged);
 
