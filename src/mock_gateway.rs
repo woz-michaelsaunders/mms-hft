@@ -303,7 +303,13 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
                     return Ok(());
                 }
                 other => {
-                    info!("Mock gateway: unhandled message type '{}', ignoring", other);
+                    info!("Mock gateway: unhandled message type '{}', sending BusinessMessageReject", other);
+                    let ref_seq = msg.get_field(tags::MSG_SEQ_NUM).unwrap_or("0");
+                    let mut reject = next_message(&out_seq, &config, 'j').await;
+                    reject.set_field(45, ref_seq);             // RefSeqNum
+                    reject.set_field(372, &other.to_string()); // RefMsgType
+                    reject.set_field(380, "3");                // Unsupported Message Type
+                    send(&mut socket, &reject).await?;
                 }
             }
 

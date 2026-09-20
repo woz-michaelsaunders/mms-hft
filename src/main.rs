@@ -23,6 +23,8 @@ use sha2::Sha256;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use zmq;
 use order_book::{OrderBookSnapshot, Side, UpdateAction};
 use order_book_buffer::DoubleBufferedOrderBook;
@@ -38,6 +40,9 @@ use axum::{
 use tower_http::cors::CorsLayer;
 
 const MAX_TICK_BUFFER: usize = 10_000;
+const COMMAND_LOG_MD: &str = "fix_commands.log";
+const COMMAND_LOG_OM: &str = "OM_fix_command.log";
+const COMMAND_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB; rotate iff len > this
 
 
 // Configuration structure
@@ -495,6 +500,100 @@ enum ConnectionState {
     Disconnecting,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Inbound,
+    Outbound,
+}
+
+impl Direction {
+    fn as_tag(self) -> &'static str {
+        match self {
+            Direction::Inbound => "IN",
+            Direction::Outbound => "OUT",
+        }
+    }
+}
+
+fn command_log_msg_type_name(msg_type: char) -> &'static str {
+    match msg_type {
+        'A' => "Logon",
+        '5' => "Logout",
+        '0' => "Heartbeat",
+        '1' => "TestRequest",
+        '2' => "ResendRequest",
+        '3' => "Reject",
+        '4' => "SequenceReset",
+        '8' => "ExecutionReport",
+        'D' => "NewOrderSingle",
+        'F' => "OrderCancelRequest",
+        'G' => "OrderCancelReplaceRequest",
+        'H' => "OrderStatusRequest",
+        'V' => "MarketDataRequest",
+        'W' => "MarketDataSnapshotFullRefresh",
+        'X' => "MarketDataIncrementalRefresh",
+        'Y' => "OrderCancelReject",
+        'x' => "SecurityListRequest",
+        'j' => "BusinessMessageReject",
+        _ => "Unknown",
+    }
+}
+
+fn is_om_command_log(sender_id: &str, target_id: &str) -> bool {
+    sender_id.contains(".UD") || target_id.contains(".UD")
+}
+
+fn command_log_filename(is_om: bool) -> &'static str {
+    if is_om {
+        COMMAND_LOG_OM
+    } else {
+        COMMAND_LOG_MD
+    }
+}
+
+fn rotate_log_if_needed(path: &Path, max_bytes: u64) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() <= max_bytes {
+        return;
+    }
+    // Backup is `<file>.1` (e.g. OM_fix_command.log.1), not Path::with_extension("1")
+    // which would strip `.log` and yield OM_fix_command.1.
+    let backup = format!("{}.1", path.as_os_str().to_string_lossy());
+    let _ = std::fs::rename(path, backup);
+}
+
+fn open_command_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    let file = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        if let Ok(meta) = file.metadata() {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = file.set_permissions(perms);
+        }
+    }
+    Ok(file)
+}
+
+fn append_command_log_entry(path: &Path, entry: String, max_bytes: u64) {
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        rotate_log_if_needed(&path, max_bytes);
+        if let Ok(mut file) = open_command_log(&path) {
+            let _ = writeln!(file, "{}", entry);
+            let _ = file.flush();
+        }
+    });
+}
+
 impl FIXSession {
     pub fn new(sender: &str, target: &str) -> Self {
         Self::new_with_credentials(sender, target, "", "")
@@ -789,7 +888,7 @@ impl FIXSession {
 
         // Log FIX command
         let encoded = msg.encode()?;
-        Self::log_fix_command(&msg, &encoded);
+        Self::log_fix_command(&msg, &encoded, Direction::Outbound);
 
         // Send message
         let mut stream_guard = self.stream.lock().await;
@@ -945,7 +1044,7 @@ impl FIXSession {
         let fix_encode_us = fix_encode_start.elapsed().as_micros() as u64;
         
         // Log FIX command to separate file
-        Self::log_fix_command(&msg, &encoded);
+        Self::log_fix_command(&msg, &encoded, Direction::Outbound);
         
         // Measure FIX send time
         let fix_send_start = Instant::now();
@@ -1361,7 +1460,9 @@ impl FIXSession {
             let complete_msg: Vec<u8> = buf.drain(..message_end).collect();
             drop(buf);
             info!("✅ Extracted complete FIX message ({} bytes) from buffer", complete_msg.len());
-            return FIXMessage::decode(&complete_msg);
+            let msg = FIXMessage::decode(&complete_msg)?;
+            Self::log_fix_command(&msg, &complete_msg, Direction::Inbound);
+            return Ok(msg);
         }
     }
 
@@ -2521,7 +2622,7 @@ impl FIXSession {
         info!("Sending FIX message (type: {}, size: {} bytes)", msg.msg_type, encoded.len());
         
         // Log FIX command to separate file
-        Self::log_fix_command(msg, &encoded);
+        Self::log_fix_command(msg, &encoded, Direction::Outbound);
 
         // Debug: Log the message content in readable format
         if msg.msg_type == 'A' {
@@ -2574,69 +2675,33 @@ impl FIXSession {
     /// Log FIX command to separate log file
     /// Routes Order Management messages to OM_fix_command.log
     /// Routes Market Data messages to fix_commands.log
-    fn log_fix_command(msg: &FIXMessage, encoded: &[u8]) {
+    fn log_fix_command(msg: &FIXMessage, encoded: &[u8], direction: Direction) {
         // Convert FIX message to readable format (replace SOH with |)
         let readable = String::from_utf8_lossy(encoded)
             .replace('\x01', "|");
-        
-        // Determine if this is Order Management or Market Data based on sender/target comp IDs
-        // Order Management: sender contains "WOZINGA.UD" or target is "UAT1.CDC.UD"
-        // Market Data: sender contains "WOZINGA_BTC.MD" or target is "UAT1.CDC.MD"
+
         let sender_id = msg.get_field(tags::SENDER_COMP_ID).unwrap_or("");
         let target_id = msg.get_field(tags::TARGET_COMP_ID).unwrap_or("");
-        let is_om = sender_id.contains("WOZINGA.UD") 
-            || target_id == "UAT1.CDC.UD";
-        
-        // Debug output
-        eprintln!("DEBUG: log_fix_command - sender_id={}, target_id={}, is_om={}", sender_id, target_id, is_om);
-        
-        // Get message type name
-        let msg_type_name = match msg.msg_type {
-            'A' => "Logon",
-            '5' => "Logout",
-            '0' => "Heartbeat",
-            '1' => "TestRequest",
-            'D' => "NewOrderSingle",
-            'F' => "OrderCancelRequest",
-            'H' => "OrderStatusRequest",
-            'V' => "MarketDataRequest",
-            _ => "Unknown",
-        };
-        
-        // Format timestamp
+        let is_om = is_om_command_log(sender_id, target_id);
+
         let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f UTC");
-        
-        // Format log entry
         let log_entry = format!(
-            "[{}] FIX {} (35={}) - {} bytes\n{}\n\n",
+            "[{}] FIX {} {} (35={}) Sender={} Target={} - {} bytes\n{}\n\n",
             timestamp,
-            msg_type_name,
+            direction.as_tag(),
+            command_log_msg_type_name(msg.msg_type),
             msg.msg_type,
+            sender_id,
+            target_id,
             encoded.len(),
             readable
         );
-        
-        // Determine log file based on gateway type
-        let log_file = if is_om {
-            "OM_fix_command.log"
-        } else {
-            "fix_commands.log"
-        };
-        
-        // Write to file synchronously (simple approach)
-        // Use blocking thread to avoid blocking async runtime
-        let log_entry_clone = log_entry;
-        let log_file_clone = log_file.to_string();
-        std::thread::spawn(move || {
-            if let Ok(mut file) = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_file_clone)
-            {
-                let _ = writeln!(file, "{}", log_entry_clone);
-                let _ = file.flush();
-            }
-        });
+
+        append_command_log_entry(
+            Path::new(command_log_filename(is_om)),
+            log_entry,
+            COMMAND_LOG_MAX_BYTES,
+        );
     }
 
     async fn next_seq_num(&self) -> u32 {
@@ -7069,5 +7134,217 @@ mod connectivity_tests {
         assert!(quote.is_some(), "order book must still be in a valid, non-corrupted state after recovery");
 
         Ok(())
+    }
+
+    fn command_log_len(path: &str) -> usize {
+        std::fs::read_to_string(path).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Poll until every needle appears in content written *after* `before`.
+    /// Needles must be unique to the stanza under test — matching a shared
+    /// substring such as a bare ClOrdID can observe the earlier outbound
+    /// NewOrderSingle (same 11=) before the inbound ExecutionReport is flushed.
+    fn wait_for_new_log_contains(path: &str, before: usize, needles: &[&str]) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let contents = std::fs::read_to_string(path).unwrap_or_default();
+            let new = if contents.len() >= before {
+                &contents[before..]
+            } else {
+                contents.as_str()
+            };
+            if needles.iter().all(|n| new.contains(n)) {
+                return contents;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!(
+                    "timed out waiting for {:?} in {} after offset {}. new content:\n{}",
+                    needles, path, before, new
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// AC4 routing: `.UD` on sender *or* target (CompIDs swap on inbound) is OM;
+    /// `.MD` only, or TEST.CLIENT isolation, is MD.
+    #[test]
+    fn is_om_command_log_is_direction_symmetric() {
+        assert!(is_om_command_log("UAT1.WOZINGA.UD.00", "UAT1.CDC.UD"));
+        assert!(is_om_command_log("UAT1.CDC.UD", "UAT1.WOZINGA.UD.00"));
+        assert!(!is_om_command_log("UAT1.WOZINGA.MD.00", "UAT1.CDC.MD"));
+        assert!(!is_om_command_log("UAT1.CDC.MD", "UAT1.WOZINGA.MD.00"));
+        assert!(!is_om_command_log("TEST.CLIENT", "MOCK.VENUE"));
+    }
+
+    #[test]
+    fn rotate_log_if_needed_over_threshold_creates_dot1_backup() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hft_cmd_rot_{}.log", std::process::id()));
+        let backup = format!("{}.1", path.as_os_str().to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+
+        std::fs::write(&path, vec![b'x'; 80]).unwrap();
+        rotate_log_if_needed(&path, 64);
+        assert!(
+            Path::new(&backup).exists(),
+            "backup must be {}.1, not a stripped-stem .1",
+            path.file_name().unwrap().to_string_lossy()
+        );
+        assert_eq!(std::fs::read(&backup).unwrap(), vec![b'x'; 80]);
+        assert!(!path.exists(), "active file is recreated on the next open, not here");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn rotate_log_if_needed_equal_to_max_does_not_rotate() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("hft_cmd_eq_{}.log", std::process::id()));
+        let backup = format!("{}.1", path.as_os_str().to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+
+        std::fs::write(&path, vec![b'y'; 64]).unwrap();
+        rotate_log_if_needed(&path, 64);
+        assert!(path.exists(), "len == max must not rotate");
+        assert!(!Path::new(&backup).exists());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 64);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    /// AC1–3, AC6: inbound ExecutionReport / BusinessMessageReject / Logout
+    /// land in OM_fix_command.log as full `|`-delimited IN stanzas. AC4: OM
+    /// outbound NewOrderSingle still routes to the same OM file tagged OUT.
+    #[tokio::test]
+    async fn inbound_fix_commands_logged_in_full() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                venue_comp_id: "UAT1.CDC.UD".into(),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = FIXSession::new("UAT1.WOZINGA.UD.00", "UAT1.CDC.UD");
+        connect_and_logon(&session, port).await?;
+
+        let cl_ord_id = format!("INLOG_{}_{}", std::process::id(), 1);
+        let before_order = command_log_len(COMMAND_LOG_OM);
+        session
+            .new_order_single(&cl_ord_id, "BTC_USDT", '1', 1.0, 100.0)
+            .await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+
+        // Wait for the inbound ExecutionReport stanza itself — not the bare
+        // ClOrdID, which is already present in the earlier outbound
+        // NewOrderSingle and would return before the IN stanza is flushed
+        // (release-mode race under `cargo test --release --locked`).
+        let om_after_er = wait_for_new_log_contains(
+            COMMAND_LOG_OM,
+            before_order,
+            &[
+                "FIX IN ExecutionReport (35=8)",
+                &format!("11={}", cl_ord_id),
+                "Sender=",
+                "Target=CLIENT",
+                "8=FIX.4.4|",
+                "10=",
+                " UTC] FIX IN ExecutionReport",
+            ],
+        );
+        assert!(
+            om_after_er.contains("FIX OUT NewOrderSingle (35=D)"),
+            "AC4: OM outbound NewOrderSingle must still land in OM_fix_command.log"
+        );
+        assert!(om_after_er.contains("Sender=UAT1.WOZINGA.UD.00"));
+        assert!(om_after_er.contains("Target=UAT1.CDC.UD"));
+        let er_idx = om_after_er
+            .rfind("FIX IN ExecutionReport (35=8)")
+            .expect("IN ExecutionReport header");
+        let er_slice = &om_after_er[er_idx..];
+        assert!(
+            er_slice.contains("8=FIX.4.4|") && er_slice.contains("|10="),
+            "inbound ExecutionReport body must be a complete pipe-delimited frame, not hex/truncated: {}",
+            &er_slice[..er_slice.len().min(400)]
+        );
+        assert!(
+            !er_slice[..er_slice.find('\n').unwrap_or(er_slice.len())].contains("hex"),
+            "header must not be a hex dump"
+        );
+
+        let before_status = command_log_len(COMMAND_LOG_OM);
+        session.order_status_request(&cl_ord_id, "BTC_USDT").await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == 'j').await?;
+        let om_after_j = wait_for_new_log_contains(
+            COMMAND_LOG_OM,
+            before_status,
+            &[
+                "FIX IN BusinessMessageReject (35=j)",
+                "35=j|",
+                "372=H|",
+                "380=3|",
+                "Sender=",
+                "Target=CLIENT",
+                " UTC] FIX IN BusinessMessageReject",
+            ],
+        );
+        let j_idx = om_after_j
+            .rfind("FIX IN BusinessMessageReject (35=j)")
+            .expect("IN BusinessMessageReject header");
+        let j_slice = &om_after_j[j_idx..];
+        assert!(j_slice.contains("8=FIX.4.4|") && j_slice.contains("|10="));
+
+        let before_logout = command_log_len(COMMAND_LOG_OM);
+        session.logout().await?;
+        // Pump immediately after logout — receive_message does not check
+        // is_connected, but the mock closes after sending inbound 35=5.
+        let _ = pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '5').await;
+        let om_after_logout = wait_for_new_log_contains(
+            COMMAND_LOG_OM,
+            before_logout,
+            &[
+                "FIX IN Logout (35=5)",
+                "Sender=",
+                "Target=CLIENT",
+                " UTC] FIX IN Logout",
+            ],
+        );
+        let lo_idx = om_after_logout
+            .rfind("FIX IN Logout (35=5)")
+            .expect("IN Logout header");
+        let lo_slice = &om_after_logout[lo_idx..];
+        assert!(lo_slice.contains("8=FIX.4.4|") && lo_slice.contains("|10="));
+
+        cleanup_processed(&cl_ord_id);
+        Ok(())
+    }
+
+    /// AC4: MD CompIDs (`.MD` only, no `.UD`) still route outbound to
+    /// `fix_commands.log`, not the OM file.
+    #[test]
+    fn md_outbound_still_routes_to_fix_commands_log() {
+        let marker = format!("MD_ROUTE_{}", std::process::id());
+        let mut msg = FIXMessage::new('V', "UAT1.WOZINGA.MD.00", "UAT1.CDC.MD", 1);
+        msg.set_field(tags::MARKET_DATA_REQ_ID, &marker);
+        let encoded = msg.encode().expect("encode MD request");
+        let before = command_log_len(COMMAND_LOG_MD);
+        FIXSession::log_fix_command(&msg, &encoded, Direction::Outbound);
+        let contents = wait_for_new_log_contains(
+            COMMAND_LOG_MD,
+            before,
+            &[
+                "FIX OUT MarketDataRequest (35=V)",
+                &marker,
+                "Sender=UAT1.WOZINGA.MD.00",
+                "Target=UAT1.CDC.MD",
+            ],
+        );
+        assert!(contents.contains(&marker));
     }
 }
