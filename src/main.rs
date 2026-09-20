@@ -863,6 +863,27 @@ impl FIXSession {
         Ok(())
     }
 
+    /// Snapshot the API working set and send OrderStatusRequest (35=H)
+    /// for each locally-open ClOrdID. Per-row send errors are logged and
+    /// skipped; the pass always returns Ok(()) after attempting every row.
+    /// Does not wait for replies — inbound 35=8 is applied by the existing
+    /// handle_message '8' arm once the receive loop (or test pump) runs.
+    pub async fn reconcile_open_orders(&self) -> Result<()> {
+        let open = self.open_orders.get_open_orders();
+        for order in open {
+            if let Err(e) = self
+                .order_status_request(&order.cl_ord_id, &order.symbol)
+                .await
+            {
+                warn!(
+                    "Failed to send OrderStatusRequest (35=H) for ClOrdID {}: {}",
+                    order.cl_ord_id, e
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Cancel an order using OrderCancelRequest (35=F)
     pub async fn cancel_order(&self, cancel_request: &CancelOrderRequest) -> Result<()> {
         if !self.is_ready().await {
@@ -2795,6 +2816,13 @@ async fn message_loop(
             warn!("❌ Logon ACK not received from gateway - connection rejected");
             sleep(Duration::from_secs(5)).await;
             continue;
+        }
+
+        // After Ready + 50ms, before select!: re-ask the venue about every
+        // locally-open ClOrdID. First connect is a no-op (empty store).
+        // Fail-open: a reconcile Err must not tear down this session iteration.
+        if let Err(e) = session.reconcile_open_orders().await {
+            warn!("Open-order reconciliation after logon failed: {}", e);
         }
 
         info!("🔗 Connection established - waiting for messages");
@@ -7087,6 +7115,87 @@ mod connectivity_tests {
         Ok(())
     }
 
+    /// Reconcile local open-order state with the venue: a ClOrdID the mock
+    /// never saw (ghost, seeded only into the client store) is evicted after
+    /// the rejecting ExecutionReport is applied, while a legitimately open
+    /// order survives the same pass.
+    #[tokio::test]
+    async fn reconcile_open_orders_evicts_ghost_and_keeps_live() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig::default(),
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        let survivor = "RECON_SURVIVOR";
+        session
+            .new_order_single(survivor, "BTC_USDT", '1', 1.0, 100.0)
+            .await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+        assert!(
+            session.open_orders.snapshot().get(survivor).is_some(),
+            "survivor must be in the client store after the New ack"
+        );
+
+        let ghost = "RECON_GHOST";
+        session.open_orders.update_order(
+            ghost.to_string(),
+            OpenOrder {
+                cl_ord_id: ghost.to_string(),
+                order_id: format!("SRV_{}", ghost),
+                exec_id: format!("EXEC_{}", ghost),
+                symbol: "BTC_USDT".to_string(),
+                side: "1".to_string(),
+                order_qty: "1.0".to_string(),
+                price: "100.0".to_string(),
+                ord_status: "0".to_string(),
+                exec_type: "0".to_string(),
+                cum_qty: "0".to_string(),
+                leaves_qty: "1.0".to_string(),
+                last_px: String::new(),
+                last_qty: String::new(),
+                avg_px: String::new(),
+                transact_time: String::new(),
+                order_create_time: String::new(),
+                rejection_reason: String::new(),
+            },
+        );
+        assert!(
+            session.open_orders.snapshot().get(ghost).is_some(),
+            "ghost must be in the client store before reconcile"
+        );
+
+        session.reconcile_open_orders().await?;
+        let mut reports = 0u8;
+        let pumped = pump_messages(&session, Duration::from_secs(3), |msg| {
+            if msg.msg_type == '8' {
+                reports += 1;
+            }
+            reports >= 2
+        })
+        .await?;
+        assert!(
+            pumped.is_some(),
+            "expected both venue ExecutionReports (ghost reject + survivor status) after reconcile"
+        );
+
+        assert!(
+            session.open_orders.snapshot().get(ghost).is_none(),
+            "ghost ClOrdID unknown to the venue must be removed after reconcile"
+        );
+        assert!(
+            session.open_orders.snapshot().get(survivor).is_some(),
+            "legitimately open order must survive reconcile"
+        );
+
+        cleanup_processed(survivor);
+        cleanup_processed(ghost);
+        Ok(())
+    }
+
     /// AC2, wired end-to-end (network-level): the mock silently drops one
     /// MarketDataIncrementalRefresh, inducing a real MsgSeqNum gap on the
     /// wire. `FIXSession::handle_message` must detect it, request recovery,
@@ -7279,7 +7388,9 @@ mod connectivity_tests {
         );
 
         let before_status = command_log_len(COMMAND_LOG_OM);
-        session.order_status_request(&cl_ord_id, "BTC_USDT").await?;
+        // 35=H is now handled by the mock (OrderStatusRequest → ExecutionReport),
+        // so drive BMR coverage with still-unhandled SecurityListRequest (35=x).
+        session.security_list_request("SEC_LIST_BMR").await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == 'j').await?;
         let om_after_j = wait_for_new_log_contains(
             COMMAND_LOG_OM,
@@ -7287,7 +7398,7 @@ mod connectivity_tests {
             &[
                 "FIX IN BusinessMessageReject (35=j)",
                 "35=j|",
-                "372=H|",
+                "372=x|",
                 "380=3|",
                 "Sender=",
                 "Target=CLIENT",

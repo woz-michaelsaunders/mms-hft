@@ -302,6 +302,35 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
                     send(&mut socket, &resp).await?;
                     return Ok(());
                 }
+                'H' => {
+                    // OrderStatusRequest. Lookup ClOrdID in the mock venue book.
+                    let cl_ord_id = msg.get_field(tags::CL_ORD_ID).unwrap_or_default().to_string();
+                    let order = orders.lock().await.get(&cl_ord_id).cloned();
+
+                    let mut resp = next_message(&out_seq, &config, '8').await;
+                    resp.set_field(tags::CL_ORD_ID, &cl_ord_id); // MUST echo 11
+
+                    if let Some(o) = order {
+                        // Found — still working. 150=I must NOT be 8/4/2; LeavesQty must be > 0.
+                        resp.set_field(tags::ORDER_ID, &format!("SRV_{}", cl_ord_id));
+                        resp.set_field(tags::EXEC_ID, &format!("EXEC_{}", cl_ord_id));
+                        resp.set_field(150, "I"); // ExecType = Order Status
+                        resp.set_field(tags::ORD_STATUS, "0"); // OrdStatus = New
+                        resp.set_field(tags::SYMBOL, &o.symbol);
+                        resp.set_field(tags::SIDE, &o.side);
+                        resp.set_field(tags::PRICE, &o.price);
+                        resp.set_field(tags::ORDER_QTY, &o.qty);
+                        resp.set_field(tags::LEAVES_QTY, &o.qty);
+                        resp.set_field(14, "0"); // CumQty — same as 'D' New ack
+                    } else {
+                        // Not found — unknown to venue. Eviction key is 150=8 + LeavesQty=0 + tag 11.
+                        resp.set_field(150, "8"); // ExecType = Rejected
+                        resp.set_field(tags::ORD_STATUS, "8"); // OrdStatus = Rejected
+                        resp.set_field(tags::LEAVES_QTY, "0");
+                        resp.set_field(tags::TEXT, "Unknown order");
+                    }
+                    send(&mut socket, &resp).await?;
+                }
                 other => {
                     info!("Mock gateway: unhandled message type '{}', sending BusinessMessageReject", other);
                     let ref_seq = msg.get_field(tags::MSG_SEQ_NUM).unwrap_or("0");
@@ -398,23 +427,28 @@ async fn stream_incrementals(
 /// Extract one complete FIX message (returns the message plus the number of
 /// bytes it consumed from `buf`) if `buf` currently holds one, else `None`.
 fn try_extract(buf: &[u8]) -> Option<(FIXMessage, usize)> {
-    let s = String::from_utf8_lossy(buf);
-    if !s.starts_with("8=") {
+    // Frame exactly one FIX message from the front of the buffer, using
+    // BodyLength (9). Locating the checksum with rfind("10=") over the whole
+    // buffer consumes every coalesced frame as one message — reconcile sends
+    // sequential 35=H and those land in a single TCP read.
+    const SOH: u8 = 0x01;
+    const TRAILER_LEN: usize = 7; // "10=" + 3 digits + SOH
+    if buf.len() < 10 || !buf.starts_with(b"8=") {
         return None;
     }
-    let pos = s.find("9=")?;
-    let after = &s[pos + 2..];
-    let end = after.find('\x01')?;
-    let body_len: usize = after[..end].parse().ok()?;
-    let body_start = pos + s[pos..].find('\x01')? + 1;
-    let checksum_search_start = body_start + body_len;
-    let last_10 = s.rfind("10=")?;
-    if last_10 < checksum_search_start {
+    let p1 = buf.iter().position(|&b| b == SOH)?;
+    if buf.len() < p1 + 3 || &buf[p1 + 1..p1 + 3] != b"9=" {
         return None;
     }
-    let checksum_end = s[last_10..].find('\x01')?;
-    let message_end = last_10 + checksum_end + 1;
+    let rel = buf[p1 + 3..].iter().position(|&b| b == SOH)?;
+    let p2 = p1 + 3 + rel;
+    let body_len: usize = std::str::from_utf8(&buf[p1 + 3..p2]).ok()?.parse().ok()?;
+    let trailer_start = p2 + 1 + body_len;
+    let message_end = trailer_start + TRAILER_LEN;
     if buf.len() < message_end {
+        return None;
+    }
+    if &buf[trailer_start..trailer_start + 3] != b"10=" || buf[message_end - 1] != SOH {
         return None;
     }
     let msg = FIXMessage::decode(&buf[..message_end]).ok()?;
