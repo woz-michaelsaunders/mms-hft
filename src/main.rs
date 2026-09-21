@@ -1,13 +1,13 @@
 mod fix_protocol;
 mod order_book;
 mod order_book_buffer;
-mod kdb_integration;
 mod sequencer;
 mod order_events;
 #[cfg(test)]
 mod mock_gateway;
-pub mod algo;
+mod algo_runtime;
 
+use fix_server::{algo, kdb_integration, kdb_query};
 use anyhow::{anyhow, bail, Result};
 use fix_protocol::{FIXMessage, tags};
 use log::{info, error, warn};
@@ -4571,14 +4571,12 @@ fn calibration_result_paths(name: &str) -> (String, String) {
 
 /// kdb_ns = unix_ms * 1_000_000 - KDB_TIMESTAMP_OFFSET_NS, checked.
 fn unix_ms_to_kdb_ns(ms: i64) -> Result<i64, CalibrateHttpError> {
-    ms.checked_mul(1_000_000)
-        .and_then(|ns| ns.checked_sub(kdb_integration::KDB_TIMESTAMP_OFFSET_NS))
-        .ok_or(CalibrateHttpError::BoundsNotIntegers)
+    kdb_query::unix_ms_to_kdb_ns(ms).ok_or(CalibrateHttpError::BoundsNotIntegers)
 }
 
 /// The ONLY q timestamp fragment. `n` is the checked i64, never the query string.
 fn kdb_ts_atom(n: i64) -> String {
-    format!("`timestamp${}j", n)
+    kdb_query::kdb_ts_atom(n)
 }
 
 fn parse_csv_f64_bounded(
@@ -4631,31 +4629,7 @@ fn grid_product(
 }
 
 fn snapshots_from_kdb_json(raw_json: &str) -> Vec<algo::Snapshot> {
-    serde_json::from_str::<serde_json::Value>(raw_json)
-        .ok()
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|row| {
-            let timestamp_ms = row.get("time").and_then(|v| v.as_i64())?;
-            let best_bid = row.get("best_bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let best_ask = row.get("best_ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let best_bid_size = row.get("best_bid_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let best_ask_size = row.get("best_ask_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            if best_bid > 0.0 && best_ask > 0.0 {
-                Some(algo::Snapshot {
-                    timestamp_ms,
-                    best_bid,
-                    best_ask,
-                    best_bid_size,
-                    best_ask_size,
-                    ..Default::default()
-                })
-            } else {
-                None
-            }
-        })
-        .collect()
+    kdb_query::snapshots_from_kdb_json(raw_json)
 }
 
 fn parse_kdb_count_c(raw_json: &str) -> Option<i64> {
@@ -4834,7 +4808,8 @@ async fn order_book_web_server(
     market_data_session: Arc<FIXSession>,  // Market data session (has order books for web display)
     market_data_sessions: Vec<(Arc<FIXSession>, String, u16)>,  // All market data sessions for status API
     kdb_writer: Arc<KdbWriter>,  // kdb+ connection for historical queries
-    algo: Arc<algo::TradingAlgo>,  // Trading algorithm
+    algo: Arc<algo::TradingAlgo>,  // Trading algorithm (SpreadCapture — bound to /api/algo/*)
+    algo_imbalance: Arc<algo::TradingAlgo>,  // MarketImbalance shadow — status only
     bind_addr: &str,
 ) -> Result<()> {
     use serde::Deserialize;
@@ -4856,6 +4831,7 @@ async fn order_book_web_server(
         all_symbols: Vec<String>,  // All symbols to subscribe to
         kdb: Arc<KdbWriter>,  // kdb+ connection for historical queries
         algo: Arc<algo::TradingAlgo>,  // Trading algorithm
+        algo_imbalance: Arc<algo::TradingAlgo>,
         calibrate_lock: Arc<tokio::sync::Mutex<()>>,
     }
     
@@ -4881,6 +4857,7 @@ async fn order_book_web_server(
         all_symbols: all_symbols_list.clone(),
         kdb: Arc::clone(&kdb_writer),
         algo: Arc::clone(&algo),
+        algo_imbalance: Arc::clone(&algo_imbalance),
         calibrate_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     
@@ -5070,7 +5047,7 @@ async fn order_book_web_server(
     // Build a WHERE predicate that safely handles symbols with punctuation by
     // constructing a symbol atom via `$"..."` instead of raw backtick literals.
     fn build_kdb_symbol_predicate(symbol: &str) -> String {
-        format!("symbol=`$\"{}\"", kdb_integration::escape_kdb_string(symbol))
+        kdb_query::kdb_symbol_predicate(symbol)
     }
 
     // GET /api/history/:symbol — last 500 best-bid/ask snapshots for a symbol (from kdb+)
@@ -5251,6 +5228,16 @@ async fn order_book_web_server(
     ) -> Json<serde_json::Value> {
         state.algo.update_config(new_cfg).await;
         Json(serde_json::json!({"ok": true}))
+    }
+
+    // GET /api/shadow/status — paper P&L for both shadow instances. No POST.
+    async fn get_shadow_status_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> axum::Json<algo::ShadowStatus> {
+        axum::Json(algo::ShadowStatus {
+            spread_capture: state.algo.status().await,
+            market_imbalance: state.algo_imbalance.status().await,
+        })
     }
 
     // Load historical snapshots from data/snapshots.csv.
@@ -5782,6 +5769,7 @@ async fn order_book_web_server(
         .route("/api/algo/enable", post(algo_enable_api))
         .route("/api/algo/disable", post(algo_disable_api))
         .route("/api/algo/config", post(algo_config_api))
+        .route("/api/shadow/status", get(get_shadow_status_api))
         .route("/api/backtest", get(get_backtest_api))
         .route("/api/backtest/sweep", get(get_backtest_sweep_api))
         .route("/api/backtest/calibrate", get(get_backtest_calibrate_api))
@@ -6327,13 +6315,38 @@ async fn main() -> Result<()> {
 
     // algo + web only if OM Some AND primary MD Some
     if let (Some(om_h), Some(md_h)) = (om.clone(), primary_md.clone()) {
-        let algo = Arc::new(algo::TradingAlgo::new(algo::AlgoConfig::default()));
+        let mut sc_cfg = algo::AlgoConfig::default();
+        sc_cfg.enabled = true; // spawn override only; Default.enabled stays false
+        let algo = Arc::new(algo::TradingAlgo::new(sc_cfg));
+
+        let mut mi_cfg = algo::AlgoConfig::default();
+        mi_cfg.strategy = algo::StrategyType::MarketImbalance;
+        mi_cfg.enabled = true;
+        let algo_imbalance = Arc::new(algo::TradingAlgo::new(mi_cfg));
+        info!("MarketImbalance shadow started (paper_mode=true); not bound to /api/algo/*");
+
         let algo_for_web = Arc::clone(&algo);
+        let algo_imbalance_for_web = Arc::clone(&algo_imbalance);
         let algo_order_session = Arc::clone(&om_h);
         let algo_market_session = Arc::clone(&md_h);
         let algo_positions = Arc::clone(&om_h.positions);
-        let _algo_handle = tokio::spawn(async move {
-            algo.run(algo_order_session, algo_market_session, algo_positions).await;
+        let _algo_handle = tokio::spawn({
+            let algo = Arc::clone(&algo);
+            let om = Arc::clone(&algo_order_session);
+            let md = Arc::clone(&algo_market_session);
+            let pos = Arc::clone(&algo_positions);
+            async move {
+                algo_runtime::run(algo, om, md, pos).await;
+            }
+        });
+        let _algo_imbalance_handle = tokio::spawn({
+            let algo = Arc::clone(&algo_imbalance);
+            let om = Arc::clone(&algo_order_session);
+            let md = Arc::clone(&algo_market_session);
+            let pos = Arc::clone(&algo_positions);
+            async move {
+                algo_runtime::run(algo, om, md, pos).await;
+            }
         });
 
         let order_session_for_web = Arc::clone(&om_h);
@@ -6347,6 +6360,7 @@ async fn main() -> Result<()> {
                 market_data_sessions_for_web,
                 kdb_for_web,
                 algo_for_web,
+                algo_imbalance_for_web,
                 "0.0.0.0:8080",
             )
             .await
@@ -8182,6 +8196,109 @@ mod connectivity_tests {
         );
         assert_eq!(session.drain_capture_probe().len(), 0, "drain is destructive; second drain empty");
         let _ = session1_count;
+        Ok(())
+    }
+
+    /// Both shadow algos paper-fill against a two-sided mock book; neither ever
+    /// emits 35=D (NewOrderSingle). MarketImbalance's aggressive-cross signals
+    /// stay inside paper_step.
+    #[tokio::test]
+    async fn shadow_mode_both_strategies_never_send_orders() -> Result<()> {
+        let orders_received = Arc::new(Mutex::new(0u64));
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                orders_received: Some(Arc::clone(&orders_received)),
+                snapshot_bbo: Some(mock_gateway::MockBbo {
+                    bid: 100.0,
+                    ask: 100.5,
+                    bid_size: 7.0,
+                    ask_size: 3.0,
+                }),
+                followup_bbo: Some(mock_gateway::MockBbo {
+                    bid: 100.49,
+                    ask: 100.51,
+                    bid_size: 7.0,
+                    ask_size: 3.0,
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = Arc::new(FIXSession::new("TEST.SHADOW", "MOCK.VENUE"));
+        connect_and_logon(&session, port).await?;
+
+        let pump_session = Arc::clone(&session);
+        let pump = tokio::spawn(async move {
+            let _ = pump_messages(&pump_session, Duration::from_secs(5), |_| false).await;
+        });
+
+        session.market_data_request("BTC_USDT", 10).await?;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if Instant::now() > deadline {
+                pump.abort();
+                return Err(anyhow!("timed out waiting for two-sided mock book"));
+            }
+            if let Some((bid, ask, _)) = session.get_best_quote("BTC_USDT").await {
+                if bid > 0.0 && ask > bid {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let mut sc_cfg = algo::AlgoConfig::default();
+        sc_cfg.enabled = true;
+        sc_cfg.poll_interval_ms = 50;
+        sc_cfg.max_book_staleness_ms = 0;
+        let sc = Arc::new(algo::TradingAlgo::new(sc_cfg));
+
+        let mut mi_cfg = algo::AlgoConfig::default();
+        mi_cfg.strategy = algo::StrategyType::MarketImbalance;
+        mi_cfg.enabled = true;
+        mi_cfg.poll_interval_ms = 50;
+        mi_cfg.max_book_staleness_ms = 0;
+        let mi = Arc::new(algo::TradingAlgo::new(mi_cfg));
+
+        let sc_run = {
+            let a = Arc::clone(&sc);
+            let om = Arc::clone(&session);
+            let md = Arc::clone(&session);
+            let pos = Arc::clone(&session.positions);
+            tokio::spawn(async move { algo_runtime::run(a, om, md, pos).await })
+        };
+        let mi_run = {
+            let a = Arc::clone(&mi);
+            let om = Arc::clone(&session);
+            let md = Arc::clone(&session);
+            let pos = Arc::clone(&session.positions);
+            tokio::spawn(async move { algo_runtime::run(a, om, md, pos).await })
+        };
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let sc_st = sc.status().await;
+        let mi_st = mi.status().await;
+        assert!(
+            sc_st.paper_fills >= 1,
+            "SpreadCapture paper_fills expected >= 1, got {}",
+            sc_st.paper_fills
+        );
+        assert!(
+            mi_st.paper_fills >= 1,
+            "MarketImbalance paper_fills expected >= 1, got {}",
+            mi_st.paper_fills
+        );
+        assert_eq!(sc_st.orders_placed, 0);
+        assert_eq!(mi_st.orders_placed, 0);
+        assert_eq!(*orders_received.lock().await, 0);
+
+        sc_run.abort();
+        mi_run.abort();
+        pump.abort();
         Ok(())
     }
 }

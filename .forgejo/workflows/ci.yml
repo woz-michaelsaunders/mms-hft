@@ -134,5 +134,6 @@ jobs:
           path: |
             target/release/fix_server
             target/release/fix_console
+            target/release/shadow_report
             sbom.cdx.json
             sbom.spdx.json

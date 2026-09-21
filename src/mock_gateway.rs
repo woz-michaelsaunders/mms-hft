@@ -45,6 +45,20 @@ pub struct MockGatewayConfig {
     pub test_request_after_logon: Option<String>,
     /// Optional recorder of symbols requested via MarketDataRequest (35=V).
     pub md_requested_symbols: Option<Arc<Mutex<Vec<String>>>>,
+    /// Optional counter of inbound NewOrderSingle (35=D). Incremented before ExecReport.
+    pub orders_received: Option<Arc<Mutex<u64>>>,
+    /// Optional two-sided snapshot BBO (prices + sizes) sent on 35=V.
+    pub snapshot_bbo: Option<MockBbo>,
+    /// Optional second 35=W after the snapshot, delayed so paper SC can rest quotes first.
+    pub followup_bbo: Option<MockBbo>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MockBbo {
+    pub bid: f64,
+    pub ask: f64,
+    pub bid_size: f64,
+    pub ask_size: f64,
 }
 
 impl Default for MockGatewayConfig {
@@ -56,6 +70,9 @@ impl Default for MockGatewayConfig {
             disconnect_after_messages: None,
             test_request_after_logon: None,
             md_requested_symbols: None,
+            orders_received: None,
+            snapshot_bbo: None,
+            followup_bbo: None,
         }
     }
 }
@@ -187,6 +204,9 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
                     send(&mut socket, &resp).await?;
                 }
                 'D' => {
+                    if let Some(counter) = &config.orders_received {
+                        *counter.lock().await += 1;
+                    }
                     let cl_ord_id = msg.get_field(tags::CL_ORD_ID).unwrap_or_default().to_string();
                     let symbol = msg.get_field(tags::SYMBOL).unwrap_or_default().to_string();
                     let side = msg.get_field(tags::SIDE).unwrap_or_default().to_string();
@@ -284,7 +304,29 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
                         rec.lock().await.push(symbol.clone());
                     }
 
-                    send_snapshot(&mut socket, &out_seq, &config, &symbol, &md_req_id, 100.0, 100.5).await?;
+                    let (bid, ask, bid_sz, ask_sz) = match &config.snapshot_bbo {
+                        Some(b) => (b.bid, b.ask, b.bid_size, b.ask_size),
+                        None => (100.0, 100.5, 1.0, 1.0),
+                    };
+                    send_snapshot(&mut socket, &out_seq, &config, &symbol, &md_req_id, bid, ask, bid_sz, ask_sz).await?;
+
+                    if let Some(follow) = &config.followup_bbo {
+                        // Delay so a paper SpreadCapture instance can rest quotes on the
+                        // first book before the crossing snapshot arrives.
+                        sleep(Duration::from_millis(200)).await;
+                        send_snapshot(
+                            &mut socket,
+                            &out_seq,
+                            &config,
+                            &symbol,
+                            &md_req_id,
+                            follow.bid,
+                            follow.ask,
+                            follow.bid_size,
+                            follow.ask_size,
+                        )
+                        .await?;
+                    }
 
                     if config.md_ticks_to_stream > 0 {
                         stream_incrementals(&mut socket, &out_seq, &config, &symbol, &md_req_id, &gap_already_used).await?;
@@ -302,7 +344,7 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
                     reset.set_field(tags::GAP_FILL_FLAG, "Y");
                     send(&mut socket, &reset).await?;
 
-                    send_snapshot(&mut socket, &out_seq, &config, "BTC_USDT", "resync", 100.0, 100.5).await?;
+                    send_snapshot(&mut socket, &out_seq, &config, "BTC_USDT", "resync", 100.0, 100.5, 1.0, 1.0).await?;
                 }
                 '5' => {
                     let resp = next_message(&out_seq, &config, '5').await;
@@ -380,6 +422,8 @@ async fn send_snapshot(
     md_req_id: &str,
     bid: f64,
     ask: f64,
+    bid_size: f64,
+    ask_size: f64,
 ) -> Result<()> {
     let mut snapshot = next_message(out_seq, config, 'W').await;
     snapshot.set_field(tags::MARKET_DATA_REQ_ID, md_req_id);
@@ -387,10 +431,10 @@ async fn send_snapshot(
     snapshot.set_field(268, "2"); // NoMDEntries
     snapshot.set_field(269, "0"); // MDEntryType = Bid
     snapshot.set_field(270, &bid.to_string());
-    snapshot.set_field(271, "1.0");
+    snapshot.set_field(271, &bid_size.to_string());
     snapshot.set_field(269, "1"); // MDEntryType = Ask
     snapshot.set_field(270, &ask.to_string());
-    snapshot.set_field(271, "1.0");
+    snapshot.set_field(271, &ask_size.to_string());
     send(socket, &snapshot).await
 }
 

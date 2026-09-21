@@ -48,7 +48,7 @@ jobs:
         id: stage
         run: |
           mkdir -p dist
-          cp target/release/fix_server target/release/fix_console dist/
+          cp target/release/fix_server target/release/fix_console target/release/shadow_report dist/
           cp sbom.cdx.json sbom.spdx.json dist/
           cd dist && sha256sum * > SHA256SUMS && cd ..
           VERSION="${GITHUB_REF_NAME:-$(git rev-parse --short HEAD)}"
@@ -64,7 +64,8 @@ jobs:
             "predicateType": "https://slsa.dev/provenance/v0.2",
             "subject": [
               {"name": "fix_server", "digest": {"sha256": "$(sha256sum dist/fix_server | cut -d' ' -f1)"}},
-              {"name": "fix_console", "digest": {"sha256": "$(sha256sum dist/fix_console | cut -d' ' -f1)"}}
+              {"name": "fix_console", "digest": {"sha256": "$(sha256sum dist/fix_console | cut -d' ' -f1)"}},
+              {"name": "shadow_report", "digest": {"sha256": "$(sha256sum dist/shadow_report | cut -d' ' -f1)"}}
             ],
             "predicate": {
               "builder": {"id": "${{ github.server_url }}/${{ github.repository }}/actions"},

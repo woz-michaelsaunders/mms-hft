@@ -12,7 +12,7 @@ use kxkdb::qtype;
 use std::collections::VecDeque;
 
 /// kdb+ epoch offset in nanoseconds (nanoseconds from Unix epoch 1970-01-01 to kdb+ epoch 2000-01-01)
-pub(crate) const KDB_TIMESTAMP_OFFSET_NS: i64 = 946_684_800_000_000_000_i64;
+pub const KDB_TIMESTAMP_OFFSET_NS: i64 = 946_684_800_000_000_000_i64;
 
 /// Maximum entries in each write buffer.  If this is exceeded (e.g. kdb+ is slow or
 /// temporarily disconnected) the oldest half is dropped with a warning so we never
@@ -112,7 +112,6 @@ struct CaptureGap {
     gap_size: u32,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeEvent {
     PendingMdIo { kind: &'static str, symbol: String, seq_num: Option<u32> },
@@ -137,7 +136,6 @@ pub struct KdbWriter {
     // Batch size thresholds
     batch_size: usize,
 
-    #[cfg(test)]
     probe: Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
 }
 
@@ -154,7 +152,6 @@ impl KdbWriter {
             own_trade_buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             capture_gap_buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             batch_size: 100, // Flush when buffer reaches 100 items
-            #[cfg(test)]
             probe: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -944,9 +941,18 @@ impl KdbWriter {
         Self::k_table_to_json(&k)
     }
 
+    pub fn record_probe(&self, ev: ProbeEvent) {
+        self.probe.lock().unwrap().push(ev.clone());
+        log::info!("PROBE {:?}", ev);
+    }
+
+    pub fn drain_probe(&self) -> Vec<ProbeEvent> {
+        std::mem::take(&mut *self.probe.lock().unwrap())
+    }
+
     /// Convert a kxkdb TABLE K object to a JSON array string.
     /// Handles columns of type: timestamp (12), float (9), symbol (11), long (7).
-    fn k_table_to_json(k: &K) -> Result<String> {
+    pub(crate) fn k_table_to_json(k: &K) -> Result<String> {
         // A TABLE in kxkdb is a flip of a dictionary.
         // get_dictionary() returns the underlying [keys: symbol_list, values: compound_list]
         let dict_k = k.get_dictionary()
@@ -1080,17 +1086,37 @@ impl KdbWriter {
     }
 }
 
+/// Connect, run one SELECT, convert via `k_table_to_json`, drop the stream.
+/// MUST NOT call initialize_tables / ensureCol / start_flush_task / start_reconnect_task.
+pub async fn query_table_once(host: &str, port: u16, q: &str) -> anyhow::Result<String> {
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        QStream::connect(ConnectionMethod::TCP, host, port, ""),
+    )
+    .await
+    .map_err(|_| anyhow!("kdb connect timed out after 5s"))?
+    .map_err(|e| anyhow!("kdb connect failed: {}", e))?;
+
+    let k = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        stream.send_sync_message(&q),
+    )
+    .await
+    .map_err(|_| anyhow!("kdb query timed out after 120s"))?
+    .map_err(|e| anyhow!("kdb query error: {}", e))?;
+
+    if k.get_type() == qtype::ERROR {
+        let err_msg = k.get_error_string().unwrap_or("unknown error");
+        return Err(anyhow!("kdb+ error: '{}", err_msg));
+    }
+    if k.get_type() != qtype::TABLE {
+        return Err(anyhow!("kdb+ returned non-table type {}: {}", k.get_type(), k));
+    }
+    KdbWriter::k_table_to_json(&k)
+}
+
 #[cfg(test)]
 impl KdbWriter {
-    pub fn record_probe(&self, ev: ProbeEvent) {
-        self.probe.lock().unwrap().push(ev.clone());
-        log::info!("PROBE {:?}", ev);
-    }
-
-    pub fn drain_probe(&self) -> Vec<ProbeEvent> {
-        std::mem::take(&mut *self.probe.lock().unwrap())
-    }
-
     pub(crate) async fn level_buffer_len(&self) -> usize {
         self.level_buffer.lock().await.len()
     }
