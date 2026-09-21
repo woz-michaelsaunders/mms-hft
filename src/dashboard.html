@@ -624,8 +624,14 @@
         }
         .md-chips {
             display: grid;
-            grid-template-columns: 1fr;
+            grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
             gap: var(--space-2);
+            min-width: 0;
+        }
+        .md-chips[hidden] { display: none !important; }
+        .md-strip .house-empty {
+            flex: none;
+            min-height: calc(var(--space-8) * 2);
         }
         .md-chip {
             background: var(--surface-2);
@@ -725,14 +731,7 @@
             .md-strip { padding: var(--space-2) var(--space-3); gap: var(--space-2); }
             .md-strip-head { flex-direction: column; }
             .md-strip-lead { max-width: none; }
-            .md-chips { grid-template-columns: 1fr; }
-            .md-chip {
-                flex-direction: row;
-                flex-wrap: wrap;
-                align-items: center;
-                padding: var(--space-2) var(--space-3);
-            }
-            .md-chip-title { flex: 1; min-width: 0; }
+            .md-chip { padding: var(--space-2) var(--space-3); }
             .md-chip-meta { display: none; }
             .chart-fixed { height: calc(var(--space-8) * 3); }
         }
@@ -740,11 +739,9 @@
             .live-main { flex-wrap: wrap; }
             .order-book-side { flex: 1 1 45%; }
             .trades-panel { flex: 1 1 100%; }
-            .md-chips { grid-template-columns: 1fr 1fr; }
         }
         @media (min-width: 1280px) {
             .live-main { flex-wrap: nowrap; }
-            .md-chips { grid-template-columns: repeat(4, 1fr); }
         }
     </style>
 </head>
@@ -776,11 +773,14 @@
                     <h2 class="md-strip-title">Market data sessions</h2>
                     <p class="md-strip-lead">Live session health, sampled without waiting on book locks. A skipped sample is not a down session — poll again.</p>
                 </div>
-                <button type="button" class="house-btn house-btn-secondary" id="mdStatusRefreshBtn" disabled>Check sessions</button>
+                <button type="button" class="house-btn house-btn-primary" id="mdStatusRefreshBtn" disabled>Check sessions</button>
             </div>
             <div id="mdStatusBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
                 <p class="house-banner-title">Loading market-data sessions</p>
                 <p class="house-banner-text">Checking FIX session health now.</p>
+            </div>
+            <div id="mdStatusEmpty" class="house-empty" hidden>
+                <p>Use Check sessions after the process is up. This strip lists every market-data FIX session from config.</p>
             </div>
             <div id="mdStatusChips" class="md-chips" role="list">
                 <article class="md-chip" role="listitem">
@@ -1970,9 +1970,38 @@
             }
             return { cls: 'pending', label: 'State unknown' };
         }
+        const MD_SESSION_LABELS = {
+            uat_md_btc: 'BTC market data',
+            uat_md_eth: 'ETH market data',
+            uat_md_others_34405: 'Others 0-9, A-D',
+            uat_md_others_34406: 'Others E-M',
+            uat_md_others_34407: 'Others N-Z',
+            prd3_md_btc: 'BTC market data',
+            prd3_md_eth: 'ETH market data',
+            prd3_md_others_34405: 'Others 0-9, A-D',
+            prd3_md_others_34406: 'Others E-M',
+            prd3_md_others_34407: 'Others N-Z'
+        };
+        function mdSessionLabel(session) {
+            if (session && session.label) return String(session.label);
+            const name = (session && session.description) ? String(session.description) : '';
+            if (!name) return 'Session';
+            if (MD_SESSION_LABELS[name]) return MD_SESSION_LABELS[name];
+            const human = name.replace(/_/g, ' ').trim();
+            return human ? human.charAt(0).toUpperCase() + human.slice(1) : 'Session';
+        }
+        function setMdEmpty(show, text) {
+            const empty = document.getElementById('mdStatusEmpty');
+            const chips = document.getElementById('mdStatusChips');
+            if (!empty || !chips) return;
+            empty.hidden = !show;
+            chips.hidden = !!show;
+            const p = empty.querySelector('p');
+            if (p && text) p.textContent = text;
+        }
         function renderMdSession(session) {
             const state = mdChipState(session);
-            const desc = session.description || 'Session';
+            const desc = mdSessionLabel(session);
             const portStr = session.port != null ? String(session.port) : '';
             const title = portStr && desc.indexOf(portStr) === -1 ? desc + ' · ' + portStr : desc;
             const symbols = session.symbols === null || session.symbols === undefined
@@ -1990,25 +2019,33 @@
                 '</article>';
         }
         let mdStatusInFlight = false;
-        function loadMdStatus() {
+        function loadMdStatus(opts) {
             if (mdStatusInFlight) return;
             const banner = document.getElementById('mdStatusBanner');
             const chips = document.getElementById('mdStatusChips');
             const btn = document.getElementById('mdStatusRefreshBtn');
+            const userInitiated = !!(opts && opts.userInitiated);
+            const firstPaint = chips.dataset.loaded !== '1';
+            const showLoading = userInitiated || firstPaint;
             mdStatusInFlight = true;
-            btn.disabled = true;
-            setBanner(banner, 'info', 'Loading market-data sessions', 'Checking FIX session health now.');
+            if (showLoading) {
+                btn.disabled = true;
+                setBanner(banner, 'info', 'Loading market-data sessions', 'Checking FIX session health now.');
+                if (firstPaint) setMdEmpty(false);
+            }
             fetch('/api/market-data-status')
                 .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
                 .then(data => {
                     const servers = data.servers || [];
                     if (!servers.length) {
                         chips.innerHTML = '';
+                        setMdEmpty(true, 'Use Check sessions after the process is up. This strip lists every market-data FIX session from config.');
                         setBanner(banner, 'neutral', 'No market-data sessions',
                             'No sessions are registered. They appear here when the server starts.');
                         return;
                     }
                     const skipped = servers.filter(s => s.status_read === 'skipped_lock_contended');
+                    setMdEmpty(false);
                     chips.innerHTML = servers.map(renderMdSession).join('');
                     if (skipped.length === servers.length) {
                         setBanner(banner, 'warning', 'Sample skipped — retrying',
@@ -2024,15 +2061,19 @@
                 })
                 .catch(err => {
                     chips.innerHTML = '';
+                    setMdEmpty(true, 'Cannot reach market-data status. Check the message above, then try Check sessions.');
                     setBanner(banner, 'error', 'Cannot reach market-data status',
                         'The process may be down or not listening. ' + err.message + '. Do not restart UAT by hand — deploy is by v* tag only.');
                 })
                 .finally(() => {
+                    chips.dataset.loaded = '1';
                     mdStatusInFlight = false;
                     btn.disabled = false;
                 });
         }
-        document.getElementById('mdStatusRefreshBtn').addEventListener('click', loadMdStatus);
+        document.getElementById('mdStatusRefreshBtn').addEventListener('click', function () {
+            loadMdStatus({ userInitiated: true });
+        });
 
         updateTotalMarkets();
         updateOrderBook({ userInitiated: true });
