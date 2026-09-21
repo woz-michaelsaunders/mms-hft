@@ -3,6 +3,10 @@ name = "fix_server"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "fix_server"
+path = "src/lib.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 bytes = "1"

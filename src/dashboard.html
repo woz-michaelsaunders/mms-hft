@@ -345,6 +345,7 @@
             max-width: min(70ch, calc(100vw - var(--space-8)));
         }
         .table-msg-error { color: var(--danger); }
+        .table-msg { overflow-wrap: anywhere; white-space: normal; }
         .table-msg-loading { color: var(--info); }
 
         .status {
@@ -674,6 +675,70 @@
         }
         .status.pending::before { background: var(--info); }
 
+        /* Shadow paper books — operator console for GET /api/shadow/status */
+        .shadow-strip {
+            display: flex;
+            flex-direction: column;
+            gap: var(--space-3);
+            min-width: 0;
+        }
+        .shadow-strip .lead { max-width: 70ch; }
+        .shadow-cards {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
+            gap: var(--space-3);
+            min-width: 0;
+        }
+        .shadow-cards[hidden] { display: none !important; }
+        .shadow-strip .house-empty {
+            flex: none;
+            min-height: calc(var(--space-8) * 2);
+        }
+        .shadow-card {
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-card);
+            padding: var(--space-4);
+            display: flex;
+            flex-direction: column;
+            align-items: stretch;
+            gap: var(--space-3);
+            min-width: 0;
+        }
+        .shadow-card-head {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: var(--space-2);
+        }
+        .shadow-card-title {
+            font-weight: 600;
+            font-size: var(--text-base);
+            margin: 0;
+            color: var(--text);
+            overflow-wrap: anywhere;
+        }
+        .shadow-card .status { align-self: flex-start; white-space: normal; }
+        .shadow-metrics {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: var(--space-3);
+        }
+        .shadow-metric-label {
+            font-size: var(--text-xs);
+            font-weight: 600;
+            color: var(--text-muted);
+            margin: 0;
+        }
+        .shadow-metric-value {
+            font-family: var(--font-mono);
+            font-size: var(--text-sm);
+            color: var(--text);
+            margin: 0;
+            overflow-wrap: anywhere;
+        }
+
         .bt-summary-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
@@ -733,6 +798,8 @@
             .md-strip-lead { max-width: none; }
             .md-chip { padding: var(--space-2) var(--space-3); }
             .md-chip-meta { display: none; }
+            .shadow-strip .lead { max-width: none; }
+            .shadow-card { padding: var(--space-3); }
             .chart-fixed { height: calc(var(--space-8) * 3); }
         }
         @media (min-width: 768px) and (max-width: 1279px) {
@@ -965,7 +1032,7 @@
                 <div class="panel-header">
                     <div>
                         <h2 class="section-title">Trading algorithm</h2>
-                        <p class="lead">Configure the strategy, then enable it. Enable is the primary action when the algo is off.</p>
+                        <p class="lead">Enable is the primary action when Spread capture is off. Enable and Disable apply to Spread capture only. Both strategies already shadow-trade in paper mode — paper fills are in Shadow mode below.</p>
                     </div>
                     <div class="btn-row">
                         <button type="button" class="house-btn house-btn-primary" id="algoEnableBtn">Enable algorithm</button>
@@ -975,9 +1042,24 @@
                 </div>
                 <div id="algoStatusBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
                     <p class="house-banner-title">Loading algorithm status</p>
-                    <p class="house-banner-text">Fetching whether the strategy is on and its last signals.</p>
+                    <p class="house-banner-text">Fetching whether Spread capture is on and its last live-path signals.</p>
                 </div>
-                <div>
+                <section class="shadow-strip" aria-labelledby="shadowTitle">
+                    <div>
+                        <h3 class="chart-caption" id="shadowTitle">Shadow mode</h3>
+                        <p class="lead">Live paper fills, position and P&amp;L for both strategies. This is not the daily backtest report. Market imbalance is not bound to Enable or Disable.</p>
+                    </div>
+                    <div id="shadowBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+                        <p class="house-banner-title">Loading shadow status</p>
+                        <p class="house-banner-text">Fetching paper fills, position and P&amp;L for both strategies.</p>
+                    </div>
+                    <div id="shadowEmpty" class="house-empty" hidden>
+                        <p>Use Refresh status after the process is up. Both shadow strategies should appear here.</p>
+                    </div>
+                    <div id="shadowCards" class="shadow-cards" role="list" hidden></div>
+                </section>
+                <fieldset id="algoForm" class="house-form">
+                    <legend class="visually-hidden">Spread capture configuration</legend>
                     <h3 class="chart-caption">Configuration</h3>
                     <div class="form-grid">
                         <label class="house-field">
@@ -1024,13 +1106,13 @@
                         <button type="button" class="house-btn house-btn-secondary" id="algoSaveBtn">Save configuration</button>
                         <span id="algoCfgMsg" class="inline-status" role="status"></span>
                     </div>
-                </div>
+                </fieldset>
                 <div>
                     <h3 class="chart-caption">Recent signals</h3>
                     <div id="algoSignalsEmpty" class="house-empty" hidden>
-                        <p>No signals yet. Enable the algorithm to start quoting.</p>
+                        <p>No live-path signals. Paper fills accrue in Shadow mode above — they are not listed here.</p>
                     </div>
-                    <div class="house-table-scroll">
+                    <div class="house-table-scroll" id="algoSignalsTable" hidden>
                         <table class="data-table">
                             <thead>
                                 <tr>
@@ -1043,7 +1125,7 @@
                                 </tr>
                             </thead>
                             <tbody id="algoSignalLog">
-                                <tr><td colspan="6" class="table-msg">No signals yet. Enable the algorithm to start quoting.</td></tr>
+                                <tr><td colspan="6" class="table-msg">No live-path signals. Paper fills accrue in Shadow mode above.</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -1525,26 +1607,154 @@
         document.getElementById('positionsRefreshBtn').addEventListener('click', loadPositions);
 
         let _algoCfgCache = null;
+        let shadowInFlight = false;
 
-        function loadAlgoStatus() {
+        function fmtShadowQty(v) {
+            if (v === undefined || v === null || Number.isNaN(Number(v))) return '—';
+            return Number(v).toFixed(6);
+        }
+        function fmtShadowPnl(v) {
+            if (v === undefined || v === null || Number.isNaN(Number(v))) return '—';
+            const n = Number(v);
+            return (n >= 0 ? '+' : '') + n.toFixed(6);
+        }
+        function strategyLabel(key) {
+            if (key === 'spread_capture') return 'Spread capture';
+            if (key === 'market_imbalance') return 'Market imbalance';
+            const human = String(key || '').replace(/_/g, ' ').trim();
+            return human ? human.charAt(0).toUpperCase() + human.slice(1) : 'Strategy';
+        }
+        function shadowLamp(status) {
+            const orders = (status && status.orders_placed) || 0;
+            const paper = !status || status.paper_mode !== false;
+            if (orders > 0) return { cls: 'error', label: 'Live orders — stop' };
+            if (!paper) return { cls: 'error', label: 'Paper mode off' };
+            if (((status && status.paper_fills) || 0) > 0) return { cls: 'connected', label: 'Fills accruing' };
+            return { cls: 'connected', label: 'Paper only' };
+        }
+        function shadowMetric(label, value, numeric) {
+            let cls = 'shadow-metric-value';
+            if (typeof numeric === 'number' && !Number.isNaN(numeric)) {
+                if (numeric > 0) cls += ' pnl-pos';
+                else if (numeric < 0) cls += ' pnl-neg';
+            }
+            return '<div><p class="shadow-metric-label">' + escapeHtml(label) + '</p>' +
+                '<p class="' + cls + '">' + escapeHtml(value) + '</p></div>';
+        }
+        function setShadowEmpty(show, text) {
+            const empty = document.getElementById('shadowEmpty');
+            const cards = document.getElementById('shadowCards');
+            if (!empty || !cards) return;
+            empty.hidden = !show;
+            cards.hidden = !!show;
+            const p = empty.querySelector('p');
+            if (p && text) p.textContent = text;
+        }
+        function renderShadowCard(key, status) {
+            const st = status || {};
+            const cfg = st.config || {};
+            const lamp = shadowLamp(st);
+            const enabled = cfg.enabled ? 'On' : 'Off';
+            const realized = Number(st.paper_realized_pnl);
+            const total = Number(st.paper_total_pnl);
+            return '<article class="shadow-card" role="listitem">' +
+                '<div class="shadow-card-head">' +
+                    '<h4 class="shadow-card-title">' + escapeHtml(strategyLabel(key)) + '</h4>' +
+                    '<div class="status ' + lamp.cls + '">' + escapeHtml(lamp.label) + '</div>' +
+                '</div>' +
+                '<p class="md-chip-meta">' + escapeHtml(cfg.symbol || '—') +
+                    ' · Config ' + enabled +
+                    ' · Live orders ' + escapeHtml(String(st.orders_placed || 0)) + '</p>' +
+                '<div class="shadow-metrics">' +
+                    shadowMetric('Paper fills', String(st.paper_fills || 0)) +
+                    shadowMetric('Paper position', fmtShadowQty(st.paper_position)) +
+                    shadowMetric('Realized P&L', fmtShadowPnl(st.paper_realized_pnl), realized) +
+                    shadowMetric('Total P&L', fmtShadowPnl(st.paper_total_pnl), total) +
+                '</div>' +
+            '</article>';
+        }
+        function loadShadowStatus(opts) {
+            if (shadowInFlight) return;
+            const banner = document.getElementById('shadowBanner');
+            const cards = document.getElementById('shadowCards');
+            const userInitiated = !!(opts && opts.userInitiated);
+            const firstPaint = cards && cards.dataset.loaded !== '1';
+            const showLoading = userInitiated || firstPaint;
+            shadowInFlight = true;
+            if (showLoading) {
+                setDisabled('algoRefreshBtn', true);
+                setBanner(banner, 'info', 'Loading shadow status',
+                    'Fetching paper fills, position and P&L for both strategies.');
+                if (firstPaint) setShadowEmpty(false);
+            }
+            fetch('/api/shadow/status')
+                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+                .then(data => {
+                    const sc = data && data.spread_capture;
+                    const mi = data && data.market_imbalance;
+                    if (!sc && !mi) {
+                        if (cards) cards.innerHTML = '';
+                        setShadowEmpty(true, 'Use Refresh status after the process is up. Both shadow strategies should appear here.');
+                        setBanner(banner, 'neutral', 'No shadow strategies',
+                            'Both Spread capture and Market imbalance should appear here when the server is up.');
+                        return;
+                    }
+                    setShadowEmpty(false);
+                    const keys = ['spread_capture', 'market_imbalance'];
+                    cards.innerHTML = keys.filter(k => data[k]).map(k => renderShadowCard(k, data[k])).join('');
+                    const leak = keys.some(k => data[k] && (data[k].orders_placed || 0) > 0);
+                    const paperOff = keys.some(k => data[k] && data[k].paper_mode === false);
+                    const fills = keys.reduce((n, k) => n + ((data[k] && data[k].paper_fills) || 0), 0);
+                    if (leak || paperOff) {
+                        setBanner(banner, 'error', 'Shadow safety check failed',
+                            'A strategy reported live orders or paper mode off. Stop and inspect before the next v* deploy.');
+                    } else if (fills === 0) {
+                        setBanner(banner, 'success', 'Both strategies are shadowing',
+                            'Paper mode is on and no live orders have been sent. No paper fills yet this session.');
+                    } else {
+                        setBanner(banner, 'success', 'Both strategies are shadowing',
+                            'Paper fills ' + fills + '. Delta versus backtest is in the daily report file, not this tab.');
+                    }
+                })
+                .catch(err => {
+                    if (cards) cards.innerHTML = '';
+                    setShadowEmpty(true, 'Cannot reach shadow status. Check the message above, then try Refresh status.');
+                    setBanner(banner, 'error', 'Cannot load shadow status',
+                        'The process may be down or too old for /api/shadow/status. ' + err.message + '.');
+                })
+                .finally(() => {
+                    if (cards) cards.dataset.loaded = '1';
+                    shadowInFlight = false;
+                    setDisabled('algoRefreshBtn', false);
+                });
+        }
+
+        function loadAlgoStatus(opts) {
             const banner = document.getElementById('algoStatusBanner');
+            const form = document.getElementById('algoForm');
             setDisabled('algoRefreshBtn', true);
+            setDisabled('algoEnableBtn', true);
+            setDisabled('algoDisableBtn', true);
+            setDisabled('algoSaveBtn', true);
+            if (form) form.disabled = true;
             fetch('/api/algo/status')
                 .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
                 .then(data => {
                     setDisabled('algoRefreshBtn', false);
+                    setDisabled('algoSaveBtn', false);
+                    if (form) form.disabled = false;
                     const cfg = data.config || {};
                     _algoCfgCache = cfg;
                     if (cfg.enabled) {
-                        setBanner(banner, 'success', 'Algorithm is on',
-                            'Trading ' + (cfg.symbol || 'the configured symbol') +
-                            '. Qty ' + (cfg.order_qty || '—') +
-                            ', min spread ' + (cfg.min_spread_bps || '—') + ' bps.');
+                        setBanner(banner, 'success', 'Spread capture is on',
+                            'Shadowing ' + (cfg.symbol || 'the configured symbol') +
+                            ' in paper mode. Qty ' + (cfg.order_qty || '—') +
+                            ', min spread ' + (cfg.min_spread_bps || '—') + ' bps. Disable stops this instance only.');
                         setDisabled('algoEnableBtn', true);
                         setDisabled('algoDisableBtn', false);
                     } else {
-                        setBanner(banner, 'warning', 'Algorithm is off',
-                            'Configure it, then enable to start quoting.');
+                        setBanner(banner, 'warning', 'Spread capture is off',
+                            'Configure it, then enable. Market imbalance keeps shadowing until the process restarts.');
                         setDisabled('algoEnableBtn', false);
                         setDisabled('algoDisableBtn', true);
                     }
@@ -1563,9 +1773,9 @@
                     const signals = data.recent_signals || [];
                     const logBody = document.getElementById('algoSignalLog');
                     const emptyEl = document.getElementById('algoSignalsEmpty');
-                    const tableWrap = emptyEl ? emptyEl.nextElementSibling : null;
+                    const tableWrap = document.getElementById('algoSignalsTable');
                     if (!signals.length) {
-                        logBody.innerHTML = tableMsg(6, 'No signals yet. Enable the algorithm to start quoting.');
+                        logBody.innerHTML = tableMsg(6, 'No live-path signals. Paper fills accrue in Shadow mode above.');
                         if (emptyEl) emptyEl.hidden = false;
                         if (tableWrap) tableWrap.hidden = true;
                     } else {
@@ -1582,12 +1792,16 @@
                                 '<td title="' + s.reason + '">' + s.reason + '</td></tr>';
                         }).join('');
                     }
+                    loadShadowStatus(opts);
                 })
                 .catch(err => {
                     setDisabled('algoRefreshBtn', false);
                     setDisabled('algoEnableBtn', true);
                     setDisabled('algoDisableBtn', true);
+                    setDisabled('algoSaveBtn', true);
+                    if (form) form.disabled = true;
                     setBanner(banner, 'error', 'Cannot load algorithm status', err.message);
+                    loadShadowStatus(opts);
                 });
         }
         function algoEnable() {
@@ -1652,7 +1866,9 @@
         }
         document.getElementById('algoEnableBtn').addEventListener('click', algoEnable);
         document.getElementById('algoDisableBtn').addEventListener('click', algoDisable);
-        document.getElementById('algoRefreshBtn').addEventListener('click', loadAlgoStatus);
+        document.getElementById('algoRefreshBtn').addEventListener('click', function () {
+            loadAlgoStatus({ userInitiated: true });
+        });
         document.getElementById('algoSaveBtn').addEventListener('click', algoSaveConfig);
         document.getElementById('algoCfgStrategy').addEventListener('change', algoStrategyChanged);
 

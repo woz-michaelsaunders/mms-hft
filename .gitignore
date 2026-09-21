@@ -6,6 +6,8 @@ config.toml
 *.csv
 # runtime state — live FIX sequence numbers, must not be versioned
 data/seqnum_*.txt
+data/shadow_fills.jsonl
+reports/
 calibration/
 
 # rotated logs (*.log alone misses .log.1 / .log.2.gz)

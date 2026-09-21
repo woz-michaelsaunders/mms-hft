@@ -17,10 +17,14 @@
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use log::{info, warn, debug};
+use log::{warn, debug};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use chrono::Utc;
+use std::io::Write;
+use std::fs::OpenOptions;
+use std::path::Path;
+use std::sync::OnceLock;
 
 /// Selects which signal-generation strategy the algo uses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -193,11 +197,34 @@ pub struct AlgoStatus {
     pub paper_total_pnl: f64,
 }
 
+pub const SHADOW_FILLS_PATH: &str = "data/shadow_fills.jsonl";
+
+/// One simulated paper fill. Serde field order is the JSONL key order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowFill {
+    pub ts_ms: i64,
+    pub strategy: StrategyType,
+    pub symbol: String,
+    pub side: String,
+    pub price: f64,
+    pub qty: f64,
+    pub pnl: f64,
+    pub cumulative_pnl: f64,
+    pub net_qty_after: f64,
+}
+
+/// HTTP 200 body for `GET /api/shadow/status`. Both keys always present.
+#[derive(Debug, Clone, Serialize)]
+pub struct ShadowStatus {
+    pub spread_capture: AlgoStatus,
+    pub market_imbalance: AlgoStatus,
+}
+
 /// Shadow-trading (paper) state: simulated inventory and P&L from passive quotes
 /// filled against the LIVE book. Never sends a real order. Mirrors the backtest
 /// fill model (fill only on a real cross; mark at the new mid => adverse selection).
 #[derive(Default)]
-struct PaperState {
+pub(crate) struct PaperState {
     net_qty: f64,
     avg_entry: f64,
     realized: f64,
@@ -208,7 +235,10 @@ struct PaperState {
 }
 
 impl PaperState {
-    fn apply_fill(&mut self, side: &str, fill: f64, cfg: &AlgoConfig) {
+    /// Unchanged inventory math. Returns None when qty after room cap <= 1e-12.
+    /// Some((qty, pnl_increment, net_qty_after)) when a fill is booked.
+    /// pnl_increment is 0.0 on a pure opening leg.
+    fn apply_fill(&mut self, side: &str, fill: f64, cfg: &AlgoConfig) -> Option<(f64, f64, f64)> {
         let room = if side == "1" {
             (cfg.max_position - self.net_qty).max(0.0)
         } else {
@@ -216,11 +246,12 @@ impl PaperState {
         };
         let qty = cfg.order_qty.min(room);
         if qty <= 1e-12 {
-            return;
+            return None;
         }
         let signed = if side == "1" { qty } else { -qty };
         let prev = self.net_qty;
         let new_net = prev + signed;
+        let mut pnl_increment = 0.0;
         if prev.abs() < 1e-12 {
             self.avg_entry = fill;
         } else if prev.signum() == signed.signum() {
@@ -233,6 +264,7 @@ impl PaperState {
                 closing * (self.avg_entry - fill)
             };
             self.realized += pnl;
+            pnl_increment = pnl;
             if new_net.abs() < 1e-12 {
                 self.avg_entry = 0.0;
             } else if new_net.signum() != prev.signum() {
@@ -241,6 +273,7 @@ impl PaperState {
         }
         self.net_qty = new_net;
         self.fills += 1;
+        Some((qty, pnl_increment, new_net))
     }
 
     fn total_pnl(&self) -> f64 {
@@ -251,13 +284,17 @@ impl PaperState {
 /// The trading algorithm.
 pub struct TradingAlgo {
     pub config: Arc<Mutex<AlgoConfig>>,
-    signals_fired: Arc<Mutex<u64>>,
-    orders_placed: Arc<Mutex<u64>>,
-    signal_log: Arc<Mutex<SignalLog>>,
+    pub signals_fired: Arc<Mutex<u64>>,
+    pub orders_placed: Arc<Mutex<u64>>,
+    pub signal_log: Arc<Mutex<SignalLog>>,
     /// Shadow/paper mode. Default TRUE; while true the algo NEVER sends a real
     /// order — it only simulates fills against the live book. (No toggle is
     /// exposed yet, so the live-order path is currently unreachable by design.)
-    paper_mode: Arc<std::sync::atomic::AtomicBool>,
+    ///
+    /// The field is `pub` so binary tests can *read* it after the lib split.
+    /// There is no setter and no `AlgoConfig` field: callers MUST NOT `.store()`
+    /// this AtomicBool. That rule is convention/review, not the type system.
+    pub paper_mode: Arc<std::sync::atomic::AtomicBool>,
     paper: Arc<Mutex<PaperState>>,
 }
 
@@ -289,38 +326,23 @@ impl TradingAlgo {
         }
     }
 
-    /// One shadow-trading step. Checks whether last step's resting paper quotes
-    /// were crossed by the live book, books the simulated fill (maker rebate via
-    /// apply_costs + adverse-selection markout at the new mid), then re-posts.
-    async fn paper_step(&self, best_bid: f64, best_ask: f64, cfg: &AlgoConfig) {
-        if best_bid <= 0.0 || best_ask <= best_bid {
-            return; // need a real two-sided book (UAT is bid-only => no paper fills)
-        }
-        let mid = 0.5 * (best_bid + best_ask);
-        let mut p = self.paper.lock().await;
-        p.last_mid = mid;
-
-        if let Some(pb) = p.quote_buy.take() {
-            if best_ask <= pb {
-                let fill = apply_costs(pb, "1", cfg.slippage_bps, cfg.maker_fee_bps);
-                p.apply_fill("1", fill, cfg);
-            }
-        }
-        if let Some(ps) = p.quote_sell.take() {
-            if best_bid >= ps {
-                let fill = apply_costs(ps, "2", cfg.slippage_bps, cfg.maker_fee_bps);
-                p.apply_fill("2", fill, cfg);
-            }
-        }
-
-        let spread_bps = (best_ask - best_bid) / best_bid * 10_000.0;
-        if spread_bps >= cfg.min_spread_bps {
-            if (cfg.max_position - p.net_qty) > 1e-12 {
-                p.quote_buy = Some(best_bid + cfg.tick_size);
-            }
-            if (cfg.max_position + p.net_qty) > 1e-12 {
-                p.quote_sell = Some(best_ask - cfg.tick_size);
-            }
+    /// One shadow-trading step. Locks paper, runs `paper_step_inner`, then
+    /// appends fills without holding the paper mutex.
+    pub async fn paper_step(
+        &self,
+        best_bid: f64,
+        best_ask: f64,
+        bids: &[(f64, f64)],
+        asks: &[(f64, f64)],
+        cfg: &AlgoConfig,
+    ) {
+        let now_ms = Utc::now().timestamp_millis();
+        let fills = {
+            let mut paper = self.paper.lock().await;
+            paper_step_inner(&mut paper, cfg, best_bid, best_ask, bids, asks, now_ms)
+        };
+        for fill in fills {
+            append_shadow_fill(&fill);
         }
     }
 
@@ -513,130 +535,153 @@ impl TradingAlgo {
 
         vec![]
     }
+}
 
-    /// Run the algo loop.  Spawned as a long-lived Tokio task in main().
-    ///
-    /// `order_session`  — FIXSession used to place orders (order management port)
-    /// `market_session` — FIXSession used to read live order books (market data port)
-    /// `positions`      — shared PositionsStore so we can check current net position
-    pub async fn run(
-        self: Arc<Self>,
-        order_session: Arc<crate::FIXSession>,
-        market_session: Arc<crate::FIXSession>,
-        positions: Arc<crate::PositionsStore>,
-    ) {
-        info!("🤖 Trading algo task started");
+/// Sync paper step. No tokio, no file I/O. Tests drive this.
+pub(crate) fn paper_step_inner(
+    paper: &mut PaperState,
+    cfg: &AlgoConfig,
+    best_bid: f64,
+    best_ask: f64,
+    bids: &[(f64, f64)],
+    asks: &[(f64, f64)],
+    now_ms: i64,
+) -> Vec<ShadowFill> {
+    if best_bid <= 0.0 || best_ask <= best_bid {
+        return vec![]; // do not clear quotes; match today's early return
+    }
+    paper.last_mid = 0.5 * (best_bid + best_ask);
+    let mut out = Vec::new();
 
-        let mut last_signal_ms: i64 = 0;
-
-        loop {
-            let cfg = self.config.lock().await.clone();
-            let interval = tokio::time::Duration::from_millis(cfg.poll_interval_ms);
-
-            if !cfg.enabled {
-                tokio::time::sleep(interval).await;
-                continue;
-            }
-
-            // Read live order book for the configured symbol
-            let (best_bid, best_ask, bids, asks) = {
-                let books = market_session.order_books.lock().await;
-                books.get(&cfg.symbol)
-                    .map(|db| {
-                        let snap = db.get_snapshot();
-                        let depth = cfg.imbalance_depth_levels.max(1);
-                        let bids = snap.bids.iter().take(depth).cloned().collect::<Vec<_>>();
-                        let asks = snap.asks.iter().take(depth).cloned().collect::<Vec<_>>();
-                        (snap.best_bid, snap.best_ask, bids, asks)
-                    })
-                    .unwrap_or_default()
-            };
-
-            // Get current net position
-            let net_position = positions
-                .snapshot()
-                .into_iter()
-                .find(|p| p.symbol == cfg.symbol)
-                .map(|p| p.net_qty)
-                .unwrap_or(0.0);
-
-            // Stale-feed guard: never quote on a frozen/stale order book.
-            let now_ms = Utc::now().timestamp_millis();
-            if cfg.max_book_staleness_ms > 0 {
-                let last_md = market_session
-                    .last_md_recv_ms
-                    .load(std::sync::atomic::Ordering::Relaxed) as i64;
-                let age = if last_md == 0 { i64::MAX } else { now_ms - last_md };
-                if age > cfg.max_book_staleness_ms as i64 {
-                    warn!("Order book STALE ({} ms) - suppressing algo entries", age);
-                    tokio::time::sleep(interval).await;
-                    continue;
-                }
-            }
-
-            // PAPER/SHADOW MODE: simulate fills against the live book; never send
-            // a real order. Produces a live paper P&L the moment a two-sided
-            // (production) feed is connected.
-            if self.paper_mode.load(std::sync::atomic::Ordering::Relaxed) {
-                self.paper_step(best_bid, best_ask, &cfg).await;
-                tokio::time::sleep(interval).await;
-                continue;
-            }
-
-            // Enforce signal cooldown — skip evaluation if fired too recently
-            if cfg.min_signal_interval_ms > 0
-                && (now_ms - last_signal_ms) < cfg.min_signal_interval_ms as i64
-            {
-                tokio::time::sleep(interval).await;
-                continue;
-            }
-
-            let signals = Self::evaluate_signal(&cfg, best_bid, best_ask, &bids, &asks, net_position);
-
-            for signal in signals {
-                info!(
-                    "🤖 ALGO SIGNAL: {} {} qty={} px={:.4} | {}",
-                    if signal.side == "1" { "BUY" } else { "SELL" },
-                    signal.symbol,
-                    signal.qty,
-                    signal.price,
-                    signal.reason
-                );
-
-                last_signal_ms = Utc::now().timestamp_millis();
-                *self.signals_fired.lock().await += 1;
-                self.signal_log.lock().await.push(signal.clone());
-
-                // Circuit breaker: stop placing once max_orders_session is hit.
-                if cfg.max_orders_session > 0
-                    && *self.orders_placed.lock().await >= cfg.max_orders_session
-                {
-                    warn!(
-                        "max_orders_session ({}) reached - halting order placement",
-                        cfg.max_orders_session
-                    );
-                    continue;
-                }
-
-                // Place the order via the FIX order session
-                let side_char = signal.side.chars().next().unwrap_or('1');
-                let cl_ord_id = format!("ALGO_{}", uuid::Uuid::new_v4().simple());
-                match order_session
-                    .new_order_single(&cl_ord_id, &signal.symbol, side_char, signal.qty, signal.price)
-                    .await
-                {
-                    Ok(()) => {
-                        *self.orders_placed.lock().await += 1;
-                        info!("🤖 ALGO ORDER SENT: {}", cl_ord_id);
+    match cfg.strategy {
+        StrategyType::SpreadCapture => {
+            if let Some(pb) = paper.quote_buy.take() {
+                if best_ask <= pb {
+                    let fill = apply_costs(pb, "1", cfg.slippage_bps, cfg.maker_fee_bps);
+                    if let Some((qty, pnl, net)) = paper.apply_fill("1", fill, cfg) {
+                        out.push(ShadowFill {
+                            ts_ms: now_ms,
+                            strategy: cfg.strategy.clone(),
+                            symbol: cfg.symbol.clone(),
+                            side: "1".to_string(),
+                            price: fill,
+                            qty,
+                            pnl,
+                            cumulative_pnl: paper.total_pnl(),
+                            net_qty_after: net,
+                        });
                     }
-                    Err(e) => {
-                        warn!("🤖 ALGO ORDER FAILED: {}", e);
+                }
+            }
+            if let Some(ps) = paper.quote_sell.take() {
+                if best_bid >= ps {
+                    let fill = apply_costs(ps, "2", cfg.slippage_bps, cfg.maker_fee_bps);
+                    if let Some((qty, pnl, net)) = paper.apply_fill("2", fill, cfg) {
+                        out.push(ShadowFill {
+                            ts_ms: now_ms,
+                            strategy: cfg.strategy.clone(),
+                            symbol: cfg.symbol.clone(),
+                            side: "2".to_string(),
+                            price: fill,
+                            qty,
+                            pnl,
+                            cumulative_pnl: paper.total_pnl(),
+                            net_qty_after: net,
+                        });
                     }
                 }
             }
 
-            tokio::time::sleep(interval).await;
+            let spread_bps = (best_ask - best_bid) / best_bid * 10_000.0;
+            if spread_bps >= cfg.min_spread_bps {
+                if (cfg.max_position - paper.net_qty) > 1e-12 {
+                    paper.quote_buy = Some(best_bid + cfg.tick_size);
+                }
+                if (cfg.max_position + paper.net_qty) > 1e-12 {
+                    paper.quote_sell = Some(best_ask - cfg.tick_size);
+                }
+            }
         }
+        StrategyType::MarketImbalance => {
+            // Quotes stay None. Inventory is PaperState.net_qty, never PositionsStore.
+            let signals = TradingAlgo::build_imbalance_signals(
+                cfg,
+                best_bid,
+                best_ask,
+                bids,
+                asks,
+                paper.net_qty,
+                now_ms,
+            );
+            for signal in signals {
+                let fill = apply_costs(
+                    signal.price,
+                    signal.side.as_str(),
+                    cfg.slippage_bps,
+                    cfg.taker_fee_bps,
+                );
+                if let Some((qty, pnl, net)) = paper.apply_fill(signal.side.as_str(), fill, cfg) {
+                    out.push(ShadowFill {
+                        ts_ms: now_ms,
+                        strategy: cfg.strategy.clone(),
+                        symbol: cfg.symbol.clone(),
+                        side: signal.side,
+                        price: fill,
+                        qty,
+                        pnl,
+                        cumulative_pnl: paper.total_pnl(),
+                        net_qty_after: net,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn shadow_fills_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Process-wide lock; create_dir_all on parent; append + flush. I/O errors warn and return.
+pub(crate) fn append_shadow_fill(fill: &ShadowFill) {
+    append_shadow_fill_to(Path::new(SHADOW_FILLS_PATH), fill);
+}
+
+fn append_shadow_fill_to(path: &Path, fill: &ShadowFill) {
+    let _guard = match shadow_fills_lock().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                warn!("shadow fills: create_dir_all failed: {}", e);
+                return;
+            }
+        }
+    }
+    let line = match serde_json::to_string(fill) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("shadow fills: serialize failed: {}", e);
+            return;
+        }
+    };
+    let mut file = match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("shadow fills: open failed: {}", e);
+            return;
+        }
+    };
+    if let Err(e) = writeln!(file, "{}", line) {
+        warn!("shadow fills: write failed: {}", e);
+        return;
+    }
+    if let Err(e) = file.flush() {
+        warn!("shadow fills: flush failed: {}", e);
     }
 }
 
@@ -1484,6 +1529,136 @@ mod tests {
             serde_json::to_vec(&a).expect("serialize a"),
             serde_json::to_vec(&b).expect("serialize b")
         );
+    }
+
+    #[test]
+    fn paper_step_inner_mi_bid_heavy_immediate_buy_taker_no_quotes() {
+        let mut cfg = test_cfg();
+        cfg.strategy = StrategyType::MarketImbalance;
+        cfg.slippage_bps = 1.0;
+        cfg.taker_fee_bps = 4.0;
+        cfg.maker_fee_bps = -1.0;
+        cfg.order_qty = 0.001;
+        cfg.max_position = 0.01;
+        let mut paper = PaperState::default();
+        let bids = vec![(100.0, 7.0)];
+        let asks = vec![(100.5, 3.0)];
+        let fills = paper_step_inner(&mut paper, &cfg, 100.0, 100.5, &bids, &asks, 1_000);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].side, "1");
+        assert_eq!(fills[0].strategy, StrategyType::MarketImbalance);
+        let expected = 100.5 * (1.0 + (cfg.slippage_bps + cfg.taker_fee_bps) / 10_000.0);
+        assert!(
+            (fills[0].price - expected).abs() < 1e-9,
+            "taker-costed ask {}, got {}",
+            expected,
+            fills[0].price
+        );
+        assert!(paper.quote_buy.is_none());
+        assert!(paper.quote_sell.is_none());
+        assert!(paper.fills >= 1);
+    }
+
+    #[test]
+    fn paper_step_inner_mi_uses_taker_even_when_maker_rebate_nonzero() {
+        let mut cfg = test_cfg();
+        cfg.strategy = StrategyType::MarketImbalance;
+        cfg.slippage_bps = 0.0;
+        cfg.taker_fee_bps = 10.0;
+        cfg.maker_fee_bps = -10.0;
+        let mut paper = PaperState::default();
+        let bids = vec![(100.0, 7.0)];
+        let asks = vec![(101.0, 3.0)];
+        let fills = paper_step_inner(&mut paper, &cfg, 100.0, 101.0, &bids, &asks, 2_000);
+        assert_eq!(fills.len(), 1);
+        let taker_px = 101.0 * (1.0 + cfg.taker_fee_bps / 10_000.0);
+        let maker_px = 101.0 * (1.0 + cfg.maker_fee_bps / 10_000.0);
+        assert!((fills[0].price - taker_px).abs() < 1e-9);
+        assert!((fills[0].price - maker_px).abs() > 1e-9);
+        assert!(paper.quote_buy.is_none() && paper.quote_sell.is_none());
+    }
+
+    #[test]
+    fn paper_step_inner_sc_rests_then_fills_on_cross_with_maker_fee() {
+        let mut cfg = test_cfg();
+        cfg.strategy = StrategyType::SpreadCapture;
+        cfg.tick_size = 0.01;
+        cfg.min_spread_bps = 5.0;
+        cfg.slippage_bps = 0.0;
+        cfg.maker_fee_bps = -10.0;
+        cfg.order_qty = 0.001;
+        let mut paper = PaperState::default();
+        let first = paper_step_inner(&mut paper, &cfg, 100.0, 100.5, &[], &[], 1);
+        assert!(first.is_empty());
+        assert!(paper.quote_buy.is_some());
+        assert!(paper.quote_sell.is_some());
+        let quote_buy = paper.quote_buy.unwrap();
+        assert!((quote_buy - 100.01).abs() < 1e-9);
+        let fills = paper_step_inner(&mut paper, &cfg, 100.0, 100.01, &[], &[], 2);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].side, "1");
+        assert_eq!(fills[0].strategy, StrategyType::SpreadCapture);
+        let maker_px = quote_buy * (1.0 + cfg.maker_fee_bps / 10_000.0);
+        assert!(
+            (fills[0].price - maker_px).abs() < 1e-9,
+            "maker-fee fill {}, got {}",
+            maker_px,
+            fills[0].price
+        );
+        assert!(fills[0].price < quote_buy);
+    }
+
+    #[test]
+    fn append_shadow_fill_to_writes_one_compact_object_and_newline() {
+        let fill = ShadowFill {
+            ts_ms: 1_773_964_800_123,
+            strategy: StrategyType::MarketImbalance,
+            symbol: "BTC_USDT".to_string(),
+            side: "1".to_string(),
+            price: 101.0505,
+            qty: 0.001,
+            pnl: 0.0,
+            cumulative_pnl: -0.00005,
+            net_qty_after: 0.001,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "shadow_fill_test_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("shadow_fills.jsonl");
+        append_shadow_fill_to(&path, &fill);
+        let s = std::fs::read_to_string(&path).expect("read jsonl");
+        assert!(s.ends_with('\n'));
+        assert_eq!(s.matches('\n').count(), 1);
+        let line = s.trim_end();
+        assert!(line.starts_with('{') && line.ends_with('}'));
+        assert!(s.contains("\"strategy\":\"market_imbalance\""));
+        assert!(!s.contains("MarketImbalance"));
+        assert!(!line.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("json");
+        assert!(parsed.is_object());
+        // Compact serde_json::to_string preserves struct field order (BTreeMap
+        // of serde_json::Value does not). Check the raw line.
+        let expected_order = [
+            "\"ts_ms\":",
+            "\"strategy\":",
+            "\"symbol\":",
+            "\"side\":",
+            "\"price\":",
+            "\"qty\":",
+            "\"pnl\":",
+            "\"cumulative_pnl\":",
+            "\"net_qty_after\":",
+        ];
+        let mut last = 0usize;
+        for key in expected_order {
+            let pos = line.find(key).expect(key);
+            assert!(pos >= last, "key order broken at {}", key);
+            last = pos;
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
