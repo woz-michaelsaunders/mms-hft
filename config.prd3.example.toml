@@ -1,0 +1,85 @@
+# PRD3 PrivateLink template — docs, not deployed.
+# Copy to config.toml, fill CompIDs, export CRYPTOCOM_PRD3_API_KEY / CRYPTOCOM_PRD3_API_SECRET.
+# chmod 0600 config.toml
+# Never commit secrets. Export named env vars; no defaults unlike KDB_HOST.
+#
+# This file is MD-only while orders stay commented: the process will spawn five
+# MD session task-pairs and will NOT bind :8080 (no dashboard). That is the
+# designed empty state, not a missing-feature bug.
+#
+# Primary-book contract: the first role = "market_data" row is autosave / ZMQ.
+# Keep BTC 34402 first among MD. Do not put ETH first.
+# Adding a session = append [[sessions]] + restart, zero main.rs change.
+# host is a hostname, NOT a URL — do not paste tcp://…
+
+[subscriptions]
+symbols = ["BTC_USDT", "BTC_USD", "BTCUSD-PERP"]
+
+[credentials.PRD3]
+api_key_env    = "CRYPTOCOM_PRD3_API_KEY"
+api_secret_env = "CRYPTOCOM_PRD3_API_SECRET"
+
+# [[sessions]]
+# name             = "prd3_om"
+# role             = "order_management"
+# host             = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com"
+# port             = 31302
+# sender_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_SENDER"
+# target_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_TARGET"
+# credentials_ref  = "PRD3"
+# NOT ENABLED — order entry pending separate approval
+
+[[sessions]]
+name             = "prd3_md_btc"
+role             = "market_data"
+host             = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com"
+port             = 34402
+sender_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_SENDER"
+target_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_TARGET"
+credentials_ref  = "PRD3"
+symbol_routing   = "all"   # first MD row = primary book
+
+[[sessions]]
+name             = "prd3_md_eth"
+role             = "market_data"
+host             = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com"
+port             = 34403
+sender_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_SENDER"
+target_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_TARGET"
+credentials_ref  = "PRD3"
+symbol_routing   = "all"
+
+[[sessions]]
+name             = "prd3_md_others_34405"
+role             = "market_data"
+host             = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com"
+port             = 34405
+sender_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_SENDER"
+target_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_TARGET"
+credentials_ref  = "PRD3"
+symbol_routing   = { first_char_ranges = ["0-9", "A-D"] }
+
+[[sessions]]
+name             = "prd3_md_others_34406"
+role             = "market_data"
+host             = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com"
+port             = 34406
+sender_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_SENDER"
+target_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_TARGET"
+credentials_ref  = "PRD3"
+symbol_routing   = { first_char_ranges = ["E-M"] }
+
+[[sessions]]
+name             = "prd3_md_others_34407"
+role             = "market_data"
+host             = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com"
+port             = 34407
+sender_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_SENDER"
+target_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_TARGET"
+credentials_ref  = "PRD3"
+symbol_routing   = { first_char_ranges = ["N-Z"] }
+
+[connection]
+heartbeat_interval      = 30
+max_reconnect_attempts  = 10
+reconnect_backoff_ms    = 1000

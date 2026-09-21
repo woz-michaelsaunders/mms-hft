@@ -1,57 +1,88 @@
 # Example configuration for fix_server (Wozinga Trading Platform)
-# Copy this file to config.toml and fill in your actual credentials.
+# Copy this file to config.toml and fill in environment-specific CompIDs.
 # config.toml is git-ignored — never commit it.
+# chmod 0600 config.toml
+# Never commit secrets. This file names environment variables; it does not hold values.
 
 # ─── Market-data subscriptions ───────────────────────────────────────────────
 # Instruments to subscribe to. Each session subscribes to the symbols listed
-# here that its own port carries. Empty means subscribe to nothing.
+# here that its own routing admits. Empty means subscribe to nothing.
 # Do not subscribe to everything the venue lists: each port lists ~1,100
 # instruments and every reconnect re-sends an order-book and a trade request
 # for each, which floods the venue and breaks the session.
 [subscriptions]
 symbols = ["BTC_USDT", "BTC_USD", "BTCUSD-PERP"]
 
-# ─── Order Management Session ────────────────────────────────────────────────
-[order_management]
-# FIX gateway TCP endpoint for order submission / execution reports
-gateway_url    = "tcp://fix-uat.crypto.com:34404"
-# SenderCompID assigned to your trading account by the exchange
-sender_comp_id = "UAT1.WOZINGA.UD.00"
-# TargetCompID of the exchange gateway
-target_comp_id = "UAT1.CDC.UD"
+# ─── Credentials (env names only — no values) ────────────────────────────────
+# Export the named variables before starting. There is NO default, unlike
+# KDB_HOST (which falls back to localhost). Unset / empty / whitespace is FATAL.
+[credentials.UAT]
+api_key_env    = "CRYPTOCOM_API_KEY"
+api_secret_env = "CRYPTOCOM_API_SECRET"
 
-# ─── Market Data Session — BTC symbols ───────────────────────────────────────
-[market_data_btc]
-gateway_url    = "tcp://fix-uat.crypto.com:34402"
-sender_comp_id = "UAT1.WOZINGA.MD.00"
-target_comp_id = "UAT1.CDC.MD"
+# ─── Sessions ────────────────────────────────────────────────────────────────
+# Adding a session = append a [[sessions]] table and restart. Zero main.rs change.
+#
+# Primary-book contract: the first role = "market_data" row is the book for
+# tick autosave, ZMQ, algo market leg, and the web Live tab. Do not reorder
+# BTC below ETH (or any other MD row) unless you intend to move those books.
+# host is a hostname, NOT a URL — do not paste tcp://…
 
-# ─── Market Data Sessions — Other symbols (ports 34405 / 34406 / 34407) ─────
-# base_url is the hostname; ports are specified individually below.
-[market_data_others]
-base_url       = "fix-uat.crypto.com"
-sender_comp_id = "UAT1.WOZINGA.MD.00"
-target_comp_id = "UAT1.CDC.MD"
-# Symbols whose first character is 0-9 or A-D
-port_34405     = 34405
-# Symbols whose first character is E-M
-port_34406     = 34406
-# Symbols whose first character is N-Z
-port_34407     = 34407
+[[sessions]]
+name             = "uat_om"
+role             = "order_management"
+host             = "fix-uat.crypto.com"
+port             = 34404
+sender_comp_id   = "UAT1.WOZINGA.UD.00"
+target_comp_id   = "UAT1.CDC.UD"
+credentials_ref  = "UAT"
 
-# ─── API Credentials ─────────────────────────────────────────────────────────
-[api]
-# Crypto.com API key (used to sign the Logon HMAC-SHA256 password)
-api_key    = "YOUR_API_KEY_HERE"
-api_secret = "YOUR_API_SECRET_HERE"
+[[sessions]]
+name             = "uat_md_btc"
+role             = "market_data"
+host             = "fix-uat.crypto.com"
+port             = 34402
+sender_comp_id   = "UAT1.WOZINGA.MD.00"
+target_comp_id   = "UAT1.CDC.MD"
+credentials_ref  = "UAT"
+symbol_routing   = "all"   # first MD row = primary book (autosave / ZMQ / algo / web)
+
+[[sessions]]
+name             = "uat_md_others_34405"
+role             = "market_data"
+host             = "fix-uat.crypto.com"
+port             = 34405
+sender_comp_id   = "UAT1.WOZINGA.MD.00"
+target_comp_id   = "UAT1.CDC.MD"
+credentials_ref  = "UAT"
+symbol_routing   = { first_char_ranges = ["0-9", "A-D"] }
+
+[[sessions]]
+name             = "uat_md_others_34406"
+role             = "market_data"
+host             = "fix-uat.crypto.com"
+port             = 34406
+sender_comp_id   = "UAT1.WOZINGA.MD.00"
+target_comp_id   = "UAT1.CDC.MD"
+credentials_ref  = "UAT"
+symbol_routing   = { first_char_ranges = ["E-M"] }
+
+[[sessions]]
+name             = "uat_md_others_34407"
+role             = "market_data"
+host             = "fix-uat.crypto.com"
+port             = 34407
+sender_comp_id   = "UAT1.WOZINGA.MD.00"
+target_comp_id   = "UAT1.CDC.MD"
+credentials_ref  = "UAT"
+symbol_routing   = { first_char_ranges = ["N-Z"] }
 
 # ─── Connection Tuning ───────────────────────────────────────────────────────
+# Per-session heartbeat_interval / max_reconnect_attempts / reconnect_backoff_ms
+# may override these; UAT omits them so runtime matches today.
 [connection]
-# How often to send FIX Heartbeat messages (seconds)
 heartbeat_interval      = 30
-# Maximum number of reconnection attempts before giving up (-1 = unlimited)
 max_reconnect_attempts  = 10
-# Initial reconnect backoff in milliseconds (doubles on each failure, max 30 s)
 reconnect_backoff_ms    = 1000
 
 # ─── kdb+ Connection (environment variables — not in this file) ──────────────
@@ -69,9 +100,9 @@ reconnect_backoff_ms    = 1000
 # [algo]                        (not loaded from config.toml — set via REST API)
 # enabled          = false
 # symbol           = "BTC_USDT"
-# order_qty        = 0.001       # base currency units per order
-# min_spread_bps   = 5.0         # minimum spread in basis points to enter
-# max_position     = 0.01        # max net position before suppressing new orders
-# poll_interval_ms = 1000        # evaluation frequency in milliseconds
-# tick_size        = 0.01        # price step for passive quoting
-# time_in_force    = "3"         # "3"=IOC (safe default), "0"=Day, "4"=FOK
+# order_qty        = 0.001
+# min_spread_bps   = 5.0
+# max_position     = 0.01
+# poll_interval_ms = 1000
+# tick_size        = 0.01
+# time_in_force    = "3"
