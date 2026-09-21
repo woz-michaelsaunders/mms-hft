@@ -805,6 +805,16 @@
             .panel-header > div { flex: 0 1 auto; }
             .panel-header .lead { max-width: none; }
             .btn-row { width: 100%; }
+            .halt-actions { width: 100%; }
+            .halt-actions .house-btn {
+                flex: 1 1 calc(50% - var(--space-2));
+                justify-content: center;
+                min-width: 0;
+            }
+            #killSwitchStatus {
+                width: 100%;
+                justify-content: flex-start;
+            }
             .form-grid { grid-template-columns: 1fr; }
             .bt-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .house-btn-primary,

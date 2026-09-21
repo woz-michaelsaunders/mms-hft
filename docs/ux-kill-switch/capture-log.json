@@ -1,0 +1,110 @@
+[
+  {
+    "file": "loading-375.png",
+    "label": "Loading — Checking halt, both halt buttons disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "empty-375.png",
+    "label": "Empty — Not halted, Reset disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "error-375.png",
+    "label": "Error — Halt status unknown",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "success-375.png",
+    "label": "Success — Kill Switch reset banner",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-375.png",
+    "label": "Disabled — in-flight trigger, both halt buttons disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "halted-375.png",
+    "label": "Halted — Kill Switch is on, Reset enabled (post-trigger)",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "loading-768.png",
+    "label": "Loading — Checking halt, both halt buttons disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "empty-768.png",
+    "label": "Empty — Not halted, Reset disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "error-768.png",
+    "label": "Error — Halt status unknown",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "success-768.png",
+    "label": "Success — Kill Switch reset banner",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-768.png",
+    "label": "Disabled — in-flight trigger, both halt buttons disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "halted-768.png",
+    "label": "Halted — Kill Switch is on, Reset enabled (post-trigger)",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "loading-1280.png",
+    "label": "Loading — Checking halt, both halt buttons disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "empty-1280.png",
+    "label": "Empty — Not halted, Reset disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "error-1280.png",
+    "label": "Error — Halt status unknown",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "success-1280.png",
+    "label": "Success — Kill Switch reset banner",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-1280.png",
+    "label": "Disabled — in-flight trigger, both halt buttons disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "halted-1280.png",
+    "label": "Halted — Kill Switch is on, Reset enabled (post-trigger)",
+    "width": "1280",
+    "overflowing": false
+  }
+]
