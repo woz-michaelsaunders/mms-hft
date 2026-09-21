@@ -1032,13 +1032,20 @@
                 <div class="panel-header">
                     <div>
                         <h2 class="section-title">Trading algorithm</h2>
-                        <p class="lead">Enable is the primary action when Spread capture is off. Enable and Disable apply to Spread capture only. Both strategies already shadow-trade in paper mode — paper fills are in Shadow mode below.</p>
+                        <p class="lead">Enable is the primary action when Spread capture is off. Enable and Disable apply to Spread capture only. Both strategies already shadow-trade in paper mode — paper fills are in Shadow mode below. Kill Switch cancels resting orders and blocks all new orders until you Reset. It does not disable the algorithm.</p>
                     </div>
                     <div class="btn-row">
+                        <div class="status pending" id="killSwitchStatus">Not halted</div>
                         <button type="button" class="house-btn house-btn-primary" id="algoEnableBtn">Enable algorithm</button>
                         <button type="button" class="house-btn house-btn-danger" id="algoDisableBtn" disabled>Disable algorithm</button>
                         <button type="button" class="house-btn house-btn-secondary" id="algoRefreshBtn">Refresh status</button>
+                        <button type="button" class="house-btn house-btn-danger" id="killSwitchBtn" aria-describedby="killSwitchStatus">Kill Switch</button>
+                        <button type="button" class="house-btn house-btn-secondary" id="killSwitchResetBtn" disabled>Reset</button>
                     </div>
+                </div>
+                <div id="killSwitchBanner" class="house-banner house-banner-info" role="status" hidden>
+                    <p class="house-banner-title">Kill Switch</p>
+                    <p class="house-banner-text">Not halted. New orders can be submitted.</p>
                 </div>
                 <div id="algoStatusBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
                     <p class="house-banner-title">Loading algorithm status</p>
@@ -1793,6 +1800,7 @@
                         }).join('');
                     }
                     loadShadowStatus(opts);
+                    loadKillSwitchStatus();
                 })
                 .catch(err => {
                     setDisabled('algoRefreshBtn', false);
@@ -1802,6 +1810,7 @@
                     if (form) form.disabled = true;
                     setBanner(banner, 'error', 'Cannot load algorithm status', err.message);
                     loadShadowStatus(opts);
+                    loadKillSwitchStatus();
                 });
         }
         function algoEnable() {
@@ -1826,6 +1835,94 @@
                 .catch(err => {
                     setDisabled('algoDisableBtn', false);
                     setBanner(banner, 'error', 'Cannot disable algorithm', err.message);
+                });
+        }
+        let killSwitchInFlight = false;
+        function paintKillSwitchChip(halted) {
+            const el = document.getElementById('killSwitchStatus');
+            if (!el) return;
+            el.className = 'status ' + (halted ? 'error' : 'connected');
+            el.textContent = halted ? 'Halted' : 'Not halted';
+        }
+        function applyKillSwitchEnablement(halted) {
+            setDisabled('killSwitchBtn', false);
+            setDisabled('killSwitchResetBtn', !halted);
+        }
+        function loadKillSwitchStatus() {
+            if (killSwitchInFlight) return;
+            fetch('/api/kill-switch/status')
+                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+                .then(data => {
+                    const halted = !!data.halted;
+                    paintKillSwitchChip(halted);
+                    applyKillSwitchEnablement(halted);
+                    const banner = document.getElementById('killSwitchBanner');
+                    if (halted) {
+                        setBanner(banner, 'error', 'Kill Switch is on',
+                            'New orders are blocked until you Reset. It does not disable the algorithm.');
+                    } else if (banner && !banner.hidden && banner.getAttribute('aria-busy') === 'true') {
+                        banner.hidden = true;
+                    }
+                })
+                .catch(err => {
+                    const banner = document.getElementById('killSwitchBanner');
+                    setBanner(banner, 'error', 'Cannot load Kill Switch status', err.message);
+                    setDisabled('killSwitchBtn', false);
+                });
+        }
+        function triggerKillSwitch() {
+            const banner = document.getElementById('killSwitchBanner');
+            killSwitchInFlight = true;
+            setDisabled('killSwitchBtn', true);
+            setDisabled('killSwitchResetBtn', true);
+            setBanner(banner, 'info', 'Pulling Kill Switch',
+                'Cancelling resting orders and blocking new submissions.');
+            fetch('/api/kill-switch', {method:'POST'})
+                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+                .then(data => {
+                    killSwitchInFlight = false;
+                    const halted = data.halted !== false;
+                    paintKillSwitchChip(halted);
+                    const attemptedRaw = Number(data.cancel_attempted);
+                    const okRaw = Number(data.cancel_ok);
+                    const failedRaw = Number(data.cancel_failed);
+                    const attempted = Number.isFinite(attemptedRaw) ? attemptedRaw : 0;
+                    const ok = Number.isFinite(okRaw) ? okRaw : 0;
+                    const failed = Number.isFinite(failedRaw) ? failedRaw : 0;
+                    const text = attempted === 0
+                        ? 'No resting orders to cancel.'
+                        : ('Cancel attempted ' + attempted + ', sent ' + ok + ', failed ' + failed +
+                            '. New orders are blocked until you Reset.');
+                    setBanner(banner, 'error', 'Kill Switch is on', text);
+                    applyKillSwitchEnablement(halted);
+                })
+                .catch(err => {
+                    killSwitchInFlight = false;
+                    setDisabled('killSwitchBtn', false);
+                    setBanner(banner, 'error', 'Cannot pull Kill Switch', err.message);
+                    loadKillSwitchStatus();
+                });
+        }
+        function resetKillSwitch() {
+            const banner = document.getElementById('killSwitchBanner');
+            killSwitchInFlight = true;
+            setDisabled('killSwitchBtn', true);
+            setDisabled('killSwitchResetBtn', true);
+            setBanner(banner, 'info', 'Resetting Kill Switch', 'Clearing the halt so order submission can resume.');
+            fetch('/api/kill-switch/reset', {method:'POST'})
+                .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+                .then(data => {
+                    killSwitchInFlight = false;
+                    const halted = !!data.halted;
+                    paintKillSwitchChip(halted);
+                    setBanner(banner, 'success', 'Kill Switch is off',
+                        'Order submission can resume. Cancelled orders are not re-posted.');
+                    applyKillSwitchEnablement(halted);
+                })
+                .catch(err => {
+                    killSwitchInFlight = false;
+                    setBanner(banner, 'error', 'Cannot reset Kill Switch', err.message);
+                    loadKillSwitchStatus();
                 });
         }
         function algoStrategyChanged() {
@@ -1866,6 +1963,8 @@
         }
         document.getElementById('algoEnableBtn').addEventListener('click', algoEnable);
         document.getElementById('algoDisableBtn').addEventListener('click', algoDisable);
+        document.getElementById('killSwitchBtn').addEventListener('click', triggerKillSwitch);
+        document.getElementById('killSwitchResetBtn').addEventListener('click', resetKillSwitch);
         document.getElementById('algoRefreshBtn').addEventListener('click', function () {
             loadAlgoStatus({ userInitiated: true });
         });
