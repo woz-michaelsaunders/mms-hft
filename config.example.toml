@@ -85,6 +85,56 @@ heartbeat_interval      = 30
 max_reconnect_attempts  = 10
 reconnect_backoff_ms    = 1000
 
+# ─── OMS hard risk gates (Road to Live) ─────────────────────────────────────
+# Copy these tables into gitignored config.toml. Changing a number takes a
+# process restart — the same motion as adding a [[sessions]] row. There is
+# no REST to edit these keys, and they are not secrets.
+#
+# max_position and max_notional here are the hard caps on every new order
+# (35=D). The Algo tab field "Max position (base units)" is a separate,
+# REST-mutable soft strategy cap. It can differ and does not override these.
+#
+# Values below are illustrative, not risk sign-off. Tune them in config.toml
+# after deploy. Empty or omitted [[symbol_limits]] leaves the exposure gate
+# off (deploy-day no-op). Once any row is present, an order for a symbol
+# that is not listed is rejected. Seed the three subscribed symbols so the
+# algo default BTC_USDT is not a surprise reject.
+#
+# Quote currencies (USDT / USD / PERP) are treated 1:1 for notional and
+# session drawdown in UAT.
+#
+# A session drawdown halt uses the existing Algo-tab Kill Switch. The chip
+# reads Halted and Reset is enabled; the banner does not say "drawdown".
+# Diagnose the trigger from process logs.
+#
+# Residual: an unpriced market-by-qty order (no price, no cash order qty)
+# skips the notional check and is position-only — the order-management
+# session has no market-data book mid.
+# Residual: session drawdown uses the sum of realized P&L only (no
+# mark-to-market).
+# Residual: 35=G amends are not exposure-gated.
+
+[[symbol_limits]]
+symbol        = "BTC_USDT"
+max_position  = 0.05
+max_notional  = 5000.0
+
+[[symbol_limits]]
+symbol        = "BTC_USD"
+max_position  = 0.05
+max_notional  = 5000.0
+
+[[symbol_limits]]
+symbol        = "BTCUSD-PERP"
+max_position  = 0.05
+max_notional  = 5000.0
+
+# Omit session_max_drawdown, or set it to 0.0 or below, to leave the
+# drawdown guard off. A finite value greater than 0 arms it. NaN or Inf
+# is a parse error and the process will not start.
+[risk]
+session_max_drawdown = 0.0
+
 # ─── kdb+ Connection (environment variables — not in this file) ──────────────
 # KDB_HOST  (default: localhost)
 # KDB_PORT  (default: 5001)

@@ -57,6 +57,12 @@ struct Config {
     #[serde(default)]
     credentials: HashMap<String, CredentialConfig>, // [credentials.NAME]
     connection: ConnectionConfig,
+    /// OMS hard per-symbol caps. Empty ⇒ exposure gate off (EL-018).
+    #[serde(default)]
+    symbol_limits: Vec<SymbolLimitConfig>,
+    /// Session-level risk knobs. Missing `[risk]` ⇒ drawdown guard off.
+    #[serde(default)]
+    risk: RiskConfig,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -245,6 +251,28 @@ struct ConnectionConfig {
     reconnect_backoff_ms: u64,
 }
 
+/// One `[[symbol_limits]]` row. Caps are OMS HARD limits (not the algo REST soft cap).
+#[derive(Clone, Debug, serde::Deserialize)]
+struct SymbolLimitConfig {
+    symbol: String,
+    max_position: f64,
+    max_notional: f64,
+}
+
+/// `[risk]` table. `None` / finite `≤ 0` ⇒ drawdown guard off (EL-018).
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+struct RiskConfig {
+    #[serde(default)]
+    session_max_drawdown: Option<f64>,
+}
+
+/// Runtime per-symbol caps. `symbol` is the HashMap key, not stored here.
+#[derive(Clone, Copy, Debug)]
+struct SymbolLimit {
+    max_position: f64,
+    max_notional: f64,
+}
+
 /// Append one line to `startup.log`, independent of the logging framework and
 /// of whatever pm2 is doing with our stdout/stderr.
 ///
@@ -430,6 +458,29 @@ fn validate_config(config: &mut Config) -> Result<()> {
             || session.host.chars().any(char::is_whitespace)
         {
             bail!("session '{}' host must not contain whitespace", session.name);
+        }
+    }
+
+    let mut seen_limit_symbols: HashSet<String> = HashSet::new();
+    for row in &config.symbol_limits {
+        let trimmed = row.symbol.trim().to_string();
+        if trimmed.is_empty() {
+            bail!("symbol_limits symbol must not be empty");
+        }
+        if !seen_limit_symbols.insert(trimmed.clone()) {
+            bail!("duplicate symbol_limits symbol: {trimmed}");
+        }
+        if !row.max_position.is_finite() || row.max_position <= 0.0 {
+            bail!("symbol_limits '{trimmed}' max_position must be finite and > 0");
+        }
+        if !row.max_notional.is_finite() || row.max_notional <= 0.0 {
+            bail!("symbol_limits '{trimmed}' max_notional must be finite and > 0");
+        }
+    }
+
+    if let Some(dd) = config.risk.session_max_drawdown {
+        if !dd.is_finite() {
+            bail!("risk.session_max_drawdown must be finite");
         }
     }
 
@@ -767,6 +818,20 @@ impl PositionsStore {
         self.store.load().values().cloned().collect()
     }
 
+    /// Net quantity for `symbol`, or `0.0` if the symbol has no position yet.
+    pub fn net_qty_of(&self, symbol: &str) -> f64 {
+        self.store
+            .load()
+            .get(symbol)
+            .map(|p| p.net_qty)
+            .unwrap_or(0.0)
+    }
+
+    /// Sum of realized P&L across all symbols. Unrealized is excluded (EL-004).
+    pub fn sum_realized_pnl(&self) -> f64 {
+        self.snapshot().iter().map(|p| p.realized_pnl).sum()
+    }
+
     /// Replay fills from data/trades.csv to rebuild positions after a restart.
     /// CSV columns: timestamp_ns,cl_ord_id,order_id,symbol,side,exec_type,last_qty,last_px,avg_px
     pub fn load_from_trades_csv(&self) {
@@ -894,6 +959,12 @@ pub struct FIXSession {
     operator_halt: Arc<AtomicBool>,
     // Lock-free positions store — aggregated fills per symbol
     positions: Arc<PositionsStore>,
+    /// OMS hard per-symbol caps. Empty map ⇒ exposure gate off (EL-018).
+    symbol_limits: Arc<ArcSwap<HashMap<String, SymbolLimit>>>,
+    /// Session drawdown threshold as f64 bits. `0.0` ⇒ guard off.
+    session_max_drawdown_bits: AtomicU64,
+    /// Peak Σ realized_pnl as f64 bits. Rebased on `reset_operator_halt`.
+    drawdown_peak_bits: AtomicU64,
     // Event-driven update channels (optional, set after creation)
     order_update_tx: Arc<Mutex<Option<broadcast::Sender<()>>>>,
     order_book_update_tx: Arc<Mutex<Option<broadcast::Sender<String>>>>,
@@ -1086,6 +1157,20 @@ impl FIXSession {
             info!("🔄 Restored seq_num={} for {} from {}", initial_seq, sender, seq_path);
         }
 
+        let positions = {
+            let ps = Arc::new(PositionsStore::new());
+            ps.load_from_trades_csv();
+            ps
+        };
+        // EL-009: peak starts at CSV-replayed Σ realized even if the guard is off.
+        // Do not trip halt in the ctor.
+        let peak_sum = positions.sum_realized_pnl();
+        let peak_bits = if peak_sum.is_finite() {
+            peak_sum.to_bits()
+        } else {
+            0.0f64.to_bits()
+        };
+
         FIXSession {
             stream: Arc::new(Mutex::new(None)),
             sender_comp_id: sender.to_string(),
@@ -1107,11 +1192,10 @@ impl FIXSession {
             order_books: Arc::new(Mutex::new(HashMap::new())),
             open_orders: Arc::new(OpenOrdersStore::new()),
             operator_halt: Arc::new(AtomicBool::new(false)),
-            positions: {
-                let ps = Arc::new(PositionsStore::new());
-                ps.load_from_trades_csv();
-                ps
-            },
+            positions,
+            symbol_limits: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            session_max_drawdown_bits: AtomicU64::new(0.0f64.to_bits()),
+            drawdown_peak_bits: AtomicU64::new(peak_bits),
             order_update_tx: Arc::new(Mutex::new(None)),
             order_book_update_tx: Arc::new(Mutex::new(None)),
             kdb_writer,
@@ -1379,7 +1463,112 @@ impl FIXSession {
 
     pub fn reset_operator_halt(&self) {
         self.operator_halt.store(false, Ordering::SeqCst);
-        info!("operator_halt=false");
+        let peak = self.session_realized_pnl();
+        let peak = if peak.is_finite() { peak } else { 0.0 };
+        store_f64(&self.drawdown_peak_bits, peak);
+        info!("operator_halt=false drawdown_peak_rebased_to={}", peak);
+    }
+
+    /// Production: once, on the OM handle after spawn. Tests: arm fixtures.
+    /// Replaces the whole map. Does NOT rebase peak. Does NOT touch operator_halt.
+    fn apply_risk_config(
+        &self,
+        limits: HashMap<String, SymbolLimit>,
+        session_max_drawdown: Option<f64>,
+    ) {
+        let keys: Vec<String> = limits.keys().cloned().collect();
+        self.symbol_limits.store(Arc::new(limits));
+        let threshold = match session_max_drawdown {
+            Some(v) if v.is_finite() && v > 0.0 => v,
+            Some(v) if !v.is_finite() => {
+                warn!("session_max_drawdown is non-finite; treating as off");
+                0.0
+            }
+            _ => 0.0,
+        };
+        store_f64(&self.session_max_drawdown_bits, threshold);
+        info!(
+            "risk_config symbols={:?} session_max_drawdown={}",
+            keys, threshold
+        );
+    }
+
+    fn reject_if_exposure_breach(&self, order: &OrderRequest) -> Result<()> {
+        let limits = self.symbol_limits.load();
+        let net = self.positions.net_qty_of(&order.symbol);
+        match check_exposure(order, net, limits.as_ref()) {
+            Ok(()) => Ok(()),
+            Err(r) => {
+                let signed = if order.side == '1' {
+                    order.qty
+                } else {
+                    -order.qty
+                };
+                let projected = net + signed;
+                let lim = limits.get(&order.symbol);
+                let max_pos = lim
+                    .map(|l| l.max_position.to_string())
+                    .unwrap_or_else(|| "n/a".into());
+                let max_not = lim
+                    .map(|l| l.max_notional.to_string())
+                    .unwrap_or_else(|| "n/a".into());
+                let notional = if let Some(p) = order.price {
+                    (order.qty * p).to_string()
+                } else if let Some(c) = order.cash_order_qty {
+                    c.to_string()
+                } else {
+                    "n/a".into()
+                };
+                warn!(
+                    "exposure_gate=reject reason={} cl_ord_id={} symbol={} side={} qty={} net_qty={} projected={} max_position={} notional={} max_notional={}",
+                    exposure_reject_reason_tag(r),
+                    order.cl_ord_id,
+                    order.symbol,
+                    order.side,
+                    order.qty,
+                    net,
+                    projected,
+                    max_pos,
+                    notional,
+                    max_not,
+                );
+                Err(anyhow!(exposure_reject_str(r)))
+            }
+        }
+    }
+
+    fn session_realized_pnl(&self) -> f64 {
+        self.positions.sum_realized_pnl()
+    }
+
+    /// Realized-only drawdown (EL-004 residual: no mark-to-market / MD books).
+    async fn evaluate_session_drawdown(&self) {
+        let threshold = load_f64(&self.session_max_drawdown_bits);
+        if !threshold.is_finite() || threshold <= 0.0 {
+            return;
+        }
+        let current = self.session_realized_pnl();
+        if !current.is_finite() {
+            warn!("session_drawdown non-finite realized_pnl; fail-closed halt");
+            if !self.operator_halt_is_set() {
+                self.trigger_operator_halt().await;
+            }
+            return;
+        }
+        let mut peak = load_f64(&self.drawdown_peak_bits);
+        if !peak.is_finite() || current > peak {
+            store_f64(&self.drawdown_peak_bits, current);
+            peak = current;
+        }
+        if peak - current >= threshold {
+            info!(
+                "operator_halt=true reason=drawdown peak={} current={} threshold={}",
+                peak, current, threshold
+            );
+            if !self.operator_halt_is_set() {
+                self.trigger_operator_halt().await;
+            }
+        }
     }
 
     pub async fn trigger_operator_halt(&self) -> OperatorHaltTriggerResult {
@@ -1517,6 +1706,10 @@ impl FIXSession {
                 "operator_halt=true rejected 35=D cl_ord_id={} symbol={}",
                 order.cl_ord_id, order.symbol
             );
+            return Err(e);
+        }
+
+        if let Err(e) = self.reject_if_exposure_breach(order) {
             return Err(e);
         }
 
@@ -2320,6 +2513,7 @@ impl FIXSession {
                         if last_qty > 0.0 && last_px > 0.0 {
                             self.positions.apply_fill(fill_symbol, fill_side, last_qty, last_px);
                             info!("📈 Position updated: symbol={} side={} qty={} px={}", fill_symbol, fill_side, last_qty, last_px);
+                            self.evaluate_session_drawdown().await;
                         }
                     }
 
@@ -3367,6 +3561,121 @@ impl FIXSession {
 
 /// Distinguishes halt rejects from `Session not ready` and `Duplicate ClOrdID rejected`.
 const OPERATOR_HALT_REJECT: &str = "Operator halt is active; new orders are blocked";
+
+const EXPOSURE_UNKNOWN_SYMBOL_REJECT: &str =
+    "Symbol is not in the configured symbol_limits table; new orders are blocked";
+const EXPOSURE_POSITION_REJECT: &str =
+    "Projected position exceeds the configured per-symbol max_position; new orders are blocked";
+const EXPOSURE_NOTIONAL_REJECT: &str =
+    "Order notional exceeds the configured per-symbol max_notional; new orders are blocked";
+const EXPOSURE_INVALID_QTY_REJECT: &str =
+    "Order quantity must be a finite value greater than zero";
+const EXPOSURE_INVALID_SIDE_REJECT: &str =
+    "Order side must be 1 (buy) or 2 (sell)";
+const EXPOSURE_INVALID_PRICE_REJECT: &str =
+    "Order price must be a finite value greater than zero when present";
+const EXPOSURE_INVALID_CASH_QTY_REJECT: &str =
+    "CashOrderQty must be a finite value greater than zero when present";
+
+/// Same epsilon already used by `Position::apply_fill`. Do not invent a second epsilon.
+const POSITION_FLAT_EPS: f64 = 1e-10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExposureReject {
+    UnknownSymbol,
+    Position,
+    Notional,
+    InvalidQty,
+    InvalidSide,
+    InvalidPrice,
+    InvalidCashQty,
+}
+
+fn exposure_reject_str(r: ExposureReject) -> &'static str {
+    match r {
+        ExposureReject::UnknownSymbol => EXPOSURE_UNKNOWN_SYMBOL_REJECT,
+        ExposureReject::Position => EXPOSURE_POSITION_REJECT,
+        ExposureReject::Notional => EXPOSURE_NOTIONAL_REJECT,
+        ExposureReject::InvalidQty => EXPOSURE_INVALID_QTY_REJECT,
+        ExposureReject::InvalidSide => EXPOSURE_INVALID_SIDE_REJECT,
+        ExposureReject::InvalidPrice => EXPOSURE_INVALID_PRICE_REJECT,
+        ExposureReject::InvalidCashQty => EXPOSURE_INVALID_CASH_QTY_REJECT,
+    }
+}
+
+fn exposure_reject_reason_tag(r: ExposureReject) -> &'static str {
+    match r {
+        ExposureReject::UnknownSymbol => "unknown_symbol",
+        ExposureReject::Position => "position",
+        ExposureReject::Notional => "notional",
+        ExposureReject::InvalidQty => "invalid_qty",
+        ExposureReject::InvalidSide => "invalid_side",
+        ExposureReject::InvalidPrice => "invalid_price",
+        ExposureReject::InvalidCashQty => "invalid_cash_qty",
+    }
+}
+
+fn load_f64(a: &AtomicU64) -> f64 {
+    f64::from_bits(a.load(Ordering::SeqCst))
+}
+
+fn store_f64(a: &AtomicU64, v: f64) {
+    a.store(v.to_bits(), Ordering::SeqCst);
+}
+
+/// Pure pre-trade 35=D exposure predicate. Empty `limits` ⇒ Ok (gate off, EL-018).
+/// Residual (EL-003): both `price` and `cash_order_qty` None ⇒ skip notional, position-only.
+fn check_exposure(
+    order: &OrderRequest,
+    net_qty: f64,
+    limits: &HashMap<String, SymbolLimit>,
+) -> std::result::Result<(), ExposureReject> {
+    if limits.is_empty() {
+        return Ok(());
+    }
+    if !order.qty.is_finite() || order.qty <= 0.0 {
+        return Err(ExposureReject::InvalidQty);
+    }
+    if order.side != '1' && order.side != '2' {
+        return Err(ExposureReject::InvalidSide);
+    }
+    if let Some(p) = order.price {
+        if !p.is_finite() || p <= 0.0 {
+            return Err(ExposureReject::InvalidPrice);
+        }
+    }
+    if let Some(c) = order.cash_order_qty {
+        if !c.is_finite() || c <= 0.0 {
+            return Err(ExposureReject::InvalidCashQty);
+        }
+    }
+    let Some(limit) = limits.get(&order.symbol) else {
+        return Err(ExposureReject::UnknownSymbol);
+    };
+    let signed = if order.side == '1' {
+        order.qty
+    } else {
+        -order.qty
+    };
+    let projected = net_qty + signed;
+    // Reduce/flatten (`|projected| ≤ |net| + EPS`) skips the position cap (AC3 / EL-006).
+    if projected.abs() > net_qty.abs() + POSITION_FLAT_EPS && projected.abs() > limit.max_position {
+        return Err(ExposureReject::Position);
+    }
+    let notional = if let Some(p) = order.price {
+        Some(order.qty * p)
+    } else if let Some(c) = order.cash_order_qty {
+        Some(c)
+    } else {
+        None
+    };
+    if let Some(n) = notional {
+        if n > limit.max_notional {
+            return Err(ExposureReject::Notional);
+        }
+    }
+    Ok(())
+}
 
 const STATUS_READ_SKIPPED_LOCK_CONTENDED: &str = "skipped_lock_contended";
 
@@ -6362,6 +6671,20 @@ async fn main() -> Result<()> {
     let primary_md = lookup_primary_md(&spawned);
     let all_md = lookup_all_md(&spawned);
 
+    if let Some(ref om_h) = om {
+        let mut map = HashMap::new();
+        for row in &config.symbol_limits {
+            map.insert(
+                row.symbol.trim().to_string(),
+                SymbolLimit {
+                    max_position: row.max_position,
+                    max_notional: row.max_notional,
+                },
+            );
+        }
+        om_h.apply_risk_config(map, config.risk.session_max_drawdown);
+    }
+
     // ---- OM bundle ----
     let watcher_opt: Option<tokio::task::JoinHandle<()>> = if let Some(ref om_h) = om {
         let order_tx = order_tx_holder
@@ -7298,6 +7621,244 @@ symbol_routing = "all"
             std::env::remove_var(secret);
             std::env::remove_var(unused);
         }
+    }
+
+    #[test]
+    fn missing_symbol_limits_and_risk_parse_as_defaults() {
+        let mut c = parse_config(&skeleton_md()).unwrap();
+        validate_config(&mut c).unwrap();
+        assert!(c.symbol_limits.is_empty());
+        assert!(c.risk.session_max_drawdown.is_none());
+    }
+
+    #[test]
+    fn parse_config_uat_example_file_includes_risk_gates() {
+        let src = include_str!("../config.example.toml");
+        let mut c = parse_config(src).unwrap();
+        validate_config(&mut c).unwrap();
+        assert_eq!(c.symbol_limits.len(), 3);
+        assert_eq!(c.symbol_limits[0].symbol, "BTC_USDT");
+        assert_eq!(c.symbol_limits[1].symbol, "BTC_USD");
+        assert_eq!(c.symbol_limits[2].symbol, "BTCUSD-PERP");
+        assert_eq!(c.symbol_limits[0].max_position, 0.05);
+        assert_eq!(c.symbol_limits[0].max_notional, 5000.0);
+        assert_eq!(c.risk.session_max_drawdown, Some(0.0));
+    }
+
+    #[test]
+    fn duplicate_symbol_limits_is_rejected() {
+        let toml = skeleton_md()
+            + r#"
+[[symbol_limits]]
+symbol = "BTC_USDT"
+max_position = 0.05
+max_notional = 5000.0
+
+[[symbol_limits]]
+symbol = " BTC_USDT "
+max_position = 0.1
+max_notional = 1000.0
+"#;
+        validate_err_contains(&toml, "duplicate symbol_limits symbol: BTC_USDT");
+    }
+
+    #[test]
+    fn empty_symbol_limits_symbol_is_rejected() {
+        let toml = skeleton_md()
+            + r#"
+[[symbol_limits]]
+symbol = "   "
+max_position = 0.05
+max_notional = 5000.0
+"#;
+        validate_err_contains(&toml, "symbol_limits symbol must not be empty");
+    }
+
+    #[test]
+    fn non_positive_or_non_finite_caps_are_rejected() {
+        validate_err_contains(
+            &(skeleton_md()
+                + r#"
+[[symbol_limits]]
+symbol = "BTC_USDT"
+max_position = 0.0
+max_notional = 5000.0
+"#),
+            "max_position must be finite and > 0",
+        );
+        validate_err_contains(
+            &(skeleton_md()
+                + r#"
+[[symbol_limits]]
+symbol = "BTC_USDT"
+max_position = 0.05
+max_notional = -1.0
+"#),
+            "max_notional must be finite and > 0",
+        );
+        validate_err_contains(
+            &(skeleton_md()
+                + r#"
+[[symbol_limits]]
+symbol = "BTC_USDT"
+max_position = nan
+max_notional = 5000.0
+"#),
+            "max_position must be finite and > 0",
+        );
+        validate_err_contains(
+            &(skeleton_md()
+                + r#"
+[[symbol_limits]]
+symbol = "BTC_USDT"
+max_position = 0.05
+max_notional = inf
+"#),
+            "max_notional must be finite and > 0",
+        );
+    }
+
+    #[test]
+    fn nan_inf_session_max_drawdown_is_rejected() {
+        validate_err_contains(
+            &(skeleton_md() + "\n[risk]\nsession_max_drawdown = nan\n"),
+            "risk.session_max_drawdown must be finite",
+        );
+        validate_err_contains(
+            &(skeleton_md() + "\n[risk]\nsession_max_drawdown = inf\n"),
+            "risk.session_max_drawdown must be finite",
+        );
+        validate_err_contains(
+            &(skeleton_md() + "\n[risk]\nsession_max_drawdown = -inf\n"),
+            "risk.session_max_drawdown must be finite",
+        );
+    }
+
+    #[test]
+    fn non_positive_session_max_drawdown_validates_as_off() {
+        for snippet in [
+            "\n[risk]\nsession_max_drawdown = 0.0\n",
+            "\n[risk]\nsession_max_drawdown = -1.0\n",
+        ] {
+            let mut c = parse_config(&(skeleton_md() + snippet)).unwrap();
+            validate_config(&mut c).unwrap();
+            assert!(c.risk.session_max_drawdown.unwrap() <= 0.0);
+        }
+    }
+
+    fn sample_order(symbol: &str, side: char, qty: f64, price: Option<f64>) -> OrderRequest {
+        OrderRequest {
+            cl_ord_id: "T1".into(),
+            symbol: symbol.into(),
+            side,
+            qty,
+            price,
+            ord_type: None,
+            time_in_force: None,
+            currency: None,
+            exec_inst: None,
+            quote_id: None,
+            cash_order_qty: None,
+            cash_margin: None,
+            trigger_price_type: None,
+            self_match_prevention_scope: None,
+            self_match_prevention_instruction: None,
+            self_match_prevention_id: None,
+            broker_id: None,
+            receive_window: None,
+        }
+    }
+
+    fn btc_limits() -> HashMap<String, SymbolLimit> {
+        let mut m = HashMap::new();
+        m.insert(
+            "BTC_USDT".into(),
+            SymbolLimit {
+                max_position: 0.05,
+                max_notional: 5000.0,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn check_exposure_empty_map_is_off() {
+        let order = sample_order("ANY", '1', 99.0, Some(1.0));
+        assert_eq!(check_exposure(&order, 0.0, &HashMap::new()), Ok(()));
+    }
+
+    #[test]
+    fn check_exposure_unknown_symbol_fail_closed() {
+        let order = sample_order("ETH_USDT", '1', 0.001, Some(100.0));
+        assert_eq!(
+            check_exposure(&order, 0.0, &btc_limits()),
+            Err(ExposureReject::UnknownSymbol)
+        );
+    }
+
+    #[test]
+    fn check_exposure_position_and_notional_and_reduce() {
+        let limits = btc_limits();
+        let over_pos = sample_order("BTC_USDT", '1', 0.1, Some(100.0));
+        assert_eq!(
+            check_exposure(&over_pos, 0.0, &limits),
+            Err(ExposureReject::Position)
+        );
+
+        let in_limit = sample_order("BTC_USDT", '1', 0.01, Some(100.0));
+        assert_eq!(check_exposure(&in_limit, 0.0, &limits), Ok(()));
+
+        // Already at/above cap: a sell that reduces |net| is not position-blocked.
+        let reduce = sample_order("BTC_USDT", '2', 0.02, Some(100.0));
+        assert_eq!(check_exposure(&reduce, 0.05, &limits), Ok(()));
+
+        // Reverse-through-flat that grows |net| is capped.
+        let reverse_grow = sample_order("BTC_USDT", '2', 0.12, Some(100.0));
+        assert_eq!(
+            check_exposure(&reverse_grow, 0.05, &limits),
+            Err(ExposureReject::Position)
+        );
+
+        // Notional is not reduce-exempt.
+        let reduce_fat_notional = sample_order("BTC_USDT", '2', 0.02, Some(300_000.0));
+        assert_eq!(
+            check_exposure(&reduce_fat_notional, 0.05, &limits),
+            Err(ExposureReject::Notional)
+        );
+    }
+
+    #[test]
+    fn check_exposure_unpriced_market_skips_notional() {
+        let mut order = sample_order("BTC_USDT", '1', 0.01, None);
+        order.cash_order_qty = None;
+        assert_eq!(check_exposure(&order, 0.0, &btc_limits()), Ok(()));
+
+        order.cash_order_qty = Some(6000.0);
+        assert_eq!(
+            check_exposure(&order, 0.0, &btc_limits()),
+            Err(ExposureReject::Notional)
+        );
+    }
+
+    #[test]
+    fn check_exposure_invalid_qty_side_price_cash() {
+        let limits = btc_limits();
+        let mut o = sample_order("BTC_USDT", '1', 0.0, Some(100.0));
+        assert_eq!(check_exposure(&o, 0.0, &limits), Err(ExposureReject::InvalidQty));
+        o.qty = f64::NAN;
+        assert_eq!(check_exposure(&o, 0.0, &limits), Err(ExposureReject::InvalidQty));
+        o.qty = 0.01;
+        o.side = '3';
+        assert_eq!(check_exposure(&o, 0.0, &limits), Err(ExposureReject::InvalidSide));
+        o.side = '1';
+        o.price = Some(0.0);
+        assert_eq!(check_exposure(&o, 0.0, &limits), Err(ExposureReject::InvalidPrice));
+        o.price = Some(100.0);
+        o.cash_order_qty = Some(f64::INFINITY);
+        assert_eq!(
+            check_exposure(&o, 0.0, &limits),
+            Err(ExposureReject::InvalidCashQty)
+        );
     }
 }
 
@@ -8503,6 +9064,177 @@ mod connectivity_tests {
         cleanup_processed("E2E_HALT_2");
         cleanup_processed("E2E_HALT_3");
         cleanup_processed("E2E_HALT_4");
+        Ok(())
+    }
+
+    /// Inject a contiguous inbound ExecutionReport (ExecType=Fill) so the
+    /// production fill path (`apply_fill` + `evaluate_session_drawdown`) runs.
+    /// Seq must be last_applied("inbound")+1 or `handle_message` drops the ER.
+    async fn inject_fill(
+        session: &FIXSession,
+        cl_ord_id: &str,
+        symbol: &str,
+        side: char,
+        qty: f64,
+        px: f64,
+    ) -> Result<()> {
+        let seq = session.sequencer.lock().await.last_applied("inbound") + 1;
+        let mut msg = FIXMessage::new(
+            '8',
+            &session.target_comp_id,
+            &session.sender_comp_id,
+            seq,
+        );
+        msg.set_field(tags::CL_ORD_ID, cl_ord_id);
+        msg.set_field(tags::SYMBOL, symbol);
+        msg.set_field(tags::SIDE, &side.to_string());
+        msg.set_field(tags::LAST_QTY, &qty.to_string());
+        msg.set_field(tags::LAST_PX, &px.to_string());
+        msg.set_field(tags::ORDER_ID, &format!("OID_{cl_ord_id}"));
+        msg.set_field(150, "2");
+        session.handle_message(&msg).await?;
+        Ok(())
+    }
+
+    /// AC1–AC3: a 35=D that would breach configured position/notional is
+    /// rejected locally with no venue send; in-limit and reducing orders send.
+    #[tokio::test]
+    async fn e2e_exposure_limit_rejects_without_sending() -> Result<()> {
+        let orders_received = Arc::new(Mutex::new(0u64));
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                orders_received: Some(Arc::clone(&orders_received)),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        // Flatten any CSV-replayed BTC_USDT inventory so this fixture starts flat.
+        let existing = session.positions.net_qty_of("BTC_USDT");
+        if existing.abs() > POSITION_FLAT_EPS {
+            let side = if existing > 0.0 { "2" } else { "1" };
+            session
+                .positions
+                .apply_fill("BTC_USDT", side, existing.abs(), 100.0);
+        }
+
+        let mut limits = HashMap::new();
+        limits.insert(
+            "BTC_USDT".to_string(),
+            SymbolLimit {
+                max_position: 0.01,
+                max_notional: 50_000.0,
+            },
+        );
+        session.apply_risk_config(limits, None);
+
+        let before = *orders_received.lock().await;
+
+        let err = session
+            .new_order_single("E2E_EXP_OVER", "BTC_USDT", '1', 1.0, 100.0)
+            .await
+            .expect_err("oversized 35=D must be rejected locally");
+        let err_s = err.to_string();
+        assert!(
+            err_s.contains(EXPOSURE_POSITION_REJECT) || err_s.contains(EXPOSURE_NOTIONAL_REJECT),
+            "expected exposure reject, got {err_s}"
+        );
+        assert_eq!(
+            *orders_received.lock().await,
+            before,
+            "rejected 35=D must not reach the mock gateway"
+        );
+
+        session
+            .new_order_single("E2E_EXP_OK", "BTC_USDT", '1', 0.001, 100.0)
+            .await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+        assert_eq!(*orders_received.lock().await, before + 1);
+
+        // Already above the cap: a reducing sell is not position-blocked (AC3).
+        session.positions.apply_fill("BTC_USDT", "1", 1.0, 100.0);
+        session
+            .new_order_single("E2E_EXP_REDUCE", "BTC_USDT", '2', 0.4, 100.0)
+            .await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+        assert_eq!(*orders_received.lock().await, before + 2);
+
+        cleanup_processed("E2E_EXP_OVER");
+        cleanup_processed("E2E_EXP_OK");
+        cleanup_processed("E2E_EXP_REDUCE");
+        Ok(())
+    }
+
+    /// AC4–AC6: realized-PnL drawdown trips the existing operator halt;
+    /// subsequent 35=D is rejected; reset rebases the peak and trading resumes.
+    #[tokio::test]
+    async fn e2e_session_drawdown_trips_halt_and_resumes_after_reset() -> Result<()> {
+        let orders_received = Arc::new(Mutex::new(0u64));
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                orders_received: Some(Arc::clone(&orders_received)),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+        session.apply_risk_config(HashMap::new(), Some(5.0));
+
+        // Dedicated symbol so CSV-replayed BTC_USDT inventory cannot change the PnL path.
+        let peak_before = session.session_realized_pnl();
+        inject_fill(&session, "E2E_DD_BUY", "DD_GUARD_SYM", '1', 1.0, 100.0).await?;
+        inject_fill(&session, "E2E_DD_SELL", "DD_GUARD_SYM", '2', 1.0, 90.0).await?;
+        assert!(
+            session.operator_halt_is_set(),
+            "buy@100 then sell@90 is −10 realized vs peak {:?}, threshold 5; now {}",
+            peak_before,
+            session.session_realized_pnl()
+        );
+
+        let before = *orders_received.lock().await;
+        let err = session
+            .new_order_single("E2E_DD_BLOCKED", "BTC_USDT", '1', 0.001, 100.0)
+            .await
+            .expect_err("drawdown halt must reject 35=D");
+        assert!(
+            err.to_string().contains(OPERATOR_HALT_REJECT),
+            "expected OPERATOR_HALT_REJECT, got {err}"
+        );
+        assert_eq!(
+            *orders_received.lock().await,
+            before,
+            "rejected 35=D must not reach the mock gateway"
+        );
+
+        session.reset_operator_halt();
+        assert!(!session.operator_halt_is_set());
+
+        // Rebase must hold: an opening fill that does not worsen realized P&L
+        // must not immediately re-trip (peak is now the post-reset P&L).
+        inject_fill(&session, "E2E_DD_REBASE", "DD_GUARD_SYM", '1', 1.0, 100.0).await?;
+        assert!(
+            !session.operator_halt_is_set(),
+            "reset must rebase drawdown peak so the next fill does not re-halt"
+        );
+
+        session
+            .new_order_single("E2E_DD_RESUME", "BTC_USDT", '1', 0.001, 100.0)
+            .await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+        assert_eq!(*orders_received.lock().await, before + 1);
+
+        cleanup_processed("E2E_DD_BUY");
+        cleanup_processed("E2E_DD_SELL");
+        cleanup_processed("E2E_DD_BLOCKED");
+        cleanup_processed("E2E_DD_REBASE");
+        cleanup_processed("E2E_DD_RESUME");
         Ok(())
     }
 }

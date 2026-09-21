@@ -1,0 +1,596 @@
+[
+  {
+    "width": "375",
+    "state": "halt-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "halt-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "halt-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "halt-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "halt-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "halt-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "halt-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "halt-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "halt-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "halt-disabled-375.png"
+  },
+  {
+    "width": "375",
+    "state": "halt-halted",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "halt-halted-375.png"
+  },
+  {
+    "width": "375",
+    "state": "pos-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "pos-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "pos-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "pos-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "pos-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "pos-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "pos-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "pos-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "pos-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "pos-disabled-375.png"
+  },
+  {
+    "width": "768",
+    "state": "halt-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "halt-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "halt-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "halt-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "halt-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "halt-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "halt-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "halt-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "halt-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "halt-disabled-768.png"
+  },
+  {
+    "width": "768",
+    "state": "halt-halted",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "halt-halted-768.png"
+  },
+  {
+    "width": "768",
+    "state": "pos-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "pos-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "pos-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "pos-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "pos-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "pos-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "pos-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "pos-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "pos-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "pos-disabled-768.png"
+  },
+  {
+    "width": "1280",
+    "state": "halt-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "halt-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "halt-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "halt-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "halt-error",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "halt-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "halt-success",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "halt-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "halt-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "halt-disabled-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "halt-halted",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "halt-halted-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "pos-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "pos-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "pos-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "pos-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "pos-error",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "pos-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "pos-success",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "pos-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "pos-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 800
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "pos-disabled-1280.png"
+  }
+]
