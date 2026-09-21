@@ -442,13 +442,22 @@
             flex-shrink: 0;
         }
         .panel-header { justify-content: space-between; align-items: flex-start; }
+        .panel-header > div { min-width: 0; flex: 1; }
         .panel-header .lead {
             margin: 0;
             color: var(--text-muted);
             font-size: var(--text-sm);
             max-width: 70ch;
+            overflow-wrap: anywhere;
         }
         .form-grid + .btn-row { margin-top: var(--space-4); }
+        .house-form {
+            border: 0;
+            margin: 0;
+            padding: 0;
+            min-width: 0;
+        }
+        .house-form:disabled { opacity: 1; }
         .tab-panel[hidden],
         .house-field[hidden],
         [hidden] { display: none !important; }
@@ -531,7 +540,7 @@
         }
         .form-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            grid-template-columns: repeat(auto-fill, minmax(min(240px, 100%), 1fr));
             gap: var(--space-3);
         }
         .house-field {
@@ -558,8 +567,8 @@
             flex-shrink: 0;
         }
         .house-banner[hidden] { display: none !important; }
-        .house-banner-title { font-weight: 600; margin: 0; }
-        .house-banner-text { margin: 0; }
+        .house-banner-title { font-weight: 600; margin: 0; overflow-wrap: anywhere; }
+        .house-banner-text { margin: 0; overflow-wrap: anywhere; }
         .house-banner-success { background: var(--success-bg); color: var(--success); border: 1px solid var(--success); }
         .house-banner-error { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); }
         .house-banner-info { background: var(--info-bg); color: var(--info); border: 1px solid var(--info); }
@@ -708,6 +717,9 @@
             }
             .stats { grid-template-columns: repeat(2, 1fr); }
             .panel-header { flex-direction: column; }
+            .panel-header .lead { max-width: none; }
+            .form-grid { grid-template-columns: 1fr; }
+            .bt-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .house-btn-primary,
             .md-strip-head .house-btn { width: 100%; justify-content: center; }
             .md-strip { padding: var(--space-2) var(--space-3); gap: var(--space-2); }
@@ -1045,14 +1057,16 @@
                 <div class="panel-header">
                     <div>
                         <h2 class="section-title">Strategy backtester</h2>
-                        <p class="lead">Replay snapshots for a symbol. Run backtest is the primary action.</p>
+                        <p class="lead">Replay snapshots for a symbol. Run backtest is the primary action. Fee and adverse-selection thresholds are in-code placeholders until an operator runs GET /api/backtest/calibrate. This tab does not apply calibrated fees to live config.</p>
                     </div>
                     <button type="button" class="house-btn house-btn-primary" id="btRunBtn" disabled>Run backtest</button>
                 </div>
-                <div id="btBanner" class="house-banner house-banner-neutral" role="status">
-                    <p class="house-banner-title">Ready to run</p>
-                    <p class="house-banner-text">Set parameters, then run a backtest.</p>
+                <div id="btBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+                    <p class="house-banner-title">Loading symbols</p>
+                    <p class="house-banner-text">Fetching the symbol list so you can run a backtest.</p>
                 </div>
+                <fieldset id="btForm" class="house-form" disabled>
+                <legend class="visually-hidden">Backtest parameters</legend>
                 <div class="form-grid">
                     <label class="house-field">
                         <span>Strategy</span>
@@ -1069,7 +1083,7 @@
                         <span>Snapshots</span>
                         <input id="btLimit" class="house-input" type="number" value="5000" min="100" max="50000">
                     </label>
-                    <label class="house-field">
+                    <label class="house-field" id="btSpreadWrap">
                         <span>Min spread (bps)</span>
                         <input id="btSpread" class="house-input" type="number" value="5" step="0.1">
                     </label>
@@ -1094,7 +1108,11 @@
                         <input id="btImbalanceDepth" class="house-input" type="number" value="1" step="1" min="1" max="1" title="Backtest uses top-of-book only (depth = 1)">
                     </label>
                 </div>
+                </fieldset>
                 <span id="btStatus" class="visually-hidden"></span>
+                <div id="btEmpty" class="house-empty">
+                    <p>No backtest yet. Wait for symbols to load, then run backtest.</p>
+                </div>
 
                 <div id="btSummary" hidden>
                     <div class="bt-summary-grid">
@@ -1645,12 +1663,35 @@
             const isImbalance = document.getElementById('btStrategy').value === 'market_imbalance';
             document.getElementById('btImbalanceThresholdWrap').hidden = !isImbalance;
             document.getElementById('btImbalanceDepthWrap').hidden = !isImbalance;
+            document.getElementById('btSpreadWrap').hidden = isImbalance;
         }
         document.getElementById('btStrategy').addEventListener('change', btStrategyChanged);
+
+        function setBtFormDisabled(on) {
+            const form = document.getElementById('btForm');
+            if (form) form.disabled = !!on;
+        }
+        function setBtEmpty(show, text) {
+            const el = document.getElementById('btEmpty');
+            if (!el) return;
+            el.hidden = !show;
+            const p = el.querySelector('p');
+            if (p && text) p.textContent = text;
+        }
+        function finishBacktestRun() {
+            const btn = document.getElementById('btRunBtn');
+            btn.disabled = false;
+            btn.textContent = 'Run backtest';
+            setBtFormDisabled(false);
+        }
 
         function initBacktestSymbols() {
             const sel = document.getElementById('btSymbol');
             if (sel.options.length > 0) return;
+            setDisabled('btRunBtn', true);
+            setBtFormDisabled(true);
+            setBtEmpty(true, 'No backtest yet. Wait for symbols to load, then run backtest.');
+            setBanner(document.getElementById('btBanner'), 'info', 'Loading symbols', 'Fetching the symbol list so you can run a backtest.');
             fetch('/api/symbols')
                 .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
                 .then(data => {
@@ -1658,9 +1699,14 @@
                     if (!syms.length) {
                         setBanner(document.getElementById('btBanner'), 'neutral', 'No symbols', 'No symbols to backtest yet.');
                         setDisabled('btRunBtn', true);
+                        setBtFormDisabled(true);
+                        setBtEmpty(true, 'No symbols to backtest yet. Load market data, then return to this tab.');
                         return;
                     }
                     setDisabled('btRunBtn', false);
+                    setBtFormDisabled(false);
+                    setBanner(document.getElementById('btBanner'), 'neutral', 'Ready to run', 'Set parameters, then run a backtest.');
+                    setBtEmpty(true, 'No backtest yet. Set parameters, then run backtest.');
                     syms.forEach(s => {
                         const o = document.createElement('option');
                         o.value = s; o.textContent = s;
@@ -1671,6 +1717,8 @@
                 .catch(() => {
                     setBanner(document.getElementById('btBanner'), 'error', 'Cannot load symbols', 'The symbol list is unavailable.');
                     setDisabled('btRunBtn', true);
+                    setBtFormDisabled(true);
+                    setBtEmpty(true, 'Cannot load symbols. Check the message above, then open this tab again.');
                 });
         }
 
@@ -1696,29 +1744,31 @@
 
             btn.disabled = true;
             btn.textContent = 'Running…';
+            setBtFormDisabled(true);
             status.textContent = 'Fetching data and simulating…';
             setBanner(banner, 'info', 'Running backtest', 'Fetching snapshots and simulating ' + symbol + '.');
             document.getElementById('btSummary').hidden = true;
+            setBtEmpty(true, 'Fetching snapshots and simulating. Run backtest is disabled until this finishes.');
 
             const url = '/api/backtest?symbol=' + encodeURIComponent(symbol) + '&limit=' + limit + '&min_spread_bps=' + spread + '&order_qty=' + qty + '&max_position=' + maxPos + '&tick_size=' + tick + '&strategy=' + strategy + '&imbalance_threshold=' + threshold + '&imbalance_depth_levels=' + depth;
 
             fetch(url)
                 .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
                 .then(data => {
-                    btn.disabled = false;
-                    btn.textContent = 'Run backtest';
+                    finishBacktestRun();
                     if (data.error) {
                         setBanner(banner, 'error', 'Backtest failed', data.error);
                         status.textContent = 'Error: ' + data.error;
+                        setBtEmpty(true, 'Backtest did not complete. Check the message above, then try again.');
                         return;
                     }
                     renderBacktestResults(data, symbol);
                 })
                 .catch(err => {
-                    btn.disabled = false;
-                    btn.textContent = 'Run backtest';
+                    finishBacktestRun();
                     setBanner(banner, 'error', 'Cannot run backtest', err.message);
                     status.textContent = 'Error: ' + err.message;
+                    setBtEmpty(true, 'Backtest did not complete. Check the message above, then try again.');
                 });
         }
         document.getElementById('btRunBtn').addEventListener('click', runBacktest);
@@ -1729,6 +1779,7 @@
             const banner = document.getElementById('btBanner');
             status.textContent = 'Processed ' + (s.snapshots_processed || 0) + ' snapshots for ' + symbol;
             setBanner(banner, 'success', 'Backtest complete', 'Processed ' + (s.snapshots_processed || 0) + ' snapshots for ' + symbol + '.');
+            setBtEmpty(false);
             document.getElementById('btSummary').hidden = false;
 
             const pnlCls = v => v > 0 ? 'pnl-pos' : v < 0 ? 'pnl-neg' : '';
@@ -1750,7 +1801,11 @@
             document.getElementById('btTradeCount').textContent = '(' + trades.length + ' trades shown)';
             const logBody = document.getElementById('btTradeLog');
             if (!trades.length) {
-                logBody.innerHTML = tableMsg(7, 'No trades fired. Try lowering min spread or increasing snapshots.');
+                const isImbalance = (document.getElementById('btStrategy').value === 'market_imbalance');
+                const hint = isImbalance
+                    ? 'No trades fired. Try lowering the imbalance threshold or increasing snapshots.'
+                    : 'No trades fired. Try lowering min spread or increasing snapshots.';
+                logBody.innerHTML = tableMsg(7, hint);
             } else {
                 const display = trades.slice(-200);
                 logBody.innerHTML = display.map(t => {

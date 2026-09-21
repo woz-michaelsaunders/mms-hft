@@ -671,13 +671,25 @@ fn open_command_log(path: &Path) -> std::io::Result<std::fs::File> {
 
 fn append_command_log_entry(path: &Path, entry: String, max_bytes: u64) {
     let path = path.to_path_buf();
-    std::thread::spawn(move || {
+    let write = move || {
         rotate_log_if_needed(&path, max_bytes);
         if let Ok(mut file) = open_command_log(&path) {
             let _ = writeln!(file, "{}", entry);
             let _ = file.flush();
         }
-    });
+    };
+    // Tests assert on log contents immediately after send/receive. The
+    // fire-and-forget thread is a release-mode race: inbound ExecutionReport
+    // can flush before the earlier outbound NewOrderSingle, which made
+    // `inbound_fix_commands_logged_in_full` fail under `cargo test --release`.
+    #[cfg(test)]
+    {
+        write();
+    }
+    #[cfg(not(test))]
+    {
+        std::thread::spawn(write);
+    }
 }
 
 /// Parse CAPTURE_SYMBOLS. Unset → {BTC_USDT}. Empty/whitespace → kill switch (no persist).
@@ -4116,6 +4128,401 @@ async fn zmq_order_book_publisher(session: Arc<FIXSession>, bind_addr: &str) -> 
     }
 }
 
+const WINDOW_NAME_MAX: usize = 64;
+const GRID_CELL_CAP: usize = 200;
+const SNAPSHOT_ROW_CAP: i64 = 500_000;
+const CALIBRATION_RESULTS_DIR: &str = "calibration/results";
+
+#[derive(Debug)]
+enum CalibrateHttpError {
+    WindowNameRequired,            // E1
+    WindowNameNotFileSafe,         // E2
+    BoundsRequired,                // E3
+    BoundsNotIntegers,             // E4
+    StartAfterEnd,                 // E5
+    GridTooLarge { n: usize },     // E6
+    NoSnapshots,                   // E7
+    WindowTooLarge { n: i64 },     // E8
+    KdbUnavailable,                // E9
+    RecordFailed,                  // E10
+    AlreadyRunning,                // E11
+    GridNotFinite,                 // E12
+}
+
+impl CalibrateHttpError {
+    fn status_code(&self) -> StatusCode {
+        match self {
+            CalibrateHttpError::KdbUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+            CalibrateHttpError::RecordFailed => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn json_body(&self) -> String {
+        let (error, hint) = match self {
+            CalibrateHttpError::WindowNameRequired => (
+                "window_name is required".to_string(),
+                "Pass window_name as a file-safe label (letters, digits, . _ -).".to_string(),
+            ),
+            CalibrateHttpError::WindowNameNotFileSafe => (
+                "window_name is not file-safe".to_string(),
+                "Use only [A-Za-z0-9._-], length 1–64, not \".\" or \"..\".".to_string(),
+            ),
+            CalibrateHttpError::BoundsRequired => (
+                "start_ts and end_ts are required".to_string(),
+                "Pass both as integer Unix milliseconds.".to_string(),
+            ),
+            CalibrateHttpError::BoundsNotIntegers => (
+                "start_ts and end_ts must be integers".to_string(),
+                "Use millisecond epoch values that fit kdb timestamp conversion.".to_string(),
+            ),
+            CalibrateHttpError::StartAfterEnd => (
+                "start_ts must be <= end_ts".to_string(),
+                "The window is a closed [start_ts, end_ts] interval.".to_string(),
+            ),
+            CalibrateHttpError::GridTooLarge { n } => (
+                format!("Grid is too large ({} combinations)", n),
+                "Each axis is at most 200 values; the product of the four axes must be <= 200.".to_string(),
+            ),
+            CalibrateHttpError::NoSnapshots => (
+                "No snapshots in this window".to_string(),
+                "Check symbol and bounds against kdb orderbook_snapshots. The early-September 2026 ticks.csv hole is a source gap.".to_string(),
+            ),
+            CalibrateHttpError::WindowTooLarge { n } => (
+                format!("Window is too large ({} rows)", n),
+                "Narrow start_ts/end_ts so the snapshot count is <= 500000.".to_string(),
+            ),
+            CalibrateHttpError::KdbUnavailable => (
+                "kdb+ is unavailable".to_string(),
+                "Start kdb (q kdb/start_kdb_server.q) and confirm KDB_HOST/KDB_PORT. Calibration does not fall back to CSV.".to_string(),
+            ),
+            CalibrateHttpError::RecordFailed => (
+                "Failed to record calibration results".to_string(),
+                "Check that the process can create calibration/results in its working directory.".to_string(),
+            ),
+            CalibrateHttpError::AlreadyRunning => (
+                "Calibration already running".to_string(),
+                "Wait for the in-flight GET to finish. Only one calibration runs at a time.".to_string(),
+            ),
+            CalibrateHttpError::GridNotFinite => (
+                "Grid values must be finite numbers".to_string(),
+                "Each CSV token must parse as a finite f64. Bad tokens are not skipped.".to_string(),
+            ),
+        };
+        match self {
+            CalibrateHttpError::GridTooLarge { n } => serde_json::json!({
+                "error": error,
+                "hint": hint,
+                "grid_product": n,
+            }),
+            CalibrateHttpError::WindowTooLarge { n } => serde_json::json!({
+                "error": error,
+                "hint": hint,
+                "n": n,
+            }),
+            _ => serde_json::json!({
+                "error": error,
+                "hint": hint,
+            }),
+        }
+        .to_string()
+    }
+}
+
+fn calibrate_http_reply(
+    err: CalibrateHttpError,
+) -> (StatusCode, [(axum::http::header::HeaderName, &'static str); 1], String) {
+    (
+        err.status_code(),
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        err.json_body(),
+    )
+}
+
+/// Ok(name) if non-empty, not "."/"..", len<=64, chars in [A-Za-z0-9._-].
+fn sanitize_window_name(raw: &str) -> Result<&str, CalibrateHttpError> {
+    if raw.is_empty() {
+        return Err(CalibrateHttpError::WindowNameRequired);
+    }
+    if raw == "." || raw == ".." || raw.len() > WINDOW_NAME_MAX {
+        return Err(CalibrateHttpError::WindowNameNotFileSafe);
+    }
+    if !raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(CalibrateHttpError::WindowNameNotFileSafe);
+    }
+    Ok(raw)
+}
+
+/// Returns ("calibration/results/{name}.json", "calibration/results/{name}.md").
+/// FORBIDDEN: Path::join / PathBuf::push of operator input.
+fn calibration_result_paths(name: &str) -> (String, String) {
+    (
+        format!("{}/{}.json", CALIBRATION_RESULTS_DIR, name),
+        format!("{}/{}.md", CALIBRATION_RESULTS_DIR, name),
+    )
+}
+
+/// kdb_ns = unix_ms * 1_000_000 - KDB_TIMESTAMP_OFFSET_NS, checked.
+fn unix_ms_to_kdb_ns(ms: i64) -> Result<i64, CalibrateHttpError> {
+    ms.checked_mul(1_000_000)
+        .and_then(|ns| ns.checked_sub(kdb_integration::KDB_TIMESTAMP_OFFSET_NS))
+        .ok_or(CalibrateHttpError::BoundsNotIntegers)
+}
+
+/// The ONLY q timestamp fragment. `n` is the checked i64, never the query string.
+fn kdb_ts_atom(n: i64) -> String {
+    format!("`timestamp${}j", n)
+}
+
+fn parse_csv_f64_bounded(
+    raw: Option<&str>,
+    fallback: f64,
+) -> Result<Vec<f64>, CalibrateHttpError> {
+    let Some(raw) = raw.filter(|s| !s.trim().is_empty()) else {
+        return Ok(vec![fallback]);
+    };
+    let mut out = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let value: f64 = token
+            .parse()
+            .map_err(|_| CalibrateHttpError::GridNotFinite)?;
+        if !value.is_finite() {
+            return Err(CalibrateHttpError::GridNotFinite);
+        }
+        out.push(value);
+        if out.len() > GRID_CELL_CAP {
+            return Err(CalibrateHttpError::GridTooLarge { n: out.len() });
+        }
+    }
+    if out.is_empty() {
+        Ok(vec![fallback])
+    } else {
+        Ok(out)
+    }
+}
+
+fn grid_product(
+    maker: &[f64],
+    taker: &[f64],
+    spread: &[f64],
+    jump: &[f64],
+) -> Result<usize, CalibrateHttpError> {
+    let product = maker
+        .len()
+        .checked_mul(taker.len())
+        .and_then(|x| x.checked_mul(spread.len()))
+        .and_then(|x| x.checked_mul(jump.len()));
+    match product {
+        None => Err(CalibrateHttpError::GridTooLarge { n: usize::MAX }),
+        Some(p) if p > GRID_CELL_CAP => Err(CalibrateHttpError::GridTooLarge { n: p }),
+        Some(p) => Ok(p),
+    }
+}
+
+fn snapshots_from_kdb_json(raw_json: &str) -> Vec<algo::Snapshot> {
+    serde_json::from_str::<serde_json::Value>(raw_json)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            let timestamp_ms = row.get("time").and_then(|v| v.as_i64())?;
+            let best_bid = row.get("best_bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let best_ask = row.get("best_ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let best_bid_size = row.get("best_bid_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let best_ask_size = row.get("best_ask_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if best_bid > 0.0 && best_ask > 0.0 {
+                Some(algo::Snapshot {
+                    timestamp_ms,
+                    best_bid,
+                    best_ask,
+                    best_bid_size,
+                    best_ask_size,
+                    ..Default::default()
+                })
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn parse_kdb_count_c(raw_json: &str) -> Option<i64> {
+    let v: serde_json::Value = serde_json::from_str(raw_json).ok()?;
+    let row = v.as_array()?.first()?;
+    row.get("c").and_then(|c| {
+        c.as_i64()
+            .or_else(|| c.as_u64().and_then(|u| i64::try_from(u).ok()))
+            .or_else(|| c.as_f64().and_then(|f| if f.is_finite() { Some(f as i64) } else { None }))
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct CalibrationReport {
+    window_name: String,
+    symbol: String,
+    start_ts: i64,
+    end_ts: i64,
+    snapshot_count: usize,
+    trades_coverage_count: u64,
+    observed_min_time_ms: i64,
+    observed_max_time_ms: i64,
+    old_params: algo::CalibratedParams,
+    new_params: algo::CalibratedParams,
+    old_spread_capture: algo::BacktestSummary,
+    old_market_imbalance: algo::BacktestSummary,
+    new_spread_capture: algo::BacktestSummary,
+    new_market_imbalance: algo::BacktestSummary,
+    grid_product: usize,
+    held_constant: algo::HeldConstant,
+}
+
+fn md_escape(s: &str) -> String {
+    s.replace('|', "\\|")
+        .replace('`', "\\`")
+        .replace('\n', " ")
+        .replace('\r', " ")
+}
+
+fn render_summary_bullets(s: &algo::BacktestSummary) -> String {
+    format!(
+        "- total_trades: {}\n\
+         - winning_trades: {}\n\
+         - losing_trades: {}\n\
+         - win_rate_pct: {}\n\
+         - total_pnl: {}\n\
+         - max_drawdown: {}\n\
+         - sharpe_ratio: {}\n\
+         - sortino_ratio: {}\n\
+         - profit_factor: {}\n\
+         - avg_trade_duration_ms: {}\n\
+         - max_consecutive_losses: {}\n\
+         - final_position: {}\n\
+         - snapshots_processed: {}",
+        s.total_trades,
+        s.winning_trades,
+        s.losing_trades,
+        s.win_rate_pct,
+        s.total_pnl,
+        s.max_drawdown,
+        s.sharpe_ratio,
+        s.sortino_ratio,
+        s.profit_factor,
+        s.avg_trade_duration_ms,
+        s.max_consecutive_losses,
+        s.final_position,
+        s.snapshots_processed
+    )
+}
+
+fn render_calibration_markdown(report: &CalibrationReport) -> String {
+    let name = md_escape(&report.window_name);
+    let symbol = md_escape(&report.symbol);
+    format!(
+        "# Calibration report: {name}\n\
+         \n\
+         ## Window\n\
+         - symbol: `{symbol}`\n\
+         - start_ts (ms): {start_ts}\n\
+         - end_ts (ms): {end_ts}\n\
+         - snapshot_count: {snapshot_count}\n\
+         - trades_coverage_count: {trades_coverage_count}\n\
+         - observed_min_time_ms: {observed_min_time_ms}\n\
+         - observed_max_time_ms: {observed_max_time_ms}\n\
+         - grid_product: {grid_product}\n\
+         \n\
+         ## Old parameters (in-code defaults)\n\
+         | Field | Value |\n\
+         |---|---|\n\
+         | maker_fee_bps | {old_maker} |\n\
+         | taker_fee_bps | {old_taker} |\n\
+         | max_spread_frac | {old_spread} |\n\
+         | max_mid_jump_frac | {old_jump} |\n\
+         \n\
+         ## New parameters (calibrated)\n\
+         | Field | Value |\n\
+         |---|---|\n\
+         | maker_fee_bps | {new_maker} |\n\
+         | taker_fee_bps | {new_taker} |\n\
+         | max_spread_frac | {new_spread} |\n\
+         | max_mid_jump_frac | {new_jump} |\n\
+         \n\
+         ## Held constant\n\
+         | Field | Value |\n\
+         |---|---|\n\
+         | order_qty | {order_qty} |\n\
+         | max_position | {max_position} |\n\
+         | tick_size | {tick_size} |\n\
+         | min_spread_bps | {min_spread_bps} |\n\
+         | imbalance_threshold | {imbalance_threshold} |\n\
+         | imbalance_depth_levels | {imbalance_depth_levels} |\n\
+         | slippage_bps | {slippage_bps} |\n\
+         \n\
+         ## Old backtest summaries\n\
+         ### SpreadCapture\n\
+         {old_sc}\n\
+         \n\
+         ### MarketImbalance\n\
+         {old_mi}\n\
+         \n\
+         ## New backtest summaries\n\
+         ### SpreadCapture\n\
+         {new_sc}\n\
+         \n\
+         ### MarketImbalance\n\
+         {new_mi}\n",
+        start_ts = report.start_ts,
+        end_ts = report.end_ts,
+        snapshot_count = report.snapshot_count,
+        trades_coverage_count = report.trades_coverage_count,
+        observed_min_time_ms = report.observed_min_time_ms,
+        observed_max_time_ms = report.observed_max_time_ms,
+        grid_product = report.grid_product,
+        old_maker = report.old_params.maker_fee_bps,
+        old_taker = report.old_params.taker_fee_bps,
+        old_spread = report.old_params.max_spread_frac,
+        old_jump = report.old_params.max_mid_jump_frac,
+        new_maker = report.new_params.maker_fee_bps,
+        new_taker = report.new_params.taker_fee_bps,
+        new_spread = report.new_params.max_spread_frac,
+        new_jump = report.new_params.max_mid_jump_frac,
+        order_qty = report.held_constant.order_qty,
+        max_position = report.held_constant.max_position,
+        tick_size = report.held_constant.tick_size,
+        min_spread_bps = report.held_constant.min_spread_bps,
+        imbalance_threshold = report.held_constant.imbalance_threshold,
+        imbalance_depth_levels = report.held_constant.imbalance_depth_levels,
+        slippage_bps = report.held_constant.slippage_bps,
+        old_sc = render_summary_bullets(&report.old_spread_capture),
+        old_mi = render_summary_bullets(&report.old_market_imbalance),
+        new_sc = render_summary_bullets(&report.new_spread_capture),
+        new_mi = render_summary_bullets(&report.new_market_imbalance),
+    )
+}
+
+fn write_calibration_artifacts(report: &CalibrationReport) -> Result<(), CalibrateHttpError> {
+    std::fs::create_dir_all(CALIBRATION_RESULTS_DIR)
+        .map_err(|_| CalibrateHttpError::RecordFailed)?;
+    let json_bytes =
+        serde_json::to_vec(report).map_err(|_| CalibrateHttpError::RecordFailed)?;
+    let md = render_calibration_markdown(report);
+    let (json_path, md_path) = calibration_result_paths(&report.window_name);
+    let json_tmp = format!("{}.tmp", json_path);
+    let md_tmp = format!("{}.tmp", md_path);
+    std::fs::write(&json_tmp, &json_bytes).map_err(|_| CalibrateHttpError::RecordFailed)?;
+    std::fs::rename(&json_tmp, &json_path).map_err(|_| CalibrateHttpError::RecordFailed)?;
+    std::fs::write(&md_tmp, md.as_bytes()).map_err(|_| CalibrateHttpError::RecordFailed)?;
+    std::fs::rename(&md_tmp, &md_path).map_err(|_| CalibrateHttpError::RecordFailed)?;
+    Ok(())
+}
+
 /// Web server for displaying order book on a webpage and API endpoints for console
 /// Serves an HTML page with real-time order book updates
 async fn order_book_web_server(
@@ -4145,6 +4552,7 @@ async fn order_book_web_server(
         all_symbols: Vec<String>,  // All symbols to subscribe to
         kdb: Arc<KdbWriter>,  // kdb+ connection for historical queries
         algo: Arc<algo::TradingAlgo>,  // Trading algorithm
+        calibrate_lock: Arc<tokio::sync::Mutex<()>>,
     }
     
     let all_symbols_list = vec![
@@ -4169,6 +4577,7 @@ async fn order_book_web_server(
         all_symbols: all_symbols_list.clone(),
         kdb: Arc::clone(&kdb_writer),
         algo: Arc::clone(&algo),
+        calibrate_lock: Arc::new(tokio::sync::Mutex::new(())),
     };
     
     // API endpoint to get order book data
@@ -4629,6 +5038,8 @@ async fn order_book_web_server(
             fee_bps,
             maker_fee_bps,
             taker_fee_bps,
+            max_spread_frac: algo::default_max_spread_frac(),
+            max_mid_jump_frac: algo::default_max_mid_jump_frac(),
             min_signal_interval_ms: 0, // not relevant in backtest
             max_book_staleness_ms: 0,
             max_orders_session: 0,
@@ -4646,28 +5057,7 @@ async fn order_book_web_server(
                 info!("📊 kdb+ query error ({}), using CSV fallback", e);
                 Vec::new()
             }
-            Ok(raw_json) => {
-                match serde_json::from_str::<serde_json::Value>(&raw_json) {
-                    Err(_) => Vec::new(),
-                    Ok(parsed) => {
-                        match parsed.as_array() {
-                            None => Vec::new(),
-                            Some(rows) => rows.iter().filter_map(|row| {
-                                let timestamp_ms = row.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
-                                let best_bid = row.get("best_bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let best_ask = row.get("best_ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let best_bid_size = row.get("best_bid_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let best_ask_size = row.get("best_ask_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                if best_bid > 0.0 && best_ask > 0.0 {
-                                    Some(algo::Snapshot { timestamp_ms, best_bid, best_ask, best_bid_size, best_ask_size, ..Default::default() })
-                                } else {
-                                    None
-                                }
-                            }).collect()
-                        }
-                    }
-                }
-            }
+            Ok(raw_json) => snapshots_from_kdb_json(&raw_json),
         };
 
         // If KDB+ returned nothing (empty table or error), fall back to data/ticks.csv.
@@ -4746,20 +5136,7 @@ async fn order_book_web_server(
             limit, symbol_predicate
         );
         let snapshots: Vec<algo::Snapshot> = match state.kdb.query_table_to_json(&q).await {
-            Ok(raw_json) => serde_json::from_str::<serde_json::Value>(&raw_json)
-                .ok()
-                .and_then(|v| v.as_array().cloned())
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|row| {
-                    let ts = row.get("time").and_then(|v| v.as_i64())?;
-                    let bb = row.get("best_bid").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let ba = row.get("best_ask").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let bbs = row.get("best_bid_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let bas = row.get("best_ask_size").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    if bb > 0.0 && ba > 0.0 { Some(algo::Snapshot { timestamp_ms: ts, best_bid: bb, best_ask: ba, best_bid_size: bbs, best_ask_size: bas, ..Default::default() }) } else { None }
-                })
-                .collect(),
+            Ok(raw_json) => snapshots_from_kdb_json(&raw_json),
             Err(_) => load_snapshots_from_csv(&symbol, limit),
         };
 
@@ -4791,6 +5168,8 @@ async fn order_book_web_server(
                             fee_bps: fee,
                             maker_fee_bps: algo::default_maker_fee_bps(),
                             taker_fee_bps: fee,
+                            max_spread_frac: algo::default_max_spread_frac(),
+                            max_mid_jump_frac: algo::default_max_mid_jump_frac(),
                             min_signal_interval_ms: 0,
                             max_book_staleness_ms: 0,
                             max_orders_session: 0,
@@ -4825,6 +5204,256 @@ async fn order_book_web_server(
         }
     }
 
+    // GET /api/backtest/calibrate — grid-search fee/threshold axes over a named kdb window.
+    async fn get_backtest_calibrate_api(
+        axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> impl axum::response::IntoResponse {
+        use axum::http::header;
+
+        let window_name = match params.get("window_name") {
+            None => return calibrate_http_reply(CalibrateHttpError::WindowNameRequired),
+            Some(raw) => match sanitize_window_name(raw) {
+                Ok(n) => n.to_string(),
+                Err(e) => return calibrate_http_reply(e),
+            },
+        };
+
+        let parse_required_i64 = |key: &str| -> Result<i64, CalibrateHttpError> {
+            match params.get(key) {
+                None => Err(CalibrateHttpError::BoundsRequired),
+                Some(s) if s.trim().is_empty() => Err(CalibrateHttpError::BoundsRequired),
+                Some(s) => s
+                    .parse::<i64>()
+                    .map_err(|_| CalibrateHttpError::BoundsNotIntegers),
+            }
+        };
+        let start_ts = match parse_required_i64("start_ts") {
+            Ok(v) => v,
+            Err(e) => return calibrate_http_reply(e),
+        };
+        let end_ts = match parse_required_i64("end_ts") {
+            Ok(v) => v,
+            Err(e) => return calibrate_http_reply(e),
+        };
+        if start_ts > end_ts {
+            return calibrate_http_reply(CalibrateHttpError::StartAfterEnd);
+        }
+        let ts0 = match unix_ms_to_kdb_ns(start_ts) {
+            Ok(v) => kdb_ts_atom(v),
+            Err(e) => return calibrate_http_reply(e),
+        };
+        let ts1 = match unix_ms_to_kdb_ns(end_ts) {
+            Ok(v) => kdb_ts_atom(v),
+            Err(e) => return calibrate_http_reply(e),
+        };
+
+        let symbol = params
+            .get("symbol")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "BTC_USDT".to_string());
+
+        let makers = match parse_csv_f64_bounded(
+            params.get("maker_fee_bps").map(|s| s.as_str()),
+            algo::default_maker_fee_bps(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return calibrate_http_reply(e),
+        };
+        let takers = match parse_csv_f64_bounded(
+            params.get("taker_fee_bps").map(|s| s.as_str()),
+            algo::default_taker_fee_bps(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return calibrate_http_reply(e),
+        };
+        let spreads = match parse_csv_f64_bounded(
+            params.get("max_spread_frac").map(|s| s.as_str()),
+            algo::default_max_spread_frac(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return calibrate_http_reply(e),
+        };
+        let jumps = match parse_csv_f64_bounded(
+            params.get("max_mid_jump_frac").map(|s| s.as_str()),
+            algo::default_max_mid_jump_frac(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return calibrate_http_reply(e),
+        };
+        if let Err(e) = grid_product(&makers, &takers, &spreads, &jumps) {
+            return calibrate_http_reply(e);
+        }
+
+        let order_qty: f64 = params
+            .get("order_qty")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.001);
+        let max_position: f64 = params
+            .get("max_position")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.01);
+        let tick_size: f64 = params
+            .get("tick_size")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.01);
+        let min_spread_bps: f64 = params
+            .get("min_spread_bps")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5.0);
+        let imbalance_threshold: f64 = params
+            .get("imbalance_threshold")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(algo::default_imbalance_threshold);
+        let imbalance_depth_levels: usize = params
+            .get("imbalance_depth_levels")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(algo::default_imbalance_depth_levels);
+        let slippage_bps: f64 = params
+            .get("slippage_bps")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(algo::default_slippage_bps);
+
+        let baseline = algo::AlgoConfig {
+            enabled: false,
+            symbol: symbol.clone(),
+            order_qty,
+            min_spread_bps,
+            max_position,
+            poll_interval_ms: 1000,
+            tick_size,
+            time_in_force: "3".to_string(),
+            strategy: algo::StrategyType::SpreadCapture,
+            imbalance_threshold,
+            imbalance_depth_levels,
+            slippage_bps,
+            fee_bps: algo::default_fee_bps(),
+            maker_fee_bps: algo::default_maker_fee_bps(),
+            taker_fee_bps: algo::default_taker_fee_bps(),
+            max_spread_frac: algo::default_max_spread_frac(),
+            max_mid_jump_frac: algo::default_max_mid_jump_frac(),
+            min_signal_interval_ms: 0,
+            max_book_staleness_ms: 0,
+            max_orders_session: 0,
+        };
+
+        let Ok(_calibrate_guard) = state.calibrate_lock.try_lock() else {
+            return calibrate_http_reply(CalibrateHttpError::AlreadyRunning);
+        };
+
+        let pred = build_kdb_symbol_predicate(&symbol);
+        let q1 = format!(
+            "select c:count i from orderbook_snapshots where {}, time within ({};{})",
+            pred, ts0, ts1
+        );
+        let count = match state.kdb.query_table_to_json(&q1).await {
+            Ok(raw) => match parse_kdb_count_c(&raw) {
+                Some(c) => c,
+                None => return calibrate_http_reply(CalibrateHttpError::KdbUnavailable),
+            },
+            Err(_) => return calibrate_http_reply(CalibrateHttpError::KdbUnavailable),
+        };
+        if count == 0 {
+            return calibrate_http_reply(CalibrateHttpError::NoSnapshots);
+        }
+        if count > SNAPSHOT_ROW_CAP {
+            return calibrate_http_reply(CalibrateHttpError::WindowTooLarge { n: count });
+        }
+
+        let q2 = format!(
+            "select c:count i from trades where {}, time within ({};{})",
+            pred, ts0, ts1
+        );
+        let trades_coverage_count: u64 = match state.kdb.query_table_to_json(&q2).await {
+            Ok(raw) => parse_kdb_count_c(&raw)
+                .and_then(|c| u64::try_from(c).ok())
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        let q3 = format!(
+            "select time, best_bid, best_ask, best_bid_size, best_ask_size from orderbook_snapshots where {}, time within ({};{})",
+            pred, ts0, ts1
+        );
+        let snapshots = match state.kdb.query_table_to_json(&q3).await {
+            Ok(raw) => snapshots_from_kdb_json(&raw),
+            Err(_) => return calibrate_http_reply(CalibrateHttpError::KdbUnavailable),
+        };
+        if snapshots.is_empty() {
+            return calibrate_http_reply(CalibrateHttpError::NoSnapshots);
+        }
+
+        let snapshot_count = snapshots.len();
+        let observed_min_time_ms = snapshots
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .min()
+            .unwrap_or(start_ts);
+        let observed_max_time_ms = snapshots
+            .iter()
+            .map(|s| s.timestamp_ms)
+            .max()
+            .unwrap_or(end_ts);
+
+        let window_name_for_cal = window_name.clone();
+        let cal_result = match tokio::task::spawn_blocking(move || {
+            algo::calibrate(
+                &snapshots,
+                &window_name_for_cal,
+                &makers,
+                &takers,
+                &spreads,
+                &jumps,
+                &baseline,
+            )
+        })
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(algo::CalibrateError::GridTooLarge { product })) => {
+                return calibrate_http_reply(CalibrateHttpError::GridTooLarge { n: product });
+            }
+            Ok(Err(algo::CalibrateError::EmptyAxis | algo::CalibrateError::NonFiniteAxis)) => {
+                return calibrate_http_reply(CalibrateHttpError::GridNotFinite);
+            }
+            Err(_) => return calibrate_http_reply(CalibrateHttpError::RecordFailed),
+        };
+
+        let report = CalibrationReport {
+            window_name: cal_result.window_name,
+            symbol,
+            start_ts,
+            end_ts,
+            snapshot_count,
+            trades_coverage_count,
+            observed_min_time_ms,
+            observed_max_time_ms,
+            old_params: cal_result.old_params,
+            new_params: cal_result.new_params,
+            old_spread_capture: cal_result.old_spread_capture,
+            old_market_imbalance: cal_result.old_market_imbalance,
+            new_spread_capture: cal_result.new_spread_capture,
+            new_market_imbalance: cal_result.new_market_imbalance,
+            grid_product: cal_result.grid_product,
+            held_constant: cal_result.held_constant,
+        };
+
+        let report_for_write = report.clone();
+        match tokio::task::spawn_blocking(move || write_calibration_artifacts(&report_for_write))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return calibrate_http_reply(e),
+            Err(_) => return calibrate_http_reply(CalibrateHttpError::RecordFailed),
+        }
+
+        match serde_json::to_string(&report) {
+            Ok(json) => (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json),
+            Err(_) => calibrate_http_reply(CalibrateHttpError::RecordFailed),
+        }
+    }
+
     // Build the router
     let html_page_clone = html_page.to_string();
     let app = Router::new()
@@ -4851,6 +5480,7 @@ async fn order_book_web_server(
         .route("/api/algo/config", post(algo_config_api))
         .route("/api/backtest", get(get_backtest_api))
         .route("/api/backtest/sweep", get(get_backtest_sweep_api))
+        .route("/api/backtest/calibrate", get(get_backtest_calibrate_api))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
     
@@ -6141,14 +6771,16 @@ mod connectivity_tests {
             .await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
-        // Wait for the inbound ExecutionReport stanza itself — not the bare
-        // ClOrdID, which is already present in the earlier outbound
-        // NewOrderSingle and would return before the IN stanza is flushed
-        // (release-mode race under `cargo test --release --locked`).
+        // Wait for both the outbound NewOrderSingle *and* the inbound
+        // ExecutionReport. Logging is async in production; waiting only for
+        // the IN stanza (or only for a bare ClOrdID shared with the OUT
+        // stanza) is a release-mode race under `cargo test --release --locked`.
         let om_after_er = wait_for_new_log_contains(
             COMMAND_LOG_OM,
             before_order,
             &[
+                "FIX OUT NewOrderSingle (35=D)",
+                " UTC] FIX OUT NewOrderSingle",
                 "FIX IN ExecutionReport (35=8)",
                 &format!("11={}", cl_ord_id),
                 "Sender=",
@@ -6516,5 +7148,64 @@ mod connectivity_tests {
         assert_eq!(session.drain_capture_probe().len(), 0, "drain is destructive; second drain empty");
         let _ = session1_count;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod calibrate_http_tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_window_name_rejects_traversal_and_accepts_label() {
+        for bad in [
+            "..",
+            "../etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            "",
+            ".",
+            &"a".repeat(65),
+        ] {
+            assert!(
+                sanitize_window_name(bad).is_err(),
+                "expected reject for {:?}",
+                bad
+            );
+        }
+        assert_eq!(
+            sanitize_window_name("uat_2026_03_01").expect("label"),
+            "uat_2026_03_01"
+        );
+    }
+
+    #[test]
+    fn unix_ms_to_kdb_ns_checked_and_atom_is_typed() {
+        let ms: i64 = 1_772_332_800_000; // 2026-03-01 UTC
+        let ns = unix_ms_to_kdb_ns(ms).expect("2026 ms converts");
+        let round_trip = (ns + kdb_integration::KDB_TIMESTAMP_OFFSET_NS) / 1_000_000;
+        assert_eq!(round_trip, ms);
+
+        assert!(matches!(
+            unix_ms_to_kdb_ns(i64::MAX),
+            Err(CalibrateHttpError::BoundsNotIntegers)
+        ));
+
+        let atom = kdb_ts_atom(ns);
+        assert!(
+            atom.starts_with("`timestamp$") && atom.ends_with('j'),
+            "atom={atom}"
+        );
+        let inner = &atom["`timestamp$".len()..atom.len() - 1];
+        assert!(
+            !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit() || c == '-'),
+            "atom inner must be digits only, got {atom}"
+        );
+        assert!(!atom.contains('"') && !atom.contains(';') && !atom.contains(' '));
+
+        let injection = "1;system\"evil\"";
+        assert!(
+            injection.parse::<i64>().is_err(),
+            "quoted injection must fail i64 parse before kdb_ts_atom"
+        );
     }
 }

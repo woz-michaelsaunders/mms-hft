@@ -12,7 +12,7 @@ use kxkdb::qtype;
 use std::collections::VecDeque;
 
 /// kdb+ epoch offset in nanoseconds (nanoseconds from Unix epoch 1970-01-01 to kdb+ epoch 2000-01-01)
-const KDB_TIMESTAMP_OFFSET_NS: i64 = 946_684_800_000_000_000_i64;
+pub(crate) const KDB_TIMESTAMP_OFFSET_NS: i64 = 946_684_800_000_000_000_i64;
 
 /// Maximum entries in each write buffer.  If this is exceeded (e.g. kdb+ is slow or
 /// temporarily disconnected) the oldest half is dropped with a warning so we never

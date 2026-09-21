@@ -82,6 +82,12 @@ pub struct AlgoConfig {
     /// Taker fee in bps (positive cost) for liquidity-removing (MarketImbalance) fills.
     #[serde(default = "default_taker_fee_bps")]
     pub taker_fee_bps: f64,
+    /// Drop snapshots whose quoted spread exceeds this fraction of best_bid (default 5%).
+    #[serde(default = "default_max_spread_frac")]
+    pub max_spread_frac: f64,
+    /// Drop snapshots whose mid jumps by more than this fraction vs the previous kept mid (default 10%).
+    #[serde(default = "default_max_mid_jump_frac")]
+    pub max_mid_jump_frac: f64,
     /// Minimum milliseconds between consecutive signals — prevents order-quota burn
     /// and reduces adverse selection on stale book updates.
     #[serde(default = "default_min_signal_interval_ms")]
@@ -101,6 +107,8 @@ pub fn default_slippage_bps() -> f64 { 1.0 }
 pub fn default_fee_bps() -> f64 { 4.0 }
 pub fn default_maker_fee_bps() -> f64 { -1.0 }  // placeholder MM-program rebate; set real rate
 pub fn default_taker_fee_bps() -> f64 { 4.0 }
+pub fn default_max_spread_frac() -> f64 { 0.05 }
+pub fn default_max_mid_jump_frac() -> f64 { 0.10 }
 pub fn default_min_signal_interval_ms() -> u64 { 500 }
 pub fn default_max_book_staleness_ms() -> u64 { 2000 }
 pub fn default_max_orders_session() -> u64 { 0 }
@@ -123,6 +131,8 @@ impl Default for AlgoConfig {
             fee_bps: default_fee_bps(),
             maker_fee_bps: default_maker_fee_bps(),
             taker_fee_bps: default_taker_fee_bps(),
+            max_spread_frac: default_max_spread_frac(),
+            max_mid_jump_frac: default_max_mid_jump_frac(),
             min_signal_interval_ms: default_min_signal_interval_ms(),
             max_book_staleness_ms: default_max_book_staleness_ms(),
             max_orders_session: default_max_orders_session(),
@@ -440,7 +450,7 @@ impl TradingAlgo {
     /// side. If bid volume / total volume >= `imbalance_threshold`, buy
     /// aggressively at `best_ask`. If ask volume dominates by the same ratio,
     /// sell aggressively at `best_bid`.
-    fn build_imbalance_signals(
+    pub fn build_imbalance_signals(
         cfg: &AlgoConfig,
         best_bid: f64,
         best_ask: f64,
@@ -715,11 +725,95 @@ fn apply_costs(price: f64, side: &str, slippage_bps: f64, fee_bps: f64) -> f64 {
     }
 }
 
+/// If kdb BBO rows have empty depth vectors, synthesize a 1-level book from
+/// top-of-book price and size so MarketImbalance can still fire.
+fn synthesize_bbo_book(s: &Snapshot) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+    let bids = if s.bids.is_empty() {
+        vec![(s.best_bid, s.best_bid_size)]
+    } else {
+        s.bids.clone()
+    };
+    let asks = if s.asks.is_empty() {
+        vec![(s.best_ask, s.best_ask_size)]
+    } else {
+        s.asks.clone()
+    };
+    (bids, asks)
+}
+
+/// Shared inventory / trade / equity accounting used by BOTH fill branches.
+/// Arithmetic is frozen — SpreadCapture numeric results must stay identical.
+fn record_fill(
+    net_qty: &mut f64,
+    avg_entry: &mut f64,
+    realized: &mut f64,
+    trades: &mut Vec<BacktestTrade>,
+    pnl_increments: &mut Vec<f64>,
+    consecutive_losses: &mut u32,
+    max_consecutive_losses: &mut u32,
+    position_open_time: &mut Option<i64>,
+    round_trip_durations_ms: &mut Vec<i64>,
+    side: &str,
+    fill: f64,
+    qty: f64,
+    cur_ts: i64,
+    mid: f64,
+) {
+    let signed = if side == "1" { qty } else { -qty };
+    let prev_net = *net_qty;
+    let new_net = prev_net + signed;
+    let mut trade_pnl = 0.0;
+
+    if prev_net.abs() < 1e-12 {
+        *avg_entry = fill;
+        *position_open_time = Some(cur_ts);
+    } else if prev_net.signum() == signed.signum() {
+        *avg_entry = (*avg_entry * prev_net.abs() + fill * qty) / (prev_net.abs() + qty);
+    } else {
+        let closing = qty.min(prev_net.abs());
+        trade_pnl = if prev_net > 0.0 {
+            closing * (fill - *avg_entry)
+        } else {
+            closing * (*avg_entry - fill)
+        };
+        *realized += trade_pnl;
+        if new_net.abs() < 1e-12 {
+            *avg_entry = 0.0;
+            if let Some(open) = position_open_time.take() {
+                round_trip_durations_ms.push(cur_ts - open);
+            }
+        } else if new_net.signum() != prev_net.signum() {
+            *avg_entry = fill;
+            *position_open_time = Some(cur_ts);
+        }
+    }
+
+    *net_qty = new_net;
+    let cum = *realized + *net_qty * (mid - *avg_entry);
+    pnl_increments.push(trade_pnl);
+    if trade_pnl < 0.0 {
+        *consecutive_losses += 1;
+        *max_consecutive_losses = (*max_consecutive_losses).max(*consecutive_losses);
+    } else if trade_pnl > 0.0 {
+        *consecutive_losses = 0;
+    }
+    trades.push(BacktestTrade {
+        timestamp_ms: cur_ts,
+        side: side.to_string(),
+        price: fill,
+        qty,
+        pnl: trade_pnl,
+        cumulative_pnl: cum,
+        net_qty_after: *net_qty,
+    });
+}
+
 /// Run a passive market-making simulation over historical snapshots.
 ///
 /// Two things make this honest where the old version was not:
-///  1. SANITY FILTER — one-sided, crossed, absurd-spread (>5%) or spike (>10%
-///     mid jump) ticks are dropped. Corrupt feed ticks otherwise produce garbage
+///  1. SANITY FILTER — one-sided, crossed, absurd-spread (`max_spread_frac`,
+///     default 5%) or spike (`max_mid_jump_frac`, default 10% mid jump) ticks
+///     are dropped. Corrupt feed ticks otherwise produce garbage
 ///     mark-to-market (e.g. a bogus best_ask blew P&L up to ~1e10).
 ///  2. ADVERSE SELECTION — a passive quote posted at snapshot[i] only fills at
 ///     snapshot[i+1] if the market actually trades THROUGH it (best_ask<=our bid,
@@ -728,6 +822,9 @@ fn apply_costs(price: f64, side: &str, slippage_bps: f64, fee_bps: f64) -> f64 {
 ///     That captures adverse selection — the term that actually decides whether
 ///     market-making is profitable. The maker rebate is applied to the fill via
 ///     `apply_costs` (a negative fee improves the fill).
+///
+/// MarketImbalance crosses the spread at the signal price and is charged
+/// `taker_fee_bps` rather than the maker rebate.
 ///
 /// Conservative by design: one-requote-interval quote life, no queue-jumping, no
 /// partial fills. It under-counts fills, not edge.
@@ -740,19 +837,17 @@ pub fn run_backtest(cfg: &AlgoConfig, snapshots: &[Snapshot]) -> BacktestResult 
             continue;
         }
         let mid = 0.5 * (s.best_bid + s.best_ask);
-        if (s.best_ask - s.best_bid) / s.best_bid > 0.05 {
-            continue; // >5% spread = junk tick
+        if (s.best_ask - s.best_bid) / s.best_bid > cfg.max_spread_frac {
+            continue; // spread wider than configured sanity threshold
         }
         if let Some(pm) = prev_mid {
-            if (mid - pm).abs() / pm > 0.10 {
-                continue; // >10% mid jump = bad tick
+            if (mid - pm).abs() / pm > cfg.max_mid_jump_frac {
+                continue; // mid jump larger than configured sanity threshold
             }
         }
         prev_mid = Some(mid);
         clean.push(s.clone());
     }
-
-    let maker_fee = cfg.maker_fee_bps;
 
     let mut net_qty: f64 = 0.0;
     let mut avg_entry: f64 = 0.0;
@@ -784,80 +879,88 @@ pub fn run_backtest(cfg: &AlgoConfig, snapshots: &[Snapshot]) -> BacktestResult 
         let mid = 0.5 * (cur.best_bid + cur.best_ask);
         last_mid = Some(mid);
 
-        let spread_bps = (prev.best_ask - prev.best_bid) / prev.best_bid * 10_000.0;
+        match cfg.strategy {
+            StrategyType::SpreadCapture => {
+                let spread_bps = (prev.best_ask - prev.best_bid) / prev.best_bid * 10_000.0;
+                if spread_bps >= cfg.min_spread_bps {
+                    let p_buy = prev.best_bid + cfg.tick_size;
+                    let p_sell = prev.best_ask - cfg.tick_size;
 
-        if spread_bps >= cfg.min_spread_bps {
-            let p_buy = prev.best_bid + cfg.tick_size;
-            let p_sell = prev.best_ask - cfg.tick_size;
+                    let mut fills: Vec<(&str, f64)> = Vec::new();
+                    if cur.best_ask <= p_buy {
+                        fills.push(("1", p_buy));
+                    }
+                    if cur.best_bid >= p_sell {
+                        fills.push(("2", p_sell));
+                    }
 
-            let mut fills: Vec<(&str, f64)> = Vec::new();
-            if cur.best_ask <= p_buy {
-                fills.push(("1", p_buy));
-            }
-            if cur.best_bid >= p_sell {
-                fills.push(("2", p_sell));
-            }
-
-            for (side, quote_px) in fills {
-                let room = if side == "1" {
-                    (cfg.max_position - net_qty).max(0.0)
-                } else {
-                    (cfg.max_position + net_qty).max(0.0)
-                };
-                let qty = cfg.order_qty.min(room);
-                if qty <= 1e-12 {
-                    continue;
-                }
-
-                let fill = apply_costs(quote_px, side, cfg.slippage_bps, maker_fee);
-                let signed = if side == "1" { qty } else { -qty };
-                let prev_net = net_qty;
-                let new_net = prev_net + signed;
-                let mut trade_pnl = 0.0;
-
-                if prev_net.abs() < 1e-12 {
-                    avg_entry = fill;
-                    position_open_time = Some(cur.timestamp_ms);
-                } else if prev_net.signum() == signed.signum() {
-                    avg_entry =
-                        (avg_entry * prev_net.abs() + fill * qty) / (prev_net.abs() + qty);
-                } else {
-                    let closing = qty.min(prev_net.abs());
-                    trade_pnl = if prev_net > 0.0 {
-                        closing * (fill - avg_entry)
-                    } else {
-                        closing * (avg_entry - fill)
-                    };
-                    realized += trade_pnl;
-                    if new_net.abs() < 1e-12 {
-                        avg_entry = 0.0;
-                        if let Some(open) = position_open_time.take() {
-                            round_trip_durations_ms.push(cur.timestamp_ms - open);
+                    for (side, quote_px) in fills {
+                        let room = if side == "1" {
+                            (cfg.max_position - net_qty).max(0.0)
+                        } else {
+                            (cfg.max_position + net_qty).max(0.0)
+                        };
+                        let qty = cfg.order_qty.min(room);
+                        if qty <= 1e-12 {
+                            continue;
                         }
-                    } else if new_net.signum() != prev_net.signum() {
-                        avg_entry = fill;
-                        position_open_time = Some(cur.timestamp_ms);
+
+                        let fill = apply_costs(quote_px, side, cfg.slippage_bps, cfg.maker_fee_bps);
+                        record_fill(
+                            &mut net_qty,
+                            &mut avg_entry,
+                            &mut realized,
+                            &mut trades,
+                            &mut pnl_increments,
+                            &mut consecutive_losses,
+                            &mut max_consecutive_losses,
+                            &mut position_open_time,
+                            &mut round_trip_durations_ms,
+                            side,
+                            fill,
+                            qty,
+                            cur.timestamp_ms,
+                            mid,
+                        );
                     }
                 }
-
-                net_qty = new_net;
-                let cum = realized + net_qty * (mid - avg_entry);
-                pnl_increments.push(trade_pnl);
-                if trade_pnl < 0.0 {
-                    consecutive_losses += 1;
-                    max_consecutive_losses = max_consecutive_losses.max(consecutive_losses);
-                } else if trade_pnl > 0.0 {
-                    consecutive_losses = 0;
+            }
+            StrategyType::MarketImbalance => {
+                let (bids, asks) = synthesize_bbo_book(prev);
+                let signals = TradingAlgo::build_imbalance_signals(
+                    cfg,
+                    prev.best_bid,
+                    prev.best_ask,
+                    &bids,
+                    &asks,
+                    net_qty,
+                    prev.timestamp_ms,
+                );
+                for signal in signals {
+                    let fill = apply_costs(
+                        signal.price,
+                        signal.side.as_str(),
+                        cfg.slippage_bps,
+                        cfg.taker_fee_bps,
+                    );
+                    let qty = signal.qty;
+                    record_fill(
+                        &mut net_qty,
+                        &mut avg_entry,
+                        &mut realized,
+                        &mut trades,
+                        &mut pnl_increments,
+                        &mut consecutive_losses,
+                        &mut max_consecutive_losses,
+                        &mut position_open_time,
+                        &mut round_trip_durations_ms,
+                        signal.side.as_str(),
+                        fill,
+                        qty,
+                        cur.timestamp_ms,
+                        mid,
+                    );
                 }
-                trades.push(BacktestTrade {
-                    timestamp_ms: cur.timestamp_ms,
-                    side: side.to_string(),
-                    price: fill,
-                    qty,
-                    pnl: trade_pnl,
-                    cumulative_pnl: cum,
-                    net_qty_after: net_qty,
-                });
             }
         }
 
@@ -942,6 +1045,174 @@ pub fn run_backtest(cfg: &AlgoConfig, snapshots: &[Snapshot]) -> BacktestResult 
     }
 }
 
+/// Four axes searched by `calibrate()`. Field declaration order is the serde JSON key order.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CalibratedParams {
+    pub maker_fee_bps: f64,
+    pub taker_fee_bps: f64,
+    pub max_spread_frac: f64,
+    pub max_mid_jump_frac: f64,
+}
+
+/// AlgoConfig numeric fields held constant across the calibration grid.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeldConstant {
+    pub order_qty: f64,
+    pub max_position: f64,
+    pub tick_size: f64,
+    pub min_spread_bps: f64,
+    pub imbalance_threshold: f64,
+    pub imbalance_depth_levels: usize,
+    pub slippage_bps: f64,
+}
+
+/// Pure calibration output. Determinism AC serializes this struct.
+#[derive(Debug, Clone, Serialize)]
+pub struct CalibrationResult {
+    pub window_name: String,
+    pub old_params: CalibratedParams,
+    pub new_params: CalibratedParams,
+    pub old_spread_capture: BacktestSummary,
+    pub old_market_imbalance: BacktestSummary,
+    pub new_spread_capture: BacktestSummary,
+    pub new_market_imbalance: BacktestSummary,
+    pub grid_product: usize,
+    pub held_constant: HeldConstant,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CalibrateError {
+    #[error("grid too large: {product} combinations")]
+    GridTooLarge { product: usize },
+    #[error("empty calibration axis")]
+    EmptyAxis,
+    #[error("non-finite calibration axis value")]
+    NonFiniteAxis,
+}
+
+const CALIBRATE_GRID_CELL_CAP: usize = 200;
+
+/// Dual-strategy grid search ranked by mean Sharpe. Pure: no fs, kdb, or clock.
+pub fn calibrate(
+    snapshots: &[Snapshot],
+    window_name: &str,
+    maker_fee_bps: &[f64],
+    taker_fee_bps: &[f64],
+    max_spread_frac: &[f64],
+    max_mid_jump_frac: &[f64],
+    baseline: &AlgoConfig,
+) -> Result<CalibrationResult, CalibrateError> {
+    if maker_fee_bps.is_empty()
+        || taker_fee_bps.is_empty()
+        || max_spread_frac.is_empty()
+        || max_mid_jump_frac.is_empty()
+    {
+        return Err(CalibrateError::EmptyAxis);
+    }
+    let any_non_finite = maker_fee_bps
+        .iter()
+        .chain(taker_fee_bps)
+        .chain(max_spread_frac)
+        .chain(max_mid_jump_frac)
+        .any(|v| !v.is_finite());
+    if any_non_finite {
+        return Err(CalibrateError::NonFiniteAxis);
+    }
+
+    let product = maker_fee_bps
+        .len()
+        .checked_mul(taker_fee_bps.len())
+        .and_then(|x| x.checked_mul(max_spread_frac.len()))
+        .and_then(|x| x.checked_mul(max_mid_jump_frac.len()));
+    let grid_product = match product {
+        None => {
+            return Err(CalibrateError::GridTooLarge {
+                product: usize::MAX,
+            })
+        }
+        Some(p) if p > CALIBRATE_GRID_CELL_CAP => {
+            return Err(CalibrateError::GridTooLarge { product: p })
+        }
+        Some(p) => p,
+    };
+
+    let mut best_key = f64::NEG_INFINITY;
+    let mut best_params: Option<CalibratedParams> = None;
+    let mut best_sc: Option<BacktestSummary> = None;
+    let mut best_mi: Option<BacktestSummary> = None;
+
+    for &maker in maker_fee_bps {
+        for &taker in taker_fee_bps {
+            for &spread in max_spread_frac {
+                for &jump in max_mid_jump_frac {
+                    let mut cfg = baseline.clone();
+                    cfg.maker_fee_bps = maker;
+                    cfg.taker_fee_bps = taker;
+                    cfg.max_spread_frac = spread;
+                    cfg.max_mid_jump_frac = jump;
+                    cfg.strategy = StrategyType::SpreadCapture;
+                    let sc = run_backtest(&cfg, snapshots);
+                    cfg.strategy = StrategyType::MarketImbalance;
+                    let mi = run_backtest(&cfg, snapshots);
+                    let mean = (sc.summary.sharpe_ratio + mi.summary.sharpe_ratio) / 2.0;
+                    let key = if mean.is_finite() {
+                        mean
+                    } else {
+                        f64::NEG_INFINITY
+                    };
+                    if best_params.is_none() || key > best_key {
+                        best_key = key;
+                        best_params = Some(CalibratedParams {
+                            maker_fee_bps: maker,
+                            taker_fee_bps: taker,
+                            max_spread_frac: spread,
+                            max_mid_jump_frac: jump,
+                        });
+                        best_sc = Some(sc.summary);
+                        best_mi = Some(mi.summary);
+                    }
+                }
+            }
+        }
+    }
+
+    let old_params = CalibratedParams {
+        maker_fee_bps: default_maker_fee_bps(),
+        taker_fee_bps: default_taker_fee_bps(),
+        max_spread_frac: default_max_spread_frac(),
+        max_mid_jump_frac: default_max_mid_jump_frac(),
+    };
+    let mut old_cfg = baseline.clone();
+    old_cfg.maker_fee_bps = old_params.maker_fee_bps;
+    old_cfg.taker_fee_bps = old_params.taker_fee_bps;
+    old_cfg.max_spread_frac = old_params.max_spread_frac;
+    old_cfg.max_mid_jump_frac = old_params.max_mid_jump_frac;
+    old_cfg.strategy = StrategyType::SpreadCapture;
+    let old_spread_capture = run_backtest(&old_cfg, snapshots).summary;
+    old_cfg.strategy = StrategyType::MarketImbalance;
+    let old_market_imbalance = run_backtest(&old_cfg, snapshots).summary;
+
+    Ok(CalibrationResult {
+        window_name: window_name.to_string(),
+        old_params,
+        new_params: best_params.expect("grid is non-empty"),
+        old_spread_capture,
+        old_market_imbalance,
+        new_spread_capture: best_sc.expect("grid is non-empty"),
+        new_market_imbalance: best_mi.expect("grid is non-empty"),
+        grid_product,
+        held_constant: HeldConstant {
+            order_qty: baseline.order_qty,
+            max_position: baseline.max_position,
+            tick_size: baseline.tick_size,
+            min_spread_bps: baseline.min_spread_bps,
+            imbalance_threshold: baseline.imbalance_threshold,
+            imbalance_depth_levels: baseline.imbalance_depth_levels,
+            slippage_bps: baseline.slippage_bps,
+        },
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,6 +1235,8 @@ mod tests {
             fee_bps: 0.0,
             maker_fee_bps: 0.0,
             taker_fee_bps: 0.0,
+            max_spread_frac: 0.05,
+            max_mid_jump_frac: 0.10,
             min_signal_interval_ms: 0,
             max_book_staleness_ms: 0,
             max_orders_session: 0,
@@ -1108,6 +1381,109 @@ mod tests {
         let r = run_backtest(&cfg, &snaps);
         assert_eq!(r.summary.total_trades, 1);
         assert!(r.trades[0].price < 100.5);
+    }
+
+    #[test]
+    fn run_backtest_market_imbalance_charges_taker_fee_bps() {
+        let mut cfg = test_cfg();
+        cfg.strategy = StrategyType::MarketImbalance;
+        cfg.maker_fee_bps = -10.0; // rebate would *lower* a buy fill if wrongly used
+        cfg.taker_fee_bps = 10.0; // positive taker fee raises a buy fill above the cross
+        cfg.slippage_bps = 0.0;
+        // Bid-heavy BBO sizes so synthesize_bbo_book + build_imbalance_signals fires a BUY
+        // at prev.best_ask (101.0). Cur is only used for mark-to-market / trade timestamp.
+        let snaps = vec![
+            Snapshot {
+                timestamp_ms: 1,
+                best_bid: 100.0,
+                best_ask: 101.0,
+                best_bid_size: 7.0,
+                best_ask_size: 3.0,
+                ..Default::default()
+            },
+            Snapshot {
+                timestamp_ms: 2,
+                best_bid: 100.0,
+                best_ask: 101.0,
+                best_bid_size: 7.0,
+                best_ask_size: 3.0,
+                ..Default::default()
+            },
+        ];
+        let r = run_backtest(&cfg, &snaps);
+        assert_eq!(r.summary.total_trades, 1);
+        assert_eq!(r.trades[0].side, "1");
+        let cross = 101.0;
+        let taker_px = cross * (1.0 + cfg.taker_fee_bps / 10_000.0);
+        let maker_px = cross * (1.0 + cfg.maker_fee_bps / 10_000.0);
+        assert!(
+            r.trades[0].price > cross,
+            "taker fee must raise the buy fill above the cross {}, got {}",
+            cross,
+            r.trades[0].price
+        );
+        assert!(
+            (r.trades[0].price - taker_px).abs() < 1e-9,
+            "fill must equal taker-fee path {}, got {}",
+            taker_px,
+            r.trades[0].price
+        );
+        assert!(
+            (r.trades[0].price - maker_px).abs() > 1e-9,
+            "fill must not equal the maker-fee path {}",
+            maker_px
+        );
+    }
+
+    #[test]
+    fn calibrate_is_deterministic_byte_identical() {
+        let snaps = vec![
+            Snapshot {
+                timestamp_ms: 1,
+                best_bid: 100.0,
+                best_ask: 101.0,
+                best_bid_size: 7.0,
+                best_ask_size: 3.0,
+                ..Default::default()
+            },
+            Snapshot {
+                timestamp_ms: 2,
+                best_bid: 100.0,
+                best_ask: 100.5,
+                best_bid_size: 7.0,
+                best_ask_size: 3.0,
+                ..Default::default()
+            },
+        ];
+        let baseline = test_cfg();
+        let makers = [-1.0, 0.0];
+        let takers = [4.0, 5.0];
+        let spreads = [0.05];
+        let jumps = [0.10];
+        let a = calibrate(
+            &snaps,
+            "uat_2026_03_01",
+            &makers,
+            &takers,
+            &spreads,
+            &jumps,
+            &baseline,
+        )
+        .expect("calibrate a");
+        let b = calibrate(
+            &snaps,
+            "uat_2026_03_01",
+            &makers,
+            &takers,
+            &spreads,
+            &jumps,
+            &baseline,
+        )
+        .expect("calibrate b");
+        assert_eq!(
+            serde_json::to_vec(&a).expect("serialize a"),
+            serde_json::to_vec(&b).expect("serialize b")
+        );
     }
 }
 
