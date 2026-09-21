@@ -26,6 +26,13 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::fix_protocol::{tags, FIXMessage};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedSmp {
+    pub scope: Option<String>,
+    pub instruction: Option<String>,
+    pub id: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct MockGatewayConfig {
     /// CompID the mock identifies itself as (becomes TargetCompID from the client's POV).
@@ -45,6 +52,9 @@ pub struct MockGatewayConfig {
     pub test_request_after_logon: Option<String>,
     /// Optional recorder of symbols requested via MarketDataRequest (35=V).
     pub md_requested_symbols: Option<Arc<Mutex<Vec<String>>>>,
+    /// Optional recorder of SMP tags on inbound NewOrderSingle (35=D).
+    /// Always-push: one entry per 35=D, Options are None when the tag is absent.
+    pub nos_smp_tags: Option<Arc<Mutex<Vec<CapturedSmp>>>>,
     /// Optional counter of inbound NewOrderSingle (35=D). Incremented before ExecReport.
     pub orders_received: Option<Arc<Mutex<u64>>>,
     /// Optional two-sided snapshot BBO (prices + sizes) sent on 35=V.
@@ -70,6 +80,7 @@ impl Default for MockGatewayConfig {
             disconnect_after_messages: None,
             test_request_after_logon: None,
             md_requested_symbols: None,
+            nos_smp_tags: None,
             orders_received: None,
             snapshot_bbo: None,
             followup_bbo: None,
@@ -206,6 +217,13 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
                 'D' => {
                     if let Some(counter) = &config.orders_received {
                         *counter.lock().await += 1;
+                    }
+                    if let Some(rec) = &config.nos_smp_tags {
+                        rec.lock().await.push(CapturedSmp {
+                            scope: msg.get_field(12362).map(str::to_string),
+                            instruction: msg.get_field(2964).map(str::to_string),
+                            id: msg.get_field(2362).map(str::to_string),
+                        });
                     }
                     let cl_ord_id = msg.get_field(tags::CL_ORD_ID).unwrap_or_default().to_string();
                     let symbol = msg.get_field(tags::SYMBOL).unwrap_or_default().to_string();

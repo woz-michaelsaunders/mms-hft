@@ -103,6 +103,17 @@ pub struct AlgoConfig {
     /// Hard cap on orders placed per process run (circuit breaker). 0 = unlimited.
     #[serde(default = "default_max_orders_session")]
     pub max_orders_session: u64,
+    /// Tag 12362 SelfMatchPreventionScope. Comments on OrderRequest list M, S.
+    /// None (default / omitted JSON) → encoder omits the tag. Not validated here.
+    #[serde(default)]
+    pub self_match_prevention_scope: Option<String>,
+    /// Tag 2964 SelfMatchPreventionInstruction. Comments list 1, 2, 3.
+    #[serde(default)]
+    pub self_match_prevention_instruction: Option<String>,
+    /// Tag 2362 SelfMatchPreventionID. Static per-strategy group id.
+    /// Comments list 0-32767. Not generated per order. Not validated here.
+    #[serde(default)]
+    pub self_match_prevention_id: Option<String>,
 }
 
 pub fn default_imbalance_threshold() -> f64 { 0.6 }
@@ -140,6 +151,9 @@ impl Default for AlgoConfig {
             min_signal_interval_ms: default_min_signal_interval_ms(),
             max_book_staleness_ms: default_max_book_staleness_ms(),
             max_orders_session: default_max_orders_session(),
+            self_match_prevention_scope: None,
+            self_match_prevention_instruction: None,
+            self_match_prevention_id: None,
         }
     }
 }
@@ -1285,6 +1299,9 @@ mod tests {
             min_signal_interval_ms: 0,
             max_book_staleness_ms: 0,
             max_orders_session: 0,
+            self_match_prevention_scope: None,
+            self_match_prevention_instruction: None,
+            self_match_prevention_id: None,
         }
     }
 
