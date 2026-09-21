@@ -85,6 +85,39 @@ heartbeat_interval      = 30
 max_reconnect_attempts  = 10
 reconnect_backoff_ms    = 1000
 
+# ─── OMS hard risk gates (Road to Live) ─────────────────────────────────────
+# Copied into gitignored config.toml; restart required (EL-008). Not secrets.
+# Empty / omitted [[symbol_limits]] ⇒ exposure gate OFF (EL-018, deploy-day no-op).
+# Once ANY row is present, unknown symbols fail closed (EL-007).
+# max_position here is the OMS HARD cap. Algo form #algoCfgMaxPos / POST /api/algo/config
+# is a different, REST-mutable SOFT cap in src/algo.rs — do not conflate.
+# Numbers below are ILLUSTRATIVE placeholders, not risk sign-off.
+# Quotes (USDT/USD/PERP) treated 1:1 for notional/drawdown (EL-012, UAT only).
+#
+# Residual: unpriced market-by-qty (no Price, no CashOrderQty) skips the notional
+# leg and enforces position-only — the OM session has no MD order-book mid.
+# Residual: drawdown uses Σ realized_pnl only (no mark-to-market).
+# Residual: 35=G amends are not exposure-gated (same as OKS-010).
+
+[[symbol_limits]]
+symbol        = "BTC_USDT"
+max_position  = 0.05
+max_notional  = 5000.0
+
+[[symbol_limits]]
+symbol        = "BTC_USD"
+max_position  = 0.05
+max_notional  = 5000.0
+
+[[symbol_limits]]
+symbol        = "BTCUSD-PERP"
+max_position  = 0.05
+max_notional  = 5000.0
+
+# 0.0 / omitted ⇒ drawdown guard OFF. Finite > 0 arms it. NaN/Inf is a parse error.
+[risk]
+session_max_drawdown = 0.0
+
 # ─── kdb+ Connection (environment variables — not in this file) ──────────────
 # KDB_HOST  (default: localhost)
 # KDB_PORT  (default: 5001)
