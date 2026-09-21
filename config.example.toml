@@ -143,9 +143,28 @@ session_max_drawdown = 0.0
 # KDB_LISTEN  (kdb process; default 127.0.0.1; set 0.0.0.0 to bind all interfaces)
 # Start the kdb+ server first:  q kdb/start_kdb_server.q
 
-# ─── Trading Algorithm Defaults ──────────────────────────────────────────────
-# The algo starts disabled.  Enable it at runtime via POST /api/algo/enable
-# or by calling POST /api/algo/config with {"enabled": true, ...}.
+# ─── Trading algorithm (REST, not this file) ─────────────────────────────────
+# AlgoConfig is not loaded from config.toml. Set it at runtime:
+#   POST /api/algo/config   full AlgoConfig JSON (whole-struct replace)
+#   GET  /api/algo/status   read-back of the live config
+#   POST /api/algo/enable   /  POST /api/algo/disable
+#
+# The algo starts disabled. Enable it with POST /api/algo/enable, or POST
+# /api/algo/config with "enabled": true plus the rest of the fields.
+#
+# Self-match prevention (FIX 12362 / 2964 / 2362) lives on that same POST as
+# three optional strings. Omit the keys or send null to leave the gate
+# inactive — the outbound 35=D then omits the corresponding tag. A partial
+# set emits only the present tags. The id is a static per-strategy group
+# string, not generated per order.
+#
+# The Algo tab does not edit these fields. Save still round-trips them from
+# the last GET so a dashboard save cannot silently disarm a REST-armed gate.
+#
+# Illustrative values (not venue sign-off):
+#   "self_match_prevention_scope": "S",
+#   "self_match_prevention_instruction": "1",
+#   "self_match_prevention_id": "42"
 #
 # [algo]                        (not loaded from config.toml — set via REST API)
 # enabled          = false

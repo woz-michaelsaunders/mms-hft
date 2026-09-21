@@ -1131,6 +1131,34 @@ fn parse_capture_symbols(raw: Option<&str>) -> HashSet<String> {
     }
 }
 
+const SMP_FIELD_MAX_LEN: usize = 32;
+
+/// True iff `s` is a single FIX field value.
+/// Empty string is OK. Length is UTF-8 byte length (`s.len()`).
+fn smp_field_wire_ok(s: &str) -> bool {
+    s.len() <= SMP_FIELD_MAX_LEN
+        && !s.as_bytes().iter().any(|&b| matches!(b, 0x00 | 0x01 | b'=' | b'\n' | b'\r'))
+}
+
+fn smp_arg_or_reject(field: &'static str, v: &Option<String>) -> Result<()> {
+    match v {
+        None => Ok(()),
+        Some(s) if smp_field_wire_ok(s) => Ok(()),
+        Some(s) => {
+            let reason = if s.len() > SMP_FIELD_MAX_LEN {
+                "exceeds max length"
+            } else {
+                "contains forbidden delimiter"
+            };
+            warn!("SMP field {} rejected: {} (len={})", field, reason, s.len());
+            Err(anyhow!(
+                "SMP field {} rejected: {} (len={})",
+                field, reason, s.len()
+            ))
+        }
+    }
+}
+
 impl FIXSession {
     pub fn new(sender: &str, target: &str) -> Self {
         Self::new_with_credentials(sender, target, "", "")
@@ -1840,7 +1868,9 @@ impl FIXSession {
         Ok(())
     }
 
-    /// Legacy new_order_single function (kept for backward compatibility)
+    /// Legacy builder the algo loop actually calls (`algo_runtime::run`).
+    /// SMP args are copied onto OrderRequest as-is after SEC-001.
+    /// Other optional OrderRequest fields stay None; ord_type stays "2"; TIF stays "1".
     pub async fn new_order_single(
         &self,
         cl_ord_id: &str,
@@ -1848,7 +1878,13 @@ impl FIXSession {
         side: char,
         qty: f64,
         price: f64,
+        self_match_prevention_scope: Option<String>,
+        self_match_prevention_instruction: Option<String>,
+        self_match_prevention_id: Option<String>,
     ) -> Result<()> {
+        smp_arg_or_reject("self_match_prevention_scope", &self_match_prevention_scope)?;
+        smp_arg_or_reject("self_match_prevention_instruction", &self_match_prevention_instruction)?;
+        smp_arg_or_reject("self_match_prevention_id", &self_match_prevention_id)?;
         let order = OrderRequest {
             cl_ord_id: cl_ord_id.to_string(),
             symbol: symbol.to_string(),
@@ -1863,9 +1899,9 @@ impl FIXSession {
             cash_order_qty: None,
             cash_margin: None,
             trigger_price_type: None,
-            self_match_prevention_scope: None,
-            self_match_prevention_instruction: None,
-            self_match_prevention_id: None,
+            self_match_prevention_scope,
+            self_match_prevention_instruction,
+            self_match_prevention_id,
             broker_id: None,
             receive_window: None,
         };
@@ -2074,7 +2110,7 @@ impl FIXSession {
             info!("  [{}/{}] Placing {} order: {} @ {:.2} (qty: {})", 
                   order_num, count, side_name, cl_ord_id, price, qty);
             
-            if let Err(e) = order_session.new_order_single(&cl_ord_id, symbol, side, qty, price).await {
+            if let Err(e) = order_session.new_order_single(&cl_ord_id, symbol, side, qty, price, None, None, None).await {
                 warn!("    Failed to place order {}: {}", cl_ord_id, e);
             } else {
                 info!("    ✅ Order {} placed successfully", cl_ord_id);
@@ -5760,6 +5796,9 @@ async fn order_book_web_server(
             min_signal_interval_ms: 0, // not relevant in backtest
             max_book_staleness_ms: 0,
             max_orders_session: 0,
+            self_match_prevention_scope: None,
+            self_match_prevention_instruction: None,
+            self_match_prevention_id: None,
         };
 
         // Query kdb+ for historical snapshots. On any error or empty result, fall back
@@ -5890,6 +5929,9 @@ async fn order_book_web_server(
                             min_signal_interval_ms: 0,
                             max_book_staleness_ms: 0,
                             max_orders_session: 0,
+                            self_match_prevention_scope: None,
+                            self_match_prevention_instruction: None,
+                            self_match_prevention_id: None,
                         };
                         let result = algo::run_backtest(&cfg, &snapshots);
                         results.push(serde_json::json!({
@@ -6053,6 +6095,9 @@ async fn order_book_web_server(
             min_signal_interval_ms: 0,
             max_book_staleness_ms: 0,
             max_orders_session: 0,
+            self_match_prevention_scope: None,
+            self_match_prevention_instruction: None,
+            self_match_prevention_id: None,
         };
 
         let Ok(_calibrate_guard) = state.calibrate_lock.try_lock() else {
@@ -7947,7 +7992,7 @@ mod connectivity_tests {
         assert!(bid > 0.0 && ask > bid);
 
         let cl_ord_id = "E2E_TEST_ORDER_1";
-        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0).await?;
+        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0, None, None, None).await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
         let open_orders = session.open_orders.snapshot();
@@ -8067,7 +8112,7 @@ mod connectivity_tests {
         // so prove liveness with traffic instead: an order can only be
         // acknowledged if the connection actually survived the probe.
         let cl_ord_id = "E2E_TEST_REQ_PROBE";
-        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0).await?;
+        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0, None, None, None).await?;
         let report = pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
         assert!(
@@ -8089,7 +8134,7 @@ mod connectivity_tests {
         connect_and_logon(&session, port).await?;
 
         let cl_ord_id = "E2E_TEST_ORDER_CXL";
-        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0).await?;
+        session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0, None, None, None).await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
         let replace_id = "E2E_TEST_ORDER_REPL";
@@ -8203,7 +8248,7 @@ mod connectivity_tests {
 
         let survivor = "RECON_SURVIVOR";
         session
-            .new_order_single(survivor, "BTC_USDT", '1', 1.0, 100.0)
+            .new_order_single(survivor, "BTC_USDT", '1', 1.0, 100.0, None, None, None)
             .await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
         assert!(
@@ -8417,7 +8462,7 @@ mod connectivity_tests {
         let cl_ord_id = format!("INLOG_{}_{}", std::process::id(), 1);
         let before_order = command_log_len(COMMAND_LOG_OM);
         session
-            .new_order_single(&cl_ord_id, "BTC_USDT", '1', 1.0, 100.0)
+            .new_order_single(&cl_ord_id, "BTC_USDT", '1', 1.0, 100.0, None, None, None)
             .await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
@@ -9000,9 +9045,9 @@ mod connectivity_tests {
         let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
         connect_and_logon(&session, port).await?;
 
-        session.new_order_single("E2E_HALT_1", "BTC_USDT", '1', 1.0, 100.0).await?;
+        session.new_order_single("E2E_HALT_1", "BTC_USDT", '1', 1.0, 100.0, None, None, None).await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
-        session.new_order_single("E2E_HALT_2", "BTC_USDT", '2', 1.0, 101.0).await?;
+        session.new_order_single("E2E_HALT_2", "BTC_USDT", '2', 1.0, 101.0, None, None, None).await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
         let resting = session.open_orders.get_open_orders();
@@ -9038,7 +9083,7 @@ mod connectivity_tests {
         );
 
         let err = session
-            .new_order_single("E2E_HALT_3", "BTC_USDT", '1', 1.0, 100.0)
+            .new_order_single("E2E_HALT_3", "BTC_USDT", '1', 1.0, 100.0, None, None, None)
             .await
             .expect_err("halted session must reject 35=D");
         let err_s = err.to_string();
@@ -9056,7 +9101,7 @@ mod connectivity_tests {
         session.reset_operator_halt();
         assert!(!session.operator_halt_is_set());
 
-        session.new_order_single("E2E_HALT_4", "BTC_USDT", '1', 1.0, 100.0).await?;
+        session.new_order_single("E2E_HALT_4", "BTC_USDT", '1', 1.0, 100.0, None, None, None).await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
         assert_eq!(*orders_received.lock().await, before_halt_orders + 1);
 
@@ -9135,7 +9180,7 @@ mod connectivity_tests {
         let before = *orders_received.lock().await;
 
         let err = session
-            .new_order_single("E2E_EXP_OVER", "BTC_USDT", '1', 1.0, 100.0)
+            .new_order_single("E2E_EXP_OVER", "BTC_USDT", '1', 1.0, 100.0, None, None, None)
             .await
             .expect_err("oversized 35=D must be rejected locally");
         let err_s = err.to_string();
@@ -9150,7 +9195,7 @@ mod connectivity_tests {
         );
 
         session
-            .new_order_single("E2E_EXP_OK", "BTC_USDT", '1', 0.001, 100.0)
+            .new_order_single("E2E_EXP_OK", "BTC_USDT", '1', 0.001, 100.0, None, None, None)
             .await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
         assert_eq!(*orders_received.lock().await, before + 1);
@@ -9158,7 +9203,7 @@ mod connectivity_tests {
         // Already above the cap: a reducing sell is not position-blocked (AC3).
         session.positions.apply_fill("BTC_USDT", "1", 1.0, 100.0);
         session
-            .new_order_single("E2E_EXP_REDUCE", "BTC_USDT", '2', 0.4, 100.0)
+            .new_order_single("E2E_EXP_REDUCE", "BTC_USDT", '2', 0.4, 100.0, None, None, None)
             .await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
         assert_eq!(*orders_received.lock().await, before + 2);
@@ -9200,7 +9245,7 @@ mod connectivity_tests {
 
         let before = *orders_received.lock().await;
         let err = session
-            .new_order_single("E2E_DD_BLOCKED", "BTC_USDT", '1', 0.001, 100.0)
+            .new_order_single("E2E_DD_BLOCKED", "BTC_USDT", '1', 0.001, 100.0, None, None, None)
             .await
             .expect_err("drawdown halt must reject 35=D");
         assert!(
@@ -9225,7 +9270,7 @@ mod connectivity_tests {
         );
 
         session
-            .new_order_single("E2E_DD_RESUME", "BTC_USDT", '1', 0.001, 100.0)
+            .new_order_single("E2E_DD_RESUME", "BTC_USDT", '1', 0.001, 100.0, None, None, None)
             .await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
         assert_eq!(*orders_received.lock().await, before + 1);
@@ -9235,6 +9280,176 @@ mod connectivity_tests {
         cleanup_processed("E2E_DD_BLOCKED");
         cleanup_processed("E2E_DD_REBASE");
         cleanup_processed("E2E_DD_RESUME");
+        Ok(())
+    }
+
+    /// Drive `FIXSession::new_order_single` against a mock that records SMP tags
+    /// on inbound 35=D. Does not start `algo_runtime::run` and does not flip
+    /// `paper_mode`.
+    async fn drive_nos_smp(
+        cl_ord_id: &str,
+        scope: Option<String>,
+        instruction: Option<String>,
+        id: Option<String>,
+    ) -> Result<(std::result::Result<(), anyhow::Error>, Vec<mock_gateway::CapturedSmp>, u64)> {
+        let rec: Arc<Mutex<Vec<mock_gateway::CapturedSmp>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let orders_received = Arc::new(Mutex::new(0u64));
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                nos_smp_tags: Some(Arc::clone(&rec)),
+                orders_received: Some(Arc::clone(&orders_received)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+        let send_result = session
+            .new_order_single(
+                cl_ord_id,
+                "BTC_USDT",
+                '1',
+                1.0,
+                100.0,
+                scope,
+                instruction,
+                id,
+            )
+            .await;
+        if send_result.is_ok() {
+            pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+        }
+        let captured = rec.lock().await.clone();
+        let n = *orders_received.lock().await;
+        cleanup_processed(cl_ord_id);
+        Ok((send_result, captured, n))
+    }
+
+    #[tokio::test]
+    async fn smp_armed_emits_all_three_tags() -> Result<()> {
+        let (sent, rec, n) = drive_nos_smp(
+            "SMP_ARMED",
+            Some("S".to_string()),
+            Some("1".to_string()),
+            Some("42".to_string()),
+        )
+        .await?;
+        sent.expect("armed SMP must send 35=D");
+        assert_eq!(n, 1);
+        assert_eq!(rec.len(), 1);
+        assert_eq!(
+            rec[0],
+            mock_gateway::CapturedSmp {
+                scope: Some("S".to_string()),
+                instruction: Some("1".to_string()),
+                id: Some("42".to_string()),
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smp_inactive_omits_all_three_tags() -> Result<()> {
+        let (sent, rec, n) = drive_nos_smp("SMP_INACTIVE", None, None, None).await?;
+        sent.expect("unset SMP must still send 35=D");
+        assert_eq!(n, 1);
+        assert_eq!(rec.len(), 1);
+        assert_eq!(
+            rec[0],
+            mock_gateway::CapturedSmp {
+                scope: None,
+                instruction: None,
+                id: None,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smp_partial_emits_only_present_tags() -> Result<()> {
+        let (sent, rec, n) = drive_nos_smp(
+            "SMP_PARTIAL",
+            None,
+            None,
+            Some("42".to_string()),
+        )
+        .await?;
+        sent.expect("partial SMP must send 35=D");
+        assert_eq!(n, 1);
+        assert_eq!(rec.len(), 1);
+        assert_eq!(
+            rec[0],
+            mock_gateway::CapturedSmp {
+                scope: None,
+                instruction: None,
+                id: Some("42".to_string()),
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smp_rejects_forbidden_delimiter_before_from_request() -> Result<()> {
+        let (sent, rec, n) = drive_nos_smp(
+            "SMP_DELIM",
+            None,
+            None,
+            Some("42\x0138=999".to_string()),
+        )
+        .await?;
+        let err = sent.expect_err("poisoned SMP id must be rejected");
+        let err_s = err.to_string();
+        assert!(
+            err_s.contains("forbidden delimiter"),
+            "expected forbidden delimiter, got {err_s}"
+        );
+        assert!(rec.is_empty(), "rejected SMP must not reach the mock gateway");
+        assert_eq!(n, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smp_rejects_oversize_before_from_request() -> Result<()> {
+        let (sent, rec, n) = drive_nos_smp(
+            "SMP_LEN",
+            None,
+            None,
+            Some("x".repeat(33)),
+        )
+        .await?;
+        let err = sent.expect_err("oversize SMP id must be rejected");
+        let err_s = err.to_string();
+        assert!(
+            err_s.contains("exceeds max length"),
+            "expected exceeds max length, got {err_s}"
+        );
+        assert!(rec.is_empty(), "rejected SMP must not reach the mock gateway");
+        assert_eq!(n, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn smp_empty_string_is_emitted() -> Result<()> {
+        let (sent, rec, n) = drive_nos_smp(
+            "SMP_EMPTY",
+            Some("".to_string()),
+            Some("".to_string()),
+            Some("".to_string()),
+        )
+        .await?;
+        sent.expect("empty SMP strings must send 35=D");
+        assert_eq!(n, 1);
+        assert_eq!(rec.len(), 1);
+        assert_eq!(
+            rec[0],
+            mock_gateway::CapturedSmp {
+                scope: Some("".to_string()),
+                instruction: Some("".to_string()),
+                id: Some("".to_string()),
+            }
+        );
         Ok(())
     }
 }

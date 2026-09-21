@@ -1,0 +1,128 @@
+[
+  {
+    "file": "loading-375.png",
+    "label": "Loading — Loading algorithm status; form and Save disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "empty-375.png",
+    "label": "Empty / off — Spread capture is off; Enable is the primary action",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "error-375.png",
+    "label": "Error — Cannot load algorithm status; Save blocked so cache cannot clobber SMP",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "success-375.png",
+    "label": "Success / on — Spread capture is on; SMP keys cached, not shown as fields",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-375.png",
+    "label": "Disabled — Save and Enable off while status is in flight",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "save-success-375.png",
+    "label": "Save success — Configuration saved; Object.assign round-trips SMP keys",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "save-error-375.png",
+    "label": "Save error — Cannot save configuration",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "loading-768.png",
+    "label": "Loading — Loading algorithm status; form and Save disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "empty-768.png",
+    "label": "Empty / off — Spread capture is off; Enable is the primary action",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "error-768.png",
+    "label": "Error — Cannot load algorithm status; Save blocked so cache cannot clobber SMP",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "success-768.png",
+    "label": "Success / on — Spread capture is on; SMP keys cached, not shown as fields",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-768.png",
+    "label": "Disabled — Save and Enable off while status is in flight",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "save-success-768.png",
+    "label": "Save success — Configuration saved; Object.assign round-trips SMP keys",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "save-error-768.png",
+    "label": "Save error — Cannot save configuration",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "loading-1280.png",
+    "label": "Loading — Loading algorithm status; form and Save disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "empty-1280.png",
+    "label": "Empty / off — Spread capture is off; Enable is the primary action",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "error-1280.png",
+    "label": "Error — Cannot load algorithm status; Save blocked so cache cannot clobber SMP",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "success-1280.png",
+    "label": "Success / on — Spread capture is on; SMP keys cached, not shown as fields",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-1280.png",
+    "label": "Disabled — Save and Enable off while status is in flight",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "save-success-1280.png",
+    "label": "Save success — Configuration saved; Object.assign round-trips SMP keys",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "save-error-1280.png",
+    "label": "Save error — Cannot save configuration",
+    "width": "1280",
+    "overflowing": false
+  }
+]

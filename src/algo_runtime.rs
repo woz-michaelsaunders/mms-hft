@@ -110,7 +110,16 @@ pub async fn run(
             let side_char = signal.side.chars().next().unwrap_or('1');
             let cl_ord_id = format!("ALGO_{}", uuid::Uuid::new_v4().simple());
             match order_session
-                .new_order_single(&cl_ord_id, &signal.symbol, side_char, signal.qty, signal.price)
+                .new_order_single(
+                    &cl_ord_id,
+                    &signal.symbol,
+                    side_char,
+                    signal.qty,
+                    signal.price,
+                    cfg.self_match_prevention_scope.clone(),
+                    cfg.self_match_prevention_instruction.clone(),
+                    cfg.self_match_prevention_id.clone(),
+                )
                 .await
             {
                 Ok(()) => {
