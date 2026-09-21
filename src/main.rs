@@ -14,7 +14,7 @@ use log::{info, error, warn};
 use serde::{Deserialize, Deserializer};
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -544,6 +544,14 @@ pub struct CancelOrderRequest {
     pub side: String,                // Tag 54: Side ("1"=BUY, "2"=SELL) - stored as String for JSON compatibility
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OperatorHaltTriggerResult {
+    pub halted: bool,            // always true after trigger_operator_halt
+    pub cancel_attempted: u32,   // snapshot.len() as u32
+    pub cancel_ok: u32,          // cancel_order Ok count
+    pub cancel_failed: u32,      // cancel_order Err count
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct ReplaceOrderRequest {
     // Required fields
@@ -880,6 +888,10 @@ pub struct FIXSession {
     order_books: Arc<Mutex<HashMap<String, DoubleBufferedOrderBook>>>,
     // Lock-free open orders store using ArcSwap for zero-lock snapshots
     open_orders: Arc<OpenOrdersStore>,
+    /// Manual operator brake (console/API label: Kill Switch).
+    /// Independent of algo enabled / paper_mode / max_orders_session.
+    /// Runtime-only; default false. Not `kill_switch` (kdb capture-symbols clash).
+    operator_halt: Arc<AtomicBool>,
     // Lock-free positions store — aggregated fills per symbol
     positions: Arc<PositionsStore>,
     // Event-driven update channels (optional, set after creation)
@@ -1094,6 +1106,7 @@ impl FIXSession {
             tick_data: Arc::new(Mutex::new(Vec::new())),
             order_books: Arc::new(Mutex::new(HashMap::new())),
             open_orders: Arc::new(OpenOrdersStore::new()),
+            operator_halt: Arc::new(AtomicBool::new(false)),
             positions: {
                 let ps = Arc::new(PositionsStore::new());
                 ps.load_from_trades_csv();
@@ -1351,6 +1364,63 @@ impl FIXSession {
         Ok(())
     }
 
+    /// Shared gate. No log here — callers log 35=D vs 35=G.
+    fn reject_if_operator_halt(&self) -> Result<()> {
+        if self.operator_halt.load(Ordering::SeqCst) {
+            Err(anyhow!(OPERATOR_HALT_REJECT))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn operator_halt_is_set(&self) -> bool {
+        self.operator_halt.load(Ordering::SeqCst)
+    }
+
+    pub fn reset_operator_halt(&self) {
+        self.operator_halt.store(false, Ordering::SeqCst);
+        info!("operator_halt=false");
+    }
+
+    pub async fn trigger_operator_halt(&self) -> OperatorHaltTriggerResult {
+        self.operator_halt.store(true, Ordering::SeqCst);
+
+        let snapshot: Vec<OpenOrder> = self.open_orders.get_open_orders();
+        let mut cancel_ok: u32 = 0;
+        let mut cancel_failed: u32 = 0;
+
+        for order in &snapshot {
+            let req = CancelOrderRequest {
+                cl_ord_id: format!("HALT_{}", uuid::Uuid::new_v4().simple()),
+                orig_cl_ord_id: order.cl_ord_id.clone(),
+                symbol: order.symbol.clone(),
+                side: order.side.clone(),
+            };
+            match self.cancel_order(&req).await {
+                Ok(()) => cancel_ok += 1,
+                Err(e) => {
+                    cancel_failed += 1;
+                    warn!(
+                        "operator_halt=true cancel_failed orig_cl_ord_id={} symbol={} err={}",
+                        order.cl_ord_id, order.symbol, e
+                    );
+                }
+            }
+        }
+
+        let result = OperatorHaltTriggerResult {
+            halted: true,
+            cancel_attempted: snapshot.len() as u32,
+            cancel_ok,
+            cancel_failed,
+        };
+        info!(
+            "operator_halt=true cancel_attempted={} cancel_ok={} cancel_failed={}",
+            result.cancel_attempted, result.cancel_ok, result.cancel_failed
+        );
+        result
+    }
+
     /// Cancel an order using OrderCancelRequest (35=F)
     pub async fn cancel_order(&self, cancel_request: &CancelOrderRequest) -> Result<()> {
         if !self.is_ready().await {
@@ -1394,6 +1464,14 @@ impl FIXSession {
     /// working order. `new_cl_ord_id` must be a fresh ClOrdID; `orig_cl_ord_id`
     /// identifies the order being replaced.
     pub async fn order_cancel_replace_request(&self, request: &ReplaceOrderRequest) -> Result<()> {
+        if let Err(e) = self.reject_if_operator_halt() {
+            warn!(
+                "operator_halt=true rejected 35=G cl_ord_id={} orig_cl_ord_id={} symbol={}",
+                request.cl_ord_id, request.orig_cl_ord_id, request.symbol
+            );
+            return Err(e);
+        }
+
         if !self.is_ready().await {
             return Err(anyhow!("Session not ready"));
         }
@@ -1434,6 +1512,14 @@ impl FIXSession {
 
     /// Create order from OrderRequest struct (supports all FIX order fields)
     pub async fn new_order_single_from_request(&self, order: &OrderRequest) -> Result<()> {
+        if let Err(e) = self.reject_if_operator_halt() {
+            warn!(
+                "operator_halt=true rejected 35=D cl_ord_id={} symbol={}",
+                order.cl_ord_id, order.symbol
+            );
+            return Err(e);
+        }
+
         if !self.is_ready().await {
             return Err(anyhow!("Session not ready"));
         }
@@ -3278,6 +3364,9 @@ impl FIXSession {
             )
     }
 }
+
+/// Distinguishes halt rejects from `Session not ready` and `Duplicate ClOrdID rejected`.
+const OPERATOR_HALT_REJECT: &str = "Operator halt is active; new orders are blocked";
 
 const STATUS_READ_SKIPPED_LOCK_CONTENDED: &str = "skipped_lock_contended";
 
@@ -5221,6 +5310,34 @@ async fn order_book_web_server(
         Json(serde_json::json!({"ok": true, "enabled": false}))
     }
 
+    async fn operator_halt_trigger_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Json<serde_json::Value> {
+        let r = state.order_session.trigger_operator_halt().await;
+        Json(serde_json::json!({
+            "ok": true,
+            "halted": r.halted,
+            "cancel_attempted": r.cancel_attempted,
+            "cancel_ok": r.cancel_ok,
+            "cancel_failed": r.cancel_failed,
+        }))
+    }
+
+    async fn operator_halt_reset_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Json<serde_json::Value> {
+        state.order_session.reset_operator_halt();
+        Json(serde_json::json!({ "ok": true, "halted": false }))
+    }
+
+    async fn operator_halt_status_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "halted": state.order_session.operator_halt_is_set()
+        }))
+    }
+
     // POST /api/algo/config — update algo config fields
     async fn algo_config_api(
         axum::extract::State(state): axum::extract::State<AppState>,
@@ -5769,6 +5886,9 @@ async fn order_book_web_server(
         .route("/api/algo/enable", post(algo_enable_api))
         .route("/api/algo/disable", post(algo_disable_api))
         .route("/api/algo/config", post(algo_config_api))
+        .route("/api/kill-switch", post(operator_halt_trigger_api))
+        .route("/api/kill-switch/reset", post(operator_halt_reset_api))
+        .route("/api/kill-switch/status", get(operator_halt_status_api))
         .route("/api/shadow/status", get(get_shadow_status_api))
         .route("/api/backtest", get(get_backtest_api))
         .route("/api/backtest/sweep", get(get_backtest_sweep_api))
@@ -8299,6 +8419,90 @@ mod connectivity_tests {
         sc_run.abort();
         mi_run.abort();
         pump.abort();
+        Ok(())
+    }
+
+    /// Operator Kill Switch: freeze, flatten every resting order with 35=F,
+    /// reject further 35=D until reset, then resume submission.
+    #[tokio::test]
+    async fn e2e_operator_halt_flattens_and_blocks_until_reset() -> Result<()> {
+        let orders_received = Arc::new(Mutex::new(0u64));
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                orders_received: Some(Arc::clone(&orders_received)),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        session.new_order_single("E2E_HALT_1", "BTC_USDT", '1', 1.0, 100.0).await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+        session.new_order_single("E2E_HALT_2", "BTC_USDT", '2', 1.0, 101.0).await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+
+        let resting = session.open_orders.get_open_orders();
+        assert!(
+            resting.len() >= 2,
+            "expected >=2 resting orders before halt, got {}",
+            resting.len()
+        );
+        let before_halt_orders = *orders_received.lock().await;
+        assert_eq!(before_halt_orders, 2);
+
+        let result = session.trigger_operator_halt().await;
+        assert!(result.halted);
+        assert!(
+            result.cancel_attempted >= 2,
+            "expected cancel_attempted >= 2, got {}",
+            result.cancel_attempted
+        );
+        assert!(session.operator_halt_is_set());
+
+        let mut canceled = 0u32;
+        pump_messages(&session, Duration::from_secs(3), |msg| {
+            if msg.msg_type == '8' && msg.get_field(150) == Some("4") {
+                canceled += 1;
+            }
+            canceled >= 2
+        })
+        .await?;
+        assert!(
+            canceled >= 2,
+            "expected a Canceled ExecutionReport for each resting order, got {}",
+            canceled
+        );
+
+        let err = session
+            .new_order_single("E2E_HALT_3", "BTC_USDT", '1', 1.0, 100.0)
+            .await
+            .expect_err("halted session must reject 35=D");
+        let err_s = err.to_string();
+        assert!(
+            err_s.contains(OPERATOR_HALT_REJECT),
+            "expected OPERATOR_HALT_REJECT, got {}",
+            err_s
+        );
+        assert_eq!(
+            *orders_received.lock().await,
+            before_halt_orders,
+            "rejected 35=D must not reach the mock gateway"
+        );
+
+        session.reset_operator_halt();
+        assert!(!session.operator_halt_is_set());
+
+        session.new_order_single("E2E_HALT_4", "BTC_USDT", '1', 1.0, 100.0).await?;
+        pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
+        assert_eq!(*orders_received.lock().await, before_halt_orders + 1);
+
+        cleanup_processed("E2E_HALT_1");
+        cleanup_processed("E2E_HALT_2");
+        cleanup_processed("E2E_HALT_3");
+        cleanup_processed("E2E_HALT_4");
         Ok(())
     }
 }
