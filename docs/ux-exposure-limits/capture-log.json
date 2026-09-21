@@ -1,0 +1,200 @@
+[
+  {
+    "file": "halt-loading-375.png",
+    "label": "Halt loading — Checking halt, both halt buttons disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "halt-empty-375.png",
+    "label": "Halt empty — Not halted, Reset disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "halt-error-375.png",
+    "label": "Halt error — Halt status unknown",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "halt-success-375.png",
+    "label": "Halt success — Kill Switch reset (resume after drawdown)",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "halt-disabled-375.png",
+    "label": "Halt disabled — in-flight trigger",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "halt-halted-375.png",
+    "label": "Halt halted — drawdown trip looks identical to operator halt",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "pos-loading-375.png",
+    "label": "Positions loading — banner + table loading, refresh disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "pos-empty-375.png",
+    "label": "Positions empty — no fills yet",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "pos-error-375.png",
+    "label": "Positions error — cannot load",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "pos-success-375.png",
+    "label": "Positions success — net qty and realized P&L",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "pos-disabled-375.png",
+    "label": "Positions disabled — refresh disabled while loading",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "halt-loading-768.png",
+    "label": "Halt loading — Checking halt, both halt buttons disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "halt-empty-768.png",
+    "label": "Halt empty — Not halted, Reset disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "halt-error-768.png",
+    "label": "Halt error — Halt status unknown",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "halt-success-768.png",
+    "label": "Halt success — Kill Switch reset (resume after drawdown)",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "halt-disabled-768.png",
+    "label": "Halt disabled — in-flight trigger",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "halt-halted-768.png",
+    "label": "Halt halted — drawdown trip looks identical to operator halt",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "pos-loading-768.png",
+    "label": "Positions loading — banner + table loading, refresh disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "pos-empty-768.png",
+    "label": "Positions empty — no fills yet",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "pos-error-768.png",
+    "label": "Positions error — cannot load",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "pos-success-768.png",
+    "label": "Positions success — net qty and realized P&L",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "pos-disabled-768.png",
+    "label": "Positions disabled — refresh disabled while loading",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "halt-loading-1280.png",
+    "label": "Halt loading — Checking halt, both halt buttons disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "halt-empty-1280.png",
+    "label": "Halt empty — Not halted, Reset disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "halt-error-1280.png",
+    "label": "Halt error — Halt status unknown",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "halt-success-1280.png",
+    "label": "Halt success — Kill Switch reset (resume after drawdown)",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "halt-disabled-1280.png",
+    "label": "Halt disabled — in-flight trigger",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "halt-halted-1280.png",
+    "label": "Halt halted — drawdown trip looks identical to operator halt",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "pos-loading-1280.png",
+    "label": "Positions loading — banner + table loading, refresh disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "pos-empty-1280.png",
+    "label": "Positions empty — no fills yet",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "pos-error-1280.png",
+    "label": "Positions error — cannot load",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "pos-success-1280.png",
+    "label": "Positions success — net qty and realized P&L",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "pos-disabled-1280.png",
+    "label": "Positions disabled — refresh disabled while loading",
+    "width": "1280",
+    "overflowing": false
+  }
+]
