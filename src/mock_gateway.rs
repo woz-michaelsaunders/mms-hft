@@ -26,7 +26,7 @@ use tokio::time::{sleep, Duration, Instant};
 
 use crate::fix_protocol::{tags, FIXMessage};
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct MockGatewayConfig {
     /// CompID the mock identifies itself as (becomes TargetCompID from the client's POV).
     pub venue_comp_id: String,
@@ -43,6 +43,8 @@ pub struct MockGatewayConfig {
     /// Heartbeat echoing it — which is what the live venue does, and what was
     /// disconnecting every session every 15-25 seconds.
     pub test_request_after_logon: Option<String>,
+    /// Optional recorder of symbols requested via MarketDataRequest (35=V).
+    pub md_requested_symbols: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl Default for MockGatewayConfig {
@@ -53,6 +55,7 @@ impl Default for MockGatewayConfig {
             induce_gap_at_tick: None,
             disconnect_after_messages: None,
             test_request_after_logon: None,
+            md_requested_symbols: None,
         }
     }
 }
@@ -276,6 +279,10 @@ async fn handle_client(mut socket: TcpStream, config: MockGatewayConfig) -> Resu
                 'V' => {
                     let symbol = msg.get_field(tags::SYMBOL).unwrap_or("UNKNOWN").to_string();
                     let md_req_id = msg.get_field(tags::MARKET_DATA_REQ_ID).unwrap_or("mdreq").to_string();
+
+                    if let Some(rec) = &config.md_requested_symbols {
+                        rec.lock().await.push(symbol.clone());
+                    }
 
                     send_snapshot(&mut socket, &out_seq, &config, &symbol, &md_req_id, 100.0, 100.5).await?;
 

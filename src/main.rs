@@ -8,15 +8,18 @@ mod order_events;
 mod mock_gateway;
 pub mod algo;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use fix_protocol::{FIXMessage, tags};
 use log::{info, error, warn};
+use serde::{Deserialize, Deserializer};
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, broadcast};
+use tokio::task::JoinSet;
 use tokio::time::{sleep, Duration, interval, Instant};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -46,15 +49,142 @@ const COMMAND_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB; rotate iff len
 
 
 // Configuration structure
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 struct Config {
     #[serde(default)]
     subscriptions: SubscriptionsConfig,
-    order_management: OrderManagementConfig,
-    market_data_btc: MarketDataConfig,
-    market_data_others: MarketDataOthersConfig,
-    api: ApiConfig,
+    sessions: Vec<SessionConfig>,
+    #[serde(default)]
+    credentials: HashMap<String, CredentialConfig>, // [credentials.NAME]
     connection: ConnectionConfig,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct SessionConfig {
+    name: String,
+    role: SessionRole,
+    host: String,
+    port: u16,
+    sender_comp_id: String,
+    target_comp_id: String,
+    credentials_ref: String,
+    #[serde(default)]
+    symbol_routing: Option<SymbolRouting>,
+    /// ADR-0008 overrides. Missing TOML keys deserialize as `None`.
+    /// Serde does NOT treat Option<T> as implicit default.
+    #[serde(default)]
+    heartbeat_interval: Option<u64>,
+    #[serde(default)]
+    max_reconnect_attempts: Option<u32>,
+    #[serde(default)]
+    reconnect_backoff_ms: Option<u64>,
+    /// Filled by `validate_config` for `role = market_data` only. Always `None` on OM.
+    #[serde(skip)]
+    compiled_routing: Option<CompiledSymbolRouting>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionRole {
+    OrderManagement,
+    MarketData,
+}
+
+impl fmt::Display for SessionRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionRole::OrderManagement => write!(f, "order_management"),
+            SessionRole::MarketData => write!(f, "market_data"),
+        }
+    }
+}
+
+/// Deserialized form. `FirstCharRanges` holds **raw TOML strings**.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SymbolRouting {
+    All,
+    FirstCharRanges(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for SymbolRouting {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum SymbolRoutingRaw {
+            All(String),
+            Ranges { first_char_ranges: Vec<String> },
+        }
+        match SymbolRoutingRaw::deserialize(deserializer)? {
+            SymbolRoutingRaw::All(s) if s == "all" => Ok(SymbolRouting::All),
+            SymbolRoutingRaw::All(s) => Err(serde::de::Error::custom(format!(
+                "symbol_routing string must be exactly \"all\", got {s:?}"
+            ))),
+            SymbolRoutingRaw::Ranges { first_char_ranges } => {
+                Ok(SymbolRouting::FirstCharRanges(first_char_ranges))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompiledSymbolRouting {
+    All,
+    FirstCharRanges(Vec<CharRange>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CharRange {
+    start: char, // inclusive, ASCII-uppercased by validate
+    end: char,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+struct CredentialConfig {
+    api_key_env: String,
+    api_secret_env: String,
+}
+
+/// In-memory secrets. NO `#[derive(Debug)]`.
+struct ResolvedCredentials {
+    api_key: String,
+    api_secret: String,
+}
+
+impl fmt::Debug for ResolvedCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedCredentials")
+            .field("api_key", &"<redacted>")
+            .field("api_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+struct SpawnedSession {
+    handle: Arc<FIXSession>,
+    config: SessionConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLoopKind {
+    Connect,
+    Heartbeat,
+}
+
+impl fmt::Display for SessionLoopKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionLoopKind::Connect => write!(f, "connect"),
+            SessionLoopKind::Heartbeat => write!(f, "heartbeat"),
+        }
+    }
+}
+
+struct SessionTaskIdentity {
+    name: String,
+    role: SessionRole,
+    host: String,
+    port: u16,
+    kind: SessionLoopKind,
 }
 
 /// Which instruments to subscribe to for market data.
@@ -109,36 +239,6 @@ fn feed_health(now_ms: u64, last_inbound_ms: u64, last_md_ms: u64, stall_ms: u64
 static SUBSCRIPTION_ALLOWLIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct OrderManagementConfig {
-    gateway_url: String,
-    sender_comp_id: String,
-    target_comp_id: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct MarketDataConfig {
-    gateway_url: String,
-    sender_comp_id: String,
-    target_comp_id: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct MarketDataOthersConfig {
-    base_url: String,
-    sender_comp_id: String,  // Same CompID for all three ports
-    target_comp_id: String,
-    port_34405: u16,
-    port_34406: u16,
-    port_34407: u16,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct ApiConfig {
-    api_key: String,
-    api_secret: String,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
 struct ConnectionConfig {
     heartbeat_interval: u64,
     max_reconnect_attempts: u32,
@@ -177,12 +277,238 @@ fn load_config() -> Result<Config> {
     let config_path = "config.toml";
     let config_content = std::fs::read_to_string(config_path)
         .map_err(|e| anyhow!("Failed to read config file {}: {}", config_path, e))?;
-    
-    let config: Config = toml::from_str(&config_content)
-        .map_err(|e| anyhow!("Failed to parse config file: {}", e))?;
-    
-    Ok(config)
+    parse_config(&config_content)
 }
+
+fn parse_config(toml_str: &str) -> Result<Config> {
+    toml::from_str(toml_str)
+        .map_err(|e| anyhow!("Failed to parse config file: {}", e))
+}
+
+fn parse_char_range(session_name: &str, raw: &str) -> Result<CharRange> {
+    let chars: Vec<char> = raw.chars().collect();
+    if chars.len() != 3 || chars[1] != '-' {
+        bail!(
+            "session '{session_name}' first_char_ranges entry '{raw}' is not X-Y"
+        );
+    }
+    if !chars[0].is_ascii() || !chars[2].is_ascii() {
+        bail!(
+            "session '{session_name}' first_char_ranges entry '{raw}' must be ASCII"
+        );
+    }
+    let start = chars[0].to_ascii_uppercase();
+    let end = chars[2].to_ascii_uppercase();
+    if start > end {
+        bail!(
+            "session '{session_name}' first_char_ranges entry '{raw}' is inverted (start > end after uppercase)"
+        );
+    }
+    Ok(CharRange { start, end })
+}
+
+fn compile_symbol_routing(session_name: &str, routing: &SymbolRouting) -> Result<CompiledSymbolRouting> {
+    match routing {
+        SymbolRouting::All => Ok(CompiledSymbolRouting::All),
+        SymbolRouting::FirstCharRanges(raw) => {
+            if raw.is_empty() {
+                bail!("session '{session_name}' first_char_ranges must not be empty");
+            }
+            let mut ranges = Vec::with_capacity(raw.len());
+            for entry in raw {
+                ranges.push(parse_char_range(session_name, entry)?);
+            }
+            Ok(CompiledSymbolRouting::FirstCharRanges(ranges))
+        }
+    }
+}
+
+fn session_admits_symbol(routing: &CompiledSymbolRouting, symbol: &str) -> bool {
+    match routing {
+        CompiledSymbolRouting::All => true, // including empty string
+        CompiledSymbolRouting::FirstCharRanges(ranges) => {
+            let Some(first) = symbol.chars().next() else {
+                return false; // empty symbol
+            };
+            let ch = first.to_ascii_uppercase();
+            ranges.iter().any(|r| r.start <= ch && ch <= r.end)
+        }
+    }
+}
+
+fn validate_config(config: &mut Config) -> Result<()> {
+    if config.sessions.is_empty() {
+        bail!("sessions must not be empty");
+    }
+
+    for session in &config.sessions {
+        if session.name.trim().is_empty() {
+            bail!("session name must not be empty");
+        }
+    }
+
+    let mut seen_names: HashSet<String> = HashSet::new();
+    for session in &config.sessions {
+        let trimmed = session.name.trim().to_string();
+        if !seen_names.insert(trimmed.clone()) {
+            bail!("duplicate session name: {trimmed}");
+        }
+    }
+
+    let n = config
+        .sessions
+        .iter()
+        .filter(|s| s.role == SessionRole::OrderManagement)
+        .count();
+    if n > 1 {
+        bail!("at most one session with role = order_management is allowed (found {n})");
+    }
+
+    for session in &config.sessions {
+        if session.credentials_ref.trim().is_empty() {
+            bail!(
+                "session '{}' credentials_ref must not be empty",
+                session.name
+            );
+        }
+    }
+
+    for session in &config.sessions {
+        if !config.credentials.contains_key(&session.credentials_ref) {
+            bail!(
+                "session '{}' credentials_ref '{}' does not match any [credentials.*] block",
+                session.name,
+                session.credentials_ref
+            );
+        }
+    }
+
+    let mut keys: Vec<&String> = config.credentials.keys().collect();
+    keys.sort();
+    for block in keys {
+        let cred = &config.credentials[block];
+        if cred.api_key_env.trim().is_empty() {
+            bail!("credentials.{block} api_key_env must not be empty");
+        }
+        if cred.api_secret_env.trim().is_empty() {
+            bail!("credentials.{block} api_secret_env must not be empty");
+        }
+    }
+
+    for session in &config.sessions {
+        if session.role == SessionRole::MarketData && session.symbol_routing.is_none() {
+            bail!(
+                "session '{}' role = market_data requires symbol_routing",
+                session.name
+            );
+        }
+    }
+
+    for session in &mut config.sessions {
+        if session.role == SessionRole::MarketData {
+            let routing = session
+                .symbol_routing
+                .as_ref()
+                .expect("check 8 required symbol_routing for market_data");
+            session.compiled_routing = Some(compile_symbol_routing(&session.name, routing)?);
+        }
+        // OM rows: if symbol_routing is Some, ignore it. compiled_routing stays None.
+    }
+
+    for session in &config.sessions {
+        if session.host.contains("://") {
+            bail!(
+                "session '{}' host must not contain '://' (use host + port, not a URL)",
+                session.name
+            );
+        }
+    }
+
+    for session in &config.sessions {
+        if session.host.split_whitespace().nth(1).is_some()
+            || session.host != session.host.trim()
+            || session.host.chars().any(char::is_whitespace)
+        {
+            bail!("session '{}' host must not contain whitespace", session.name);
+        }
+    }
+
+    Ok(())
+}
+
+fn used_credential_refs(sessions: &[SessionConfig]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for s in sessions {
+        if seen.insert(s.credentials_ref.clone()) {
+            out.push(s.credentials_ref.clone());
+        }
+    }
+    out
+}
+
+fn read_env_nonempty(var_name: &str, cred_ref: &str, field: &str) -> Result<String> {
+    match std::env::var(var_name) {
+        Err(_) => bail!(
+            "environment variable {var_name} (credentials.{cred_ref} {field}) is not set"
+        ),
+        Ok(v) if v.trim().is_empty() => bail!(
+            "environment variable {var_name} (credentials.{cred_ref} {field}) is empty"
+        ),
+        Ok(v) => Ok(v), // keep raw value; do not trim secrets
+    }
+}
+
+fn resolve_credentials(config: &Config) -> Result<HashMap<String, ResolvedCredentials>> {
+    let mut out = HashMap::new();
+    for ref_name in used_credential_refs(&config.sessions) {
+        let cred = config
+            .credentials
+            .get(&ref_name)
+            .expect("validate_config already required this credentials_ref");
+        let api_key = read_env_nonempty(&cred.api_key_env, &ref_name, "api_key_env")?;
+        let api_secret = read_env_nonempty(&cred.api_secret_env, &ref_name, "api_secret_env")?;
+        out.insert(ref_name, ResolvedCredentials { api_key, api_secret });
+    }
+    Ok(out)
+}
+
+fn session_heartbeat_interval(session: &SessionConfig, conn: &ConnectionConfig) -> u64 {
+    session.heartbeat_interval.unwrap_or(conn.heartbeat_interval)
+}
+fn session_max_reconnect_attempts(session: &SessionConfig, conn: &ConnectionConfig) -> u32 {
+    session.max_reconnect_attempts.unwrap_or(conn.max_reconnect_attempts)
+}
+fn session_reconnect_backoff_ms(session: &SessionConfig, conn: &ConnectionConfig) -> u64 {
+    session.reconnect_backoff_ms.unwrap_or(conn.reconnect_backoff_ms)
+}
+
+fn connect_addr(session: &SessionConfig) -> String {
+    format!("{}:{}", session.host, session.port)
+}
+
+fn lookup_om(spawned: &[SpawnedSession]) -> Option<Arc<FIXSession>> {
+    spawned
+        .iter()
+        .find(|s| s.config.role == SessionRole::OrderManagement)
+        .map(|s| Arc::clone(&s.handle))
+}
+
+fn lookup_primary_md(spawned: &[SpawnedSession]) -> Option<Arc<FIXSession>> {
+    spawned
+        .iter()
+        .find(|s| s.config.role == SessionRole::MarketData)
+        .map(|s| Arc::clone(&s.handle))
+}
+
+fn lookup_all_md(spawned: &[SpawnedSession]) -> Vec<(Arc<FIXSession>, String, u16)> {
+    spawned
+        .iter()
+        .filter(|s| s.config.role == SessionRole::MarketData)
+        .map(|s| (Arc::clone(&s.handle), s.config.name.clone(), s.config.port))
+        .collect()
+}
+
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct OrderRequest {
@@ -3169,28 +3495,6 @@ async fn message_loop(
     }
 }
 
-/// Determine which market data port to use based on symbol's first character
-fn get_market_data_port_for_symbol(symbol: &str, config: &MarketDataOthersConfig) -> u16 {
-    if symbol.is_empty() {
-        return config.port_34405; // Default
-    }
-    
-    let first_char = symbol.chars().next().unwrap().to_ascii_uppercase();
-    
-    match first_char {
-        '0'..='9' | 'A'..='D' => config.port_34405,
-        'E'..='M' => config.port_34406,
-        'N'..='Z' => config.port_34407,
-        _ => config.port_34405, // Default fallback
-    }
-}
-
-/// Get the full URL for a symbol's market data connection
-fn get_market_data_url_for_symbol(symbol: &str, config: &MarketDataOthersConfig) -> String {
-    let port = get_market_data_port_for_symbol(symbol, config);
-    format!("{}:{}", config.base_url, port)
-}
-
 /// Market Data connection loop for securities requests
 /// symbol_filter: Optional function to filter which symbols this server should subscribe to
 async fn market_data_loop(
@@ -5751,10 +6055,7 @@ async fn main() -> Result<()> {
 
     startup_note("starting");
 
-    // `main` returns Result, so a bare `?` here would print only "Error: ..."
-    // to a stderr that may not be captured, and exit 1 silently — which is
-    // exactly what happened on 2026-09-11. Say what failed, durably, first.
-    let config = match load_config() {
+    let mut config = match load_config() {
         Ok(c) => {
             startup_note("config.toml loaded");
             c
@@ -5764,437 +6065,421 @@ async fn main() -> Result<()> {
             return Err(e);
         }
     };
-    info!("✅ Configuration loaded from config.toml");
+
+    if let Err(e) = validate_config(&mut config) {
+        startup_note(&format!("FATAL: config validation failed: {e:#}"));
+        return Err(e);
+    }
+
+    let resolved = match resolve_credentials(&config) {
+        Ok(m) => m,
+        Err(e) => {
+            startup_note(&format!("FATAL: credential resolve failed: {e:#}"));
+            return Err(e);
+        }
+    };
+
+    // names as written, list order; refs unique first-seen
+    let names: Vec<&str> = config.sessions.iter().map(|s| s.name.as_str()).collect();
+    startup_note(&format!(
+        "sessions: n={} names=[{}]",
+        names.len(),
+        names.join(", ")
+    ));
+    let refs = used_credential_refs(&config.sessions);
+    startup_note(&format!(
+        "credentials resolved: refs=[{}]",
+        refs.join(", ")
+    ));
+
+    // Do NOT info!("{:?}", config);
     let _ = SUBSCRIPTION_ALLOWLIST.set(config.subscriptions.symbols.clone());
     info!("📜 Subscription allowlist: {:?}", config.subscriptions.symbols);
 
-    info!("╔════════════════════════════════════════════════════════════╗");
-    info!("║  MULTI-CONNECTION FIX SERVER - ORDER + MARKET DATA           ║");
-    info!("║  1. Order Management Gateway                                 ║");
-    info!("║  2. Market Data Server (BTC)                                 ║");
-    info!("║  3. Market Data Server (34405) - Symbols 0-9, A-D            ║");
-    info!("║  4. Market Data Server (34406) - Symbols E-M                ║");
-    info!("║  5. Market Data Server (34407) - Symbols N-Z                 ║");
-    info!("╚════════════════════════════════════════════════════════════╝");
-    info!("");
-    info!("Order Management Gateway: {}", config.order_management.gateway_url);
-    info!("  Sender: {} -> Target: {}", config.order_management.sender_comp_id, config.order_management.target_comp_id);
-    info!("Market Data Server (BTC): {}", config.market_data_btc.gateway_url);
-    info!("  Sender: {} -> Target: {}", config.market_data_btc.sender_comp_id, config.market_data_btc.target_comp_id);
-    info!("Market Data Servers (Others): {}", config.market_data_others.base_url);
-    info!("  Port {}: Symbols 0-9, A-D", config.market_data_others.port_34405);
-    info!("  Port {}: Symbols E-M", config.market_data_others.port_34406);
-    info!("  Port {}: Symbols N-Z", config.market_data_others.port_34407);
-    info!("  Sender: {} -> Target: {}", config.market_data_others.sender_comp_id, config.market_data_others.target_comp_id);
-
-    // Initialize kdb+ writer (connect to kdb+ server via IPC)
-    // Default to localhost:5001 - can be configured via environment or config file
+    // KDB_HOST / KDB_PORT defaults UNCHANGED
     let kdb_host = std::env::var("KDB_HOST").unwrap_or_else(|_| "localhost".to_string());
     let kdb_port: u16 = std::env::var("KDB_PORT")
         .unwrap_or_else(|_| "5001".to_string())
         .parse()
         .unwrap_or(5001);
-    
+
     let kdb_writer = Arc::new(KdbWriter::new(kdb_host.clone(), kdb_port));
-    kdb_writer.initialize().await
-        .map_err(|e| {
-            error!("❌ FATAL: Failed to initialize kdb+ writer ({}:{}): {}", kdb_host, kdb_port, e);
-            error!("❌ Server cannot start without kdb+ connectivity.");
-            error!("💡 To fix: Start kdb+ server with: q -p {}", kdb_port);
-            error!("💡 Or set KDB_HOST and KDB_PORT environment variables if kdb+ is on a different host/port.");
-            anyhow::anyhow!("kdb+ connection required but failed: {}", e)
-        })?;
+    kdb_writer.initialize().await.map_err(|e| {
+        error!("❌ FATAL: Failed to initialize kdb+ writer ({}:{}): {}", kdb_host, kdb_port, e);
+        error!("❌ Server cannot start without kdb+ connectivity.");
+        error!("💡 To fix: Start kdb+ server with: q -p {}", kdb_port);
+        error!("💡 Or set KDB_HOST and KDB_PORT environment variables if kdb+ is on a different host/port.");
+        anyhow::anyhow!("kdb+ connection required but failed: {}", e)
+    })?;
     info!("✅ kdb+ writer initialized. Connected to {}:{}", kdb_host, kdb_port);
 
-    let session = Arc::new(FIXSession::new_with_credentials_and_kdb(
-        &config.order_management.sender_comp_id, 
-        &config.order_management.target_comp_id,
-        &config.api.api_key,
-        &config.api.api_secret,
-        Arc::clone(&kdb_writer)
-    ));
-    let market_data_session = Arc::new(FIXSession::new_with_credentials_and_kdb(
-        &config.market_data_btc.sender_comp_id, 
-        &config.market_data_btc.target_comp_id,
-        &config.api.api_key,
-        &config.api.api_secret,
-        Arc::clone(&kdb_writer)
-    ));
-    
-    // Create additional market data sessions for ports 34405-34407 (symbol-based routing)
-    let market_data_others_34405 = Arc::new(FIXSession::new_with_credentials_and_kdb(
-        &config.market_data_others.sender_comp_id,
-        &config.market_data_others.target_comp_id,
-        &config.api.api_key,
-        &config.api.api_secret,
-        Arc::clone(&kdb_writer)
-    ));
-    let market_data_others_34406 = Arc::new(FIXSession::new_with_credentials_and_kdb(
-        &config.market_data_others.sender_comp_id,
-        &config.market_data_others.target_comp_id,
-        &config.api.api_key,
-        &config.api.api_secret,
-        Arc::clone(&kdb_writer)
-    ));
-    let market_data_others_34407 = Arc::new(FIXSession::new_with_credentials_and_kdb(
-        &config.market_data_others.sender_comp_id,
-        &config.market_data_others.target_comp_id,
-        &config.api.api_key,
-        &config.api.api_secret,
-        Arc::clone(&kdb_writer)
-    ));
+    // ---- channels BEFORE the spawn loop (moved earlier than today) ----
+    let (order_update_tx, _) = broadcast::channel::<()>(1000);
+    let (order_book_update_tx, _) = broadcast::channel::<String>(1000);
+    let (shutdown_tx, _shutdown_rx) = broadcast::channel::<()>(1);
 
-    // Create channel for order requests
-    let (order_tx, order_rx) = mpsc::channel(100);
+    let mut session_tasks: JoinSet<(SessionTaskIdentity, Result<()>)> = JoinSet::new();
+    let mut spawned: Vec<SpawnedSession> = Vec::new();
+    let mut order_rx_holder: Option<mpsc::Receiver<OrderRequest>> = None;
+    let mut order_tx_holder: Option<mpsc::Sender<OrderRequest>> = None;
 
-    // Order directory watcher
-    let order_tx_for_watcher = order_tx.clone();
-    let session_for_watcher = Arc::clone(&session);
-    let orders_watcher_handle = tokio::spawn(async move {
-        if let Err(e) = watch_orders_directory(order_tx_for_watcher, "orders", session_for_watcher).await {
-            error!("Fatal error in orders directory watcher: {}", e);
-        }
-    });
+    if config.sessions.iter().any(|s| s.role == SessionRole::OrderManagement) {
+        let (tx, rx) = mpsc::channel::<OrderRequest>(100);
+        order_tx_holder = Some(tx);
+        order_rx_holder = Some(rx);
+    }
 
-    // Message loop with order handling
-    let session_clone = Arc::clone(&session);
-    let gateway_clone = config.order_management.gateway_url.clone();
-    let heartbeat_interval = config.connection.heartbeat_interval;
-    let max_reconnect = config.connection.max_reconnect_attempts;
-    let reconnect_backoff = config.connection.reconnect_backoff_ms;
-    let msg_handle = tokio::spawn(async move {
-        if let Err(e) = message_loop(session_clone, gateway_clone, order_rx, heartbeat_interval, max_reconnect, reconnect_backoff).await {
-            error!("Fatal error in message loop: {}", e);
-        }
-    });
+    // ---- spawn loop, list order ----
+    for session in config.sessions.iter() {
+        let creds = resolved
+            .get(&session.credentials_ref)
+            .expect("validate_config + resolve_credentials");
+        let handle = Arc::new(FIXSession::new_with_credentials_and_kdb(
+            &session.sender_comp_id,
+            &session.target_comp_id,
+            &creds.api_key,
+            &creds.api_secret,
+            Arc::clone(&kdb_writer),
+        ));
+        handle
+            .set_update_channels(order_update_tx.clone(), order_book_update_tx.clone())
+            .await;
 
-    // Heartbeat loop for order gateway
-    let session_clone = Arc::clone(&session);
-    let heartbeat_interval_clone = heartbeat_interval;
-    let heartbeat_handle = tokio::spawn(async move {
-        if let Err(e) = heartbeat_loop(session_clone, heartbeat_interval_clone).await {
-            error!("Fatal error in heartbeat loop: {}", e);
-        }
-    });
+        let addr = connect_addr(session);
+        let hb = session_heartbeat_interval(session, &config.connection);
+        let max = session_max_reconnect_attempts(session, &config.connection);
+        let backoff = session_reconnect_backoff_ms(session, &config.connection);
 
-    // Market Data connection loop (separate from order gateway)
-    let market_data_clone = Arc::clone(&market_data_session);
-    let market_data_url = config.market_data_btc.gateway_url.clone();
-    let market_data_handle = tokio::spawn(async move {
-        if let Err(e) = market_data_loop(market_data_clone, market_data_url, heartbeat_interval, max_reconnect, reconnect_backoff, None).await {
-            error!("Fatal error in market data loop: {}", e);
-        }
-    });
+        info!(
+            "spawned session {} role={} {}:{} sender={} target={} credentials_ref={}",
+            session.name,
+            session.role,
+            session.host,
+            session.port,
+            session.sender_comp_id,
+            session.target_comp_id,
+            session.credentials_ref
+        );
 
-    // Market Data Heartbeat loop
-    let market_data_clone = Arc::clone(&market_data_session);
-    let market_data_heartbeat_handle = tokio::spawn(async move {
-        if let Err(e) = heartbeat_loop(market_data_clone, heartbeat_interval).await {
-            error!("Fatal error in market data heartbeat loop: {}", e);
-        }
-    });
-
-    // Additional Market Data connections for ports 34405-34407
-    // Port 34405: symbols starting with 0-9, A-D
-    let market_data_34405_clone = Arc::clone(&market_data_others_34405);
-    let market_data_34405_url = format!("{}:{}", config.market_data_others.base_url, config.market_data_others.port_34405);
-    let config_34405 = config.market_data_others.clone();
-    let market_data_34405_handle = tokio::spawn(async move {
-        let filter: Box<dyn Fn(&str) -> bool + Send + Sync> = Box::new(move |symbol: &str| {
-            let port = get_market_data_port_for_symbol(symbol, &config_34405);
-            port == config_34405.port_34405
-        });
-        if let Err(e) = market_data_loop(market_data_34405_clone, market_data_34405_url, heartbeat_interval, max_reconnect, reconnect_backoff, Some(filter)).await {
-            error!("Fatal error in market data loop (34405): {}", e);
-        }
-    });
-
-    // Port 34406: symbols starting with E-M
-    let market_data_34406_clone = Arc::clone(&market_data_others_34406);
-    let market_data_34406_url = format!("{}:{}", config.market_data_others.base_url, config.market_data_others.port_34406);
-    let config_34406 = config.market_data_others.clone();
-    let market_data_34406_handle = tokio::spawn(async move {
-        let filter: Box<dyn Fn(&str) -> bool + Send + Sync> = Box::new(move |symbol: &str| {
-            let port = get_market_data_port_for_symbol(symbol, &config_34406);
-            port == config_34406.port_34406
-        });
-        if let Err(e) = market_data_loop(market_data_34406_clone, market_data_34406_url, heartbeat_interval, max_reconnect, reconnect_backoff, Some(filter)).await {
-            error!("Fatal error in market data loop (34406): {}", e);
-        }
-    });
-
-    // Port 34407: symbols starting with N-Z
-    let market_data_34407_clone = Arc::clone(&market_data_others_34407);
-    let market_data_34407_url = format!("{}:{}", config.market_data_others.base_url, config.market_data_others.port_34407);
-    let config_34407 = config.market_data_others.clone();
-    let market_data_34407_handle = tokio::spawn(async move {
-        let filter: Box<dyn Fn(&str) -> bool + Send + Sync> = Box::new(move |symbol: &str| {
-            let port = get_market_data_port_for_symbol(symbol, &config_34407);
-            port == config_34407.port_34407
-        });
-        if let Err(e) = market_data_loop(market_data_34407_clone, market_data_34407_url, heartbeat_interval, max_reconnect, reconnect_backoff, Some(filter)).await {
-            error!("Fatal error in market data loop (34407): {}", e);
-        }
-    });
-
-    // Additional Market Data Heartbeat loops
-    let market_data_34405_clone = Arc::clone(&market_data_others_34405);
-    let market_data_34405_heartbeat_handle = tokio::spawn(async move {
-        if let Err(e) = heartbeat_loop(market_data_34405_clone, heartbeat_interval).await {
-            error!("Fatal error in market data heartbeat loop (34405): {}", e);
-        }
-    });
-
-    let market_data_34406_clone = Arc::clone(&market_data_others_34406);
-    let market_data_34406_heartbeat_handle = tokio::spawn(async move {
-        if let Err(e) = heartbeat_loop(market_data_34406_clone, heartbeat_interval).await {
-            error!("Fatal error in market data heartbeat loop (34406): {}", e);
-        }
-    });
-
-    let market_data_34407_clone = Arc::clone(&market_data_others_34407);
-    let market_data_34407_heartbeat_handle = tokio::spawn(async move {
-        if let Err(e) = heartbeat_loop(market_data_34407_clone, heartbeat_interval).await {
-            error!("Fatal error in market data heartbeat loop (34407): {}", e);
-        }
-    });
-
-    // Create broadcast channels for event-driven updates
-    let (order_update_tx, _) = broadcast::channel::<()>(1000); // Signal execution report updates
-    let (order_book_update_tx, _) = broadcast::channel::<String>(1000); // Signal order book updates (symbol)
-    
-    // Create shutdown channel for graceful shutdown
-    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    
-    // Set update channels in sessions
-    session.set_update_channels(order_update_tx.clone(), order_book_update_tx.clone()).await;
-    market_data_session.set_update_channels(order_update_tx.clone(), order_book_update_tx.clone()).await;
-    market_data_others_34405.set_update_channels(order_update_tx.clone(), order_book_update_tx.clone()).await;
-    market_data_others_34406.set_update_channels(order_update_tx.clone(), order_book_update_tx.clone()).await;
-    market_data_others_34407.set_update_channels(order_update_tx.clone(), order_book_update_tx.clone()).await;
-    
-    // Note: Management Console has been moved to a standalone program
-    // Run: cargo run --bin fix_console
-    
-    // Web server — serves the trading UI and API endpoints on port 8080
-    let order_session_for_web = Arc::clone(&session);
-    let market_data_for_web = Arc::clone(&market_data_session);
-    let market_data_sessions_for_web = vec![
-        (Arc::clone(&market_data_session),        "BTC Market Data".to_string(),    config.market_data_btc.gateway_url.split(':').last().and_then(|p| p.parse().ok()).unwrap_or(34404_u16)),
-        (Arc::clone(&market_data_others_34405),   "Others 34405".to_string(),       config.market_data_others.port_34405),
-        (Arc::clone(&market_data_others_34406),   "Others 34406".to_string(),       config.market_data_others.port_34406),
-        (Arc::clone(&market_data_others_34407),   "Others 34407".to_string(),       config.market_data_others.port_34407),
-    ];
-    // Trading Algo — starts disabled; enable via web UI or API (must be created before web server)
-    let algo = Arc::new(algo::TradingAlgo::new(algo::AlgoConfig::default()));
-    let algo_for_web = Arc::clone(&algo);
-    let algo_order_session = Arc::clone(&session);
-    let algo_market_session = Arc::clone(&market_data_session);
-    let algo_positions = Arc::clone(&session.positions);
-    let _algo_handle = tokio::spawn(async move {
-        algo.run(algo_order_session, algo_market_session, algo_positions).await;
-    });
-
-    let kdb_for_web = Arc::clone(&kdb_writer);
-    let _web_server_handle = tokio::spawn(async move {
-        if let Err(e) = order_book_web_server(order_session_for_web, market_data_for_web, market_data_sessions_for_web, kdb_for_web, algo_for_web, "0.0.0.0:8080").await {
-            error!("Fatal error in web server: {}", e);
-        }
-    });
-    
-    // Open Orders CSV Generator - event-driven (updates immediately on execution reports)
-    let open_orders_store = Arc::clone(&session.open_orders);
-    let csv_update_rx = order_update_tx.subscribe();
-    let _csv_generator_handle = tokio::spawn(async move {
-        if let Err(e) = open_orders_csv_generator_event_driven(open_orders_store, csv_update_rx).await {
-            error!("Fatal error in open orders CSV generator: {}", e);
-        }
-    });
-
-    // Auto-save tick data to data/ticks.csv every 60 seconds for backtest persistence.
-    // Uses append mode so data accumulates across server sessions.
-    let market_data_for_autosave = Arc::clone(&market_data_session);
-    let _tick_autosave_handle = tokio::spawn(async move {
-        let mut save_interval = interval(Duration::from_secs(60));
-        save_interval.tick().await; // skip the immediate first tick
-        loop {
-            save_interval.tick().await;
-            let _ = market_data_for_autosave.save_ticks_to_parquet("data/ticks.csv").await;
-        }
-    });
-
-    // ZeroMQ Publisher for order book data - event-driven (publishes immediately on updates)
-    let market_data_for_zmq = Arc::clone(&market_data_session);
-    let zmq_update_rx = order_book_update_tx.subscribe();
-    let zmq_handle = tokio::spawn(async move {
-        if let Err(e) = zmq_order_book_publisher_event_driven(market_data_for_zmq, "tcp://0.0.0.0:5555", zmq_update_rx).await {
-            error!("Fatal error in ZeroMQ publisher: {}", e);
-        }
-    });
-
-    // Stale-feed watchdog — detects silent TCP stalls on market-data sessions.
-    // If a session is Ready but hasn't received a W/X message in 30s, the TCP
-    // stream is closed so the existing reconnect loop re-establishes it.
-    let stale_sessions: Vec<Arc<FIXSession>> = vec![
-        Arc::clone(&market_data_session),
-        Arc::clone(&market_data_others_34405),
-        Arc::clone(&market_data_others_34406),
-        Arc::clone(&market_data_others_34407),
-    ];
-    let _stale_feed_watchdog = tokio::spawn(async move {
-        const STALE_THRESHOLD_MS: u64 = 30_000;   // nothing inbound at all -> reconnect
-        const QUIET_FEED_LOG_MS: u64 = 60_000;   // no market data -> just say so
-        let mut check_interval = interval(Duration::from_secs(15));
-        check_interval.tick().await; // skip immediate first tick
-        loop {
-            check_interval.tick().await;
-            let now_ms = chrono::Utc::now().timestamp_millis() as u64;
-            for sess in &stale_sessions {
-                if !sess.is_ready().await { continue; }
-                let health = feed_health(
-                    now_ms,
-                    sess.last_inbound_ms.load(Ordering::Relaxed),
-                    sess.last_md_recv_ms.load(Ordering::Relaxed),
-                    STALE_THRESHOLD_MS,
-                    QUIET_FEED_LOG_MS,
-                );
-                if let FeedHealth::QuietFeed { md_silent_ms } = health {
-                    info!("📭 No market data on {} for {}ms — connection alive (heartbeats arriving), not reconnecting",
-                        sess.sender_comp_id, md_silent_ms);
-                }
-                if let FeedHealth::Stalled { silent_ms } = health {
-                    warn!("⚠️  Stalled stream on {} — nothing inbound for {}ms, forcing reconnect",
-                        sess.sender_comp_id, silent_ms);
-                    // Drop the stream; the message_loop error path will reconnect.
-                    let mut stream = sess.stream.lock().await;
-                    *stream = None;
-                    drop(stream);
-                    *sess.connection_state.lock().await = ConnectionState::Disconnected;
-                    *sess.is_connected.lock().await = false;
-                    // Reset so we don't spam reconnects before the loop fires
-                    sess.last_md_recv_ms.store(0, Ordering::Relaxed);
-                    sess.last_inbound_ms.store(0, Ordering::Relaxed);
-                }
-            }
-        }
-    });
-
-    // Periodic prune of stale order_timings / order_data / order_times entries.
-    // Orders that never received an execution report (e.g. session dropped) would
-    // otherwise stay in these HashMaps forever, slowly growing RSS.
-    let session_for_prune = Arc::clone(&session);
-    let _order_prune_handle = tokio::spawn(async move {
-        const PRUNE_INTERVAL_SECS: u64 = 300; // run every 5 minutes
-        const MAX_AGE_SECS: i64 = 300;        // drop entries older than 5 minutes
-        let mut prune_interval = interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
-        prune_interval.tick().await; // skip the immediate first tick
-        loop {
-            prune_interval.tick().await;
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let cutoff_ms = now_ms - MAX_AGE_SECS * 1000;
-
-            // Prune order_timings: drop entries whose file_read_timestamp is older than cutoff
-            {
-                let mut timings = session_for_prune.order_timings.lock().await;
-                let before = timings.len();
-                timings.retain(|_, t| {
-                    t.file_read_timestamp
-                        .map(|ts| ts > cutoff_ms)
-                        .unwrap_or(true) // keep entries with no timestamp (brand-new)
+        match session.role {
+            SessionRole::OrderManagement => {
+                let order_rx = order_rx_holder
+                    .take()
+                    .expect("validate forbade 2+ OM; channel created before loop");
+                let h1 = Arc::clone(&handle);
+                let addr1 = addr.clone();
+                let id_connect = SessionTaskIdentity {
+                    name: session.name.clone(),
+                    role: session.role,
+                    host: session.host.clone(),
+                    port: session.port,
+                    kind: SessionLoopKind::Connect,
+                };
+                session_tasks.spawn(async move {
+                    let result = message_loop(h1, addr1, order_rx, hb, max, backoff).await;
+                    if let Err(ref e) = result {
+                        error!("Fatal error in message loop: {e}");
+                    }
+                    (id_connect, result)
                 });
-                let pruned = before - timings.len();
-                if pruned > 0 {
-                    warn!("🧹 Pruned {} stale order_timings entries", pruned);
-                }
+                let h2 = Arc::clone(&handle);
+                let id_hb = SessionTaskIdentity {
+                    name: session.name.clone(),
+                    role: session.role,
+                    host: session.host.clone(),
+                    port: session.port,
+                    kind: SessionLoopKind::Heartbeat,
+                };
+                session_tasks.spawn(async move {
+                    let result = heartbeat_loop(h2, hb).await;
+                    if let Err(ref e) = result {
+                        error!("Fatal error in heartbeat loop: {e}");
+                    }
+                    (id_hb, result)
+                });
             }
-
-            // Prune order_data: same keying, drop any cl_ord_id not in timings
-            {
-                let timings = session_for_prune.order_timings.lock().await;
-                let mut data = session_for_prune.order_data.lock().await;
-                let before = data.len();
-                data.retain(|k, _| timings.contains_key(k));
-                let pruned = before - data.len();
-                if pruned > 0 {
-                    warn!("🧹 Pruned {} stale order_data entries", pruned);
-                }
-            }
-
-            // Prune order_times (Instant-based latency tracker): drop if elapsed > 5 min
-            {
-                let mut times = session_for_prune.order_times.lock().await;
-                let before = times.len();
-                times.retain(|_, inst| inst.elapsed().as_secs() < MAX_AGE_SECS as u64);
-                let pruned = before - times.len();
-                if pruned > 0 {
-                    warn!("🧹 Pruned {} stale order_times entries", pruned);
-                }
+            SessionRole::MarketData => {
+                let routing = session
+                    .compiled_routing
+                    .clone()
+                    .expect("validate_config fills compiled_routing for MD");
+                let filter: Box<dyn Fn(&str) -> bool + Send + Sync> =
+                    Box::new(move |sym: &str| session_admits_symbol(&routing, sym));
+                let h1 = Arc::clone(&handle);
+                let addr1 = addr.clone();
+                let id_connect = SessionTaskIdentity {
+                    name: session.name.clone(),
+                    role: session.role,
+                    host: session.host.clone(),
+                    port: session.port,
+                    kind: SessionLoopKind::Connect,
+                };
+                session_tasks.spawn(async move {
+                    let result =
+                        market_data_loop(h1, addr1, hb, max, backoff, Some(filter)).await;
+                    if let Err(ref e) = result {
+                        error!("Fatal error in market data loop: {e}");
+                    }
+                    (id_connect, result)
+                });
+                let h2 = Arc::clone(&handle);
+                let id_hb = SessionTaskIdentity {
+                    name: session.name.clone(),
+                    role: session.role,
+                    host: session.host.clone(),
+                    port: session.port,
+                    kind: SessionLoopKind::Heartbeat,
+                };
+                session_tasks.spawn(async move {
+                    let result = heartbeat_loop(h2, hb).await;
+                    if let Err(ref e) = result {
+                        error!("Fatal error in heartbeat loop: {e}");
+                    }
+                    (id_hb, result)
+                });
             }
         }
-    });
 
-    // Wait for initial connections and logons
+        startup_note(&format!(
+            "session task spawned: {} ({} {}:{})",
+            session.name, session.role, session.host, session.port
+        ));
+        spawned.push(SpawnedSession {
+            handle,
+            config: session.clone(),
+        });
+    }
+
+    let om = lookup_om(&spawned);
+    let primary_md = lookup_primary_md(&spawned);
+    let all_md = lookup_all_md(&spawned);
+
+    // ---- OM bundle ----
+    let watcher_opt: Option<tokio::task::JoinHandle<()>> = if let Some(ref om_h) = om {
+        let order_tx = order_tx_holder
+            .take()
+            .expect("OM present ⇒ channel created");
+        let om_w = Arc::clone(om_h);
+        Some(tokio::spawn(async move {
+            if let Err(e) = watch_orders_directory(order_tx, "orders", om_w).await {
+                error!("Fatal error in orders directory watcher: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    if let Some(ref om_h) = om {
+        // prune (fire-and-forget)
+        let session_for_prune = Arc::clone(om_h);
+        let _order_prune_handle = tokio::spawn(async move {
+            const PRUNE_INTERVAL_SECS: u64 = 300;
+            const MAX_AGE_SECS: i64 = 300;
+            let mut prune_interval = interval(Duration::from_secs(PRUNE_INTERVAL_SECS));
+            prune_interval.tick().await;
+            loop {
+                prune_interval.tick().await;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let cutoff_ms = now_ms - MAX_AGE_SECS * 1000;
+                {
+                    let mut timings = session_for_prune.order_timings.lock().await;
+                    let before = timings.len();
+                    timings.retain(|_, t| {
+                        t.file_read_timestamp.map(|ts| ts > cutoff_ms).unwrap_or(true)
+                    });
+                    let pruned = before - timings.len();
+                    if pruned > 0 {
+                        warn!("🧹 Pruned {} stale order_timings entries", pruned);
+                    }
+                }
+                {
+                    let timings = session_for_prune.order_timings.lock().await;
+                    let mut data = session_for_prune.order_data.lock().await;
+                    let before = data.len();
+                    data.retain(|k, _| timings.contains_key(k));
+                    let pruned = before - data.len();
+                    if pruned > 0 {
+                        warn!("🧹 Pruned {} stale order_data entries", pruned);
+                    }
+                }
+                {
+                    let mut times = session_for_prune.order_times.lock().await;
+                    let before = times.len();
+                    times.retain(|_, inst| inst.elapsed().as_secs() < MAX_AGE_SECS as u64);
+                    let pruned = before - times.len();
+                    if pruned > 0 {
+                        warn!("🧹 Pruned {} stale order_times entries", pruned);
+                    }
+                }
+            }
+        });
+
+        let open_orders_store = Arc::clone(&om_h.open_orders);
+        let csv_update_rx = order_update_tx.subscribe();
+        let _csv_generator_handle = tokio::spawn(async move {
+            if let Err(e) =
+                open_orders_csv_generator_event_driven(open_orders_store, csv_update_rx).await
+            {
+                error!("Fatal error in open orders CSV generator: {}", e);
+            }
+        });
+    }
+
+    // algo + web only if OM Some AND primary MD Some
+    if let (Some(om_h), Some(md_h)) = (om.clone(), primary_md.clone()) {
+        let algo = Arc::new(algo::TradingAlgo::new(algo::AlgoConfig::default()));
+        let algo_for_web = Arc::clone(&algo);
+        let algo_order_session = Arc::clone(&om_h);
+        let algo_market_session = Arc::clone(&md_h);
+        let algo_positions = Arc::clone(&om_h.positions);
+        let _algo_handle = tokio::spawn(async move {
+            algo.run(algo_order_session, algo_market_session, algo_positions).await;
+        });
+
+        let order_session_for_web = Arc::clone(&om_h);
+        let market_data_for_web = Arc::clone(&md_h);
+        let market_data_sessions_for_web = all_md.clone(); // (handle, name, port) list order
+        let kdb_for_web = Arc::clone(&kdb_writer);
+        let _web_server_handle = tokio::spawn(async move {
+            if let Err(e) = order_book_web_server(
+                order_session_for_web,
+                market_data_for_web,
+                market_data_sessions_for_web,
+                kdb_for_web,
+                algo_for_web,
+                "0.0.0.0:8080",
+            )
+            .await
+            {
+                error!("Fatal error in web server: {}", e);
+            }
+        });
+    }
+
+    // ---- MD bundle ----
+    let zmq_opt: Option<tokio::task::JoinHandle<()>> = if let Some(ref md_h) = primary_md {
+        let market_data_for_autosave = Arc::clone(md_h);
+        let _tick_autosave_handle = tokio::spawn(async move {
+            let mut save_interval = interval(Duration::from_secs(60));
+            save_interval.tick().await;
+            loop {
+                save_interval.tick().await;
+                let _ = market_data_for_autosave
+                    .save_ticks_to_parquet("data/ticks.csv")
+                    .await;
+            }
+        });
+
+        let market_data_for_zmq = Arc::clone(md_h);
+        let zmq_update_rx = order_book_update_tx.subscribe();
+        Some(tokio::spawn(async move {
+            if let Err(e) = zmq_order_book_publisher_event_driven(
+                market_data_for_zmq,
+                "tcp://0.0.0.0:5555",
+                zmq_update_rx,
+            )
+            .await
+            {
+                error!("Fatal error in ZeroMQ publisher: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    if !all_md.is_empty() {
+        // watchdog over all MD; log name AND sender_comp_id
+        let stale_sessions: Vec<(Arc<FIXSession>, String)> = spawned
+            .iter()
+            .filter(|s| s.config.role == SessionRole::MarketData)
+            .map(|s| (Arc::clone(&s.handle), s.config.name.clone()))
+            .collect();
+        let _stale_feed_watchdog = tokio::spawn(async move {
+            const STALE_THRESHOLD_MS: u64 = 30_000;
+            const QUIET_FEED_LOG_MS: u64 = 60_000;
+            let mut check_interval = interval(Duration::from_secs(15));
+            check_interval.tick().await;
+            loop {
+                check_interval.tick().await;
+                let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                for (sess, name) in &stale_sessions {
+                    if !sess.is_ready().await {
+                        continue;
+                    }
+                    let health = feed_health(
+                        now_ms,
+                        sess.last_inbound_ms.load(Ordering::Relaxed),
+                        sess.last_md_recv_ms.load(Ordering::Relaxed),
+                        STALE_THRESHOLD_MS,
+                        QUIET_FEED_LOG_MS,
+                    );
+                    if let FeedHealth::QuietFeed { md_silent_ms } = health {
+                        info!(
+                            "📭 No market data on {} ({}) for {}ms — connection alive (heartbeats arriving), not reconnecting",
+                            name, sess.sender_comp_id, md_silent_ms
+                        );
+                    }
+                    if let FeedHealth::Stalled { silent_ms } = health {
+                        warn!(
+                            "⚠️  Stalled stream on {} ({}) — nothing inbound for {}ms, forcing reconnect",
+                            name, sess.sender_comp_id, silent_ms
+                        );
+                        let mut stream = sess.stream.lock().await;
+                        *stream = None;
+                        drop(stream);
+                        *sess.connection_state.lock().await = ConnectionState::Disconnected;
+                        *sess.is_connected.lock().await = false;
+                        sess.last_md_recv_ms.store(0, Ordering::Relaxed);
+                        sess.last_inbound_ms.store(0, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+
     info!("Waiting for connections and logons to complete...");
     sleep(Duration::from_secs(3)).await;
-
-    info!("");
-    info!("🔄 Server running continuously - all services active:");
-    info!("   ✓ Order Management Gateway connection");
-    info!("   ✓ Market Data Server (34402) - BTC symbols");
-    info!("   ✓ Market Data Server (34405) - Symbols 0-9, A-D");
-    info!("   ✓ Market Data Server (34406) - Symbols E-M");
-    info!("   ✓ Market Data Server (34407) - Symbols N-Z");
-    info!("   ✓ ZeroMQ Publisher (tcp://0.0.0.0:5555) - Topics: symbol (e.g., BTC_USDT)");
-    info!("   ✓ Orders directory watcher (orders/) - Processing JSON order files");
-    info!("   ✓ Management Console - Run separately: cargo run --bin fix_console");
-    info!("");
-    info!("To use the management console, run: cargo run --bin fix_console");
-    info!("Press Ctrl+C to stop the server.");
-
-    // Reaching here means every service spawned. A startup.log with "starting"
-    // but no "startup complete" is the signature of a start that died partway,
-    // which is otherwise invisible once pm2 has restarted the process.
     startup_note("startup complete — all services active");
 
-    // Keep the server running indefinitely
-    // Wait for any of the critical tasks to fail (they will log errors and continue)
-    // Or wait for console to request shutdown
     let mut shutdown_rx_main = shutdown_tx.subscribe();
     tokio::select! {
-        _ = msg_handle => {
-            error!("Order Management message loop exited");
+        Some(res) = session_tasks.join_next() => {
+            match res {
+                Ok((id, Ok(()))) => {
+                    error!(
+                        "session task exited: {} ({} {}:{} {})",
+                        id.name, id.role, id.host, id.port, id.kind
+                    );
+                }
+                Ok((id, Err(e))) => {
+                    error!(
+                        "session task exited: {} ({} {}:{} {}): {e}",
+                        id.name, id.role, id.host, id.port, id.kind
+                    );
+                }
+                Err(join_err) => {
+                    error!("session task panicked: {join_err}");
+                }
+            }
         }
-        _ = heartbeat_handle => {
-            error!("Order Management heartbeat loop exited");
-        }
-        _ = market_data_handle => {
-            error!("Market Data loop exited");
-        }
-        _ = market_data_heartbeat_handle => {
-            error!("Market Data heartbeat loop exited");
-        }
-        _ = market_data_34405_handle => {
-            error!("Market Data loop (34405) exited");
-        }
-        _ = market_data_34405_heartbeat_handle => {
-            error!("Market Data heartbeat loop (34405) exited");
-        }
-        _ = market_data_34406_handle => {
-            error!("Market Data loop (34406) exited");
-        }
-        _ = market_data_34406_heartbeat_handle => {
-            error!("Market Data heartbeat loop (34406) exited");
-        }
-        _ = market_data_34407_handle => {
-            error!("Market Data loop (34407) exited");
-        }
-        _ = market_data_34407_heartbeat_handle => {
-            error!("Market Data heartbeat loop (34407) exited");
-        }
-        _ = zmq_handle => {
+        _ = async {
+            match zmq_opt {
+                Some(h) => {
+                    let _ = h.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {
             error!("ZeroMQ publisher exited");
         }
-        _ = orders_watcher_handle => {
+        _ = async {
+            match watcher_opt {
+                Some(h) => {
+                    let _ = h.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        } => {
             error!("Orders directory watcher exited");
         }
         _ = shutdown_rx_main.recv() => {
@@ -6213,6 +6498,676 @@ async fn main() -> Result<()> {
 // logic (gap/dup/recovery, no networking) is covered separately in
 // src/sequencer.rs's own unit tests.
 // ============================================================================
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    fn skeleton_md() -> String {
+        r#"
+[connection]
+heartbeat_interval = 30
+max_reconnect_attempts = 10
+reconnect_backoff_ms = 1000
+
+[credentials.UAT]
+api_key_env = "CRYPTOCOM_API_KEY"
+api_secret_env = "CRYPTOCOM_API_SECRET"
+
+[[sessions]]
+name = "s1"
+role = "market_data"
+host = "fix-uat.crypto.com"
+port = 34402
+sender_comp_id = "S"
+target_comp_id = "T"
+credentials_ref = "UAT"
+symbol_routing = "all"
+"#
+        .to_string()
+    }
+
+    fn validate_err_contains(toml: &str, needle: &str) {
+        let mut c = parse_config(toml).unwrap_or_else(|e| panic!("parse should succeed: {e:#}"));
+        let err = validate_config(&mut c).expect_err("validate should fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
+    }
+
+    #[test]
+    fn session_admits_symbol_uat_3_way_split() {
+        let ad = compile_symbol_routing(
+            "t",
+            &SymbolRouting::FirstCharRanges(vec!["0-9".into(), "A-D".into()]),
+        )
+        .unwrap();
+        let em = compile_symbol_routing(
+            "t",
+            &SymbolRouting::FirstCharRanges(vec!["E-M".into()]),
+        )
+        .unwrap();
+        let nz = compile_symbol_routing(
+            "t",
+            &SymbolRouting::FirstCharRanges(vec!["N-Z".into()]),
+        )
+        .unwrap();
+        assert!(session_admits_symbol(&ad, "BTC_USDT"));
+        assert!(!session_admits_symbol(&em, "BTC_USDT"));
+        assert!(!session_admits_symbol(&nz, "BTC_USDT"));
+        assert!(session_admits_symbol(&em, "ETH_USDT"));
+        assert!(!session_admits_symbol(&ad, "ETH_USDT"));
+        assert!(!session_admits_symbol(&nz, "ETH_USDT"));
+        assert!(session_admits_symbol(&nz, "SOL_USDT"));
+        assert!(!session_admits_symbol(&ad, "SOL_USDT"));
+        assert!(!session_admits_symbol(&em, "SOL_USDT"));
+        assert!(!session_admits_symbol(&ad, ""));
+        assert!(!session_admits_symbol(&em, ""));
+        assert!(!session_admits_symbol(&nz, ""));
+        assert!(session_admits_symbol(&ad, "btc_usdt"));
+    }
+
+    #[test]
+    fn session_admits_symbol_all_admits_everything_including_empty() {
+        let all = CompiledSymbolRouting::All;
+        assert!(session_admits_symbol(&all, "BTC_USDT"));
+        assert!(session_admits_symbol(&all, "ETH_USDT"));
+        assert!(session_admits_symbol(&all, "SOL_USDT"));
+        assert!(session_admits_symbol(&all, ""));
+        assert!(session_admits_symbol(&all, "中文"));
+    }
+
+    #[test]
+    fn session_admits_symbol_2_way_split() {
+        let first = compile_symbol_routing(
+            "t",
+            &SymbolRouting::FirstCharRanges(vec!["0-9".into(), "A-M".into()]),
+        )
+        .unwrap();
+        let second = compile_symbol_routing(
+            "t",
+            &SymbolRouting::FirstCharRanges(vec!["N-Z".into()]),
+        )
+        .unwrap();
+        assert!(session_admits_symbol(&first, "BTC_USDT"));
+        assert!(session_admits_symbol(&first, "ETH_USDT"));
+        assert!(!session_admits_symbol(&second, "BTC_USDT"));
+        assert!(!session_admits_symbol(&second, "ETH_USDT"));
+        assert!(session_admits_symbol(&second, "SOL_USDT"));
+        assert!(!session_admits_symbol(&first, "SOL_USDT"));
+        assert!(!session_admits_symbol(&first, ""));
+        assert!(!session_admits_symbol(&second, ""));
+    }
+
+    #[test]
+    fn session_admits_symbol_1_way_split() {
+        let one = compile_symbol_routing(
+            "t",
+            &SymbolRouting::FirstCharRanges(vec!["A-Z".into()]),
+        )
+        .unwrap();
+        assert!(session_admits_symbol(&one, "BTC_USDT"));
+        assert!(session_admits_symbol(&one, "ETH_USDT"));
+        assert!(session_admits_symbol(&one, "SOL_USDT"));
+        assert!(!session_admits_symbol(&one, "9_FOO"));
+        assert!(!session_admits_symbol(&one, ""));
+    }
+
+    #[test]
+    fn session_admits_symbol_non_ascii_first_char_false_for_ranges() {
+        let ad = compile_symbol_routing(
+            "t",
+            &SymbolRouting::FirstCharRanges(vec!["A-D".into()]),
+        )
+        .unwrap();
+        assert!(!session_admits_symbol(&ad, "Ω_USDT"));
+        assert!(session_admits_symbol(&CompiledSymbolRouting::All, "Ω_USDT"));
+    }
+
+    #[test]
+    fn parse_config_uat_example_file() {
+        let src = include_str!("../config.example.toml");
+        let c = parse_config(src).unwrap();
+        assert_eq!(c.sessions.len(), 5);
+
+        assert_eq!(c.sessions[0].name, "uat_om");
+        assert_eq!(c.sessions[0].role, SessionRole::OrderManagement);
+        assert_eq!(c.sessions[0].port, 34404);
+        assert_eq!(c.sessions[0].host, "fix-uat.crypto.com");
+        assert_eq!(c.sessions[0].sender_comp_id, "UAT1.WOZINGA.UD.00");
+        assert_eq!(c.sessions[0].target_comp_id, "UAT1.CDC.UD");
+        assert_eq!(c.sessions[0].credentials_ref, "UAT");
+        assert!(c.sessions[0].heartbeat_interval.is_none());
+        assert!(c.sessions[0].max_reconnect_attempts.is_none());
+        assert!(c.sessions[0].reconnect_backoff_ms.is_none());
+
+        assert_eq!(c.sessions[1].name, "uat_md_btc");
+        assert_eq!(c.sessions[1].role, SessionRole::MarketData);
+        assert_eq!(c.sessions[1].port, 34402);
+        assert_eq!(c.sessions[1].symbol_routing, Some(SymbolRouting::All));
+        assert_eq!(
+            c.sessions
+                .iter()
+                .find(|s| s.role == SessionRole::MarketData)
+                .unwrap()
+                .name,
+            "uat_md_btc"
+        );
+
+        assert_eq!(c.sessions[2].name, "uat_md_others_34405");
+        assert_eq!(c.sessions[2].port, 34405);
+        assert_eq!(
+            c.sessions[2].symbol_routing,
+            Some(SymbolRouting::FirstCharRanges(vec![
+                "0-9".into(),
+                "A-D".into()
+            ]))
+        );
+
+        assert_eq!(c.sessions[3].name, "uat_md_others_34406");
+        assert_eq!(c.sessions[3].port, 34406);
+        assert_eq!(
+            c.sessions[3].symbol_routing,
+            Some(SymbolRouting::FirstCharRanges(vec!["E-M".into()]))
+        );
+
+        assert_eq!(c.sessions[4].name, "uat_md_others_34407");
+        assert_eq!(c.sessions[4].port, 34407);
+        assert_eq!(
+            c.sessions[4].symbol_routing,
+            Some(SymbolRouting::FirstCharRanges(vec!["N-Z".into()]))
+        );
+
+        assert_eq!(c.credentials["UAT"].api_key_env, "CRYPTOCOM_API_KEY");
+        assert_eq!(c.credentials["UAT"].api_secret_env, "CRYPTOCOM_API_SECRET");
+        assert_eq!(
+            c.subscriptions.symbols,
+            vec!["BTC_USDT", "BTC_USD", "BTCUSD-PERP"]
+        );
+        assert_eq!(c.connection.heartbeat_interval, 30);
+        assert_eq!(c.connection.max_reconnect_attempts, 10);
+        assert_eq!(c.connection.reconnect_backoff_ms, 1000);
+        assert!(!src.contains("api_key ="));
+        assert!(src.contains("api_key_env"));
+        assert!(!src.contains("YOUR_API_KEY"));
+        assert!(!src.contains("YOUR_API_SECRET"));
+    }
+
+    #[test]
+    fn parse_config_prd3_example_file() {
+        let src = include_str!("../config.prd3.example.toml");
+        let c = parse_config(src).unwrap();
+        assert_eq!(c.sessions.len(), 5);
+        assert!(c
+            .sessions
+            .iter()
+            .all(|s| s.role != SessionRole::OrderManagement));
+
+        let first_md = c
+            .sessions
+            .iter()
+            .find(|s| s.role == SessionRole::MarketData)
+            .unwrap();
+        assert_eq!(first_md.port, 34402);
+        assert_eq!(first_md.symbol_routing, Some(SymbolRouting::All));
+        assert_eq!(first_md.name, "prd3_md_btc");
+
+        let eth = c
+            .sessions
+            .iter()
+            .find(|s| s.name == "prd3_md_eth")
+            .unwrap();
+        assert_eq!(eth.port, 34403);
+        assert_eq!(eth.symbol_routing, Some(SymbolRouting::All));
+        assert_ne!(first_md.name, eth.name);
+
+        let p34405 = c
+            .sessions
+            .iter()
+            .find(|s| s.port == 34405)
+            .unwrap();
+        assert_eq!(
+            p34405.symbol_routing,
+            Some(SymbolRouting::FirstCharRanges(vec![
+                "0-9".into(),
+                "A-D".into()
+            ]))
+        );
+        let p34406 = c
+            .sessions
+            .iter()
+            .find(|s| s.port == 34406)
+            .unwrap();
+        assert_eq!(
+            p34406.symbol_routing,
+            Some(SymbolRouting::FirstCharRanges(vec!["E-M".into()]))
+        );
+        let p34407 = c
+            .sessions
+            .iter()
+            .find(|s| s.port == 34407)
+            .unwrap();
+        assert_eq!(
+            p34407.symbol_routing,
+            Some(SymbolRouting::FirstCharRanges(vec!["N-Z".into()]))
+        );
+
+        let vpce = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com";
+        for s in &c.sessions {
+            assert_eq!(s.host, vpce);
+            assert_eq!(s.credentials_ref, "PRD3");
+        }
+        assert_eq!(c.credentials["PRD3"].api_key_env, "CRYPTOCOM_PRD3_API_KEY");
+        assert_eq!(
+            c.credentials["PRD3"].api_secret_env,
+            "CRYPTOCOM_PRD3_API_SECRET"
+        );
+        assert!(src.contains("# NOT ENABLED — order entry pending separate approval"));
+        assert!(src.contains("31302"));
+        assert!(src.contains("REPLACE_WITH_VENUE_ASSIGNED_"));
+        assert!(!src.contains("api_key ="));
+        assert_eq!(
+            c.subscriptions.symbols,
+            vec!["BTC_USDT", "BTC_USD", "BTCUSD-PERP"]
+        );
+        assert_eq!(c.connection.heartbeat_interval, 30);
+        assert_eq!(c.connection.max_reconnect_attempts, 10);
+        assert_eq!(c.connection.reconnect_backoff_ms, 1000);
+    }
+
+    #[test]
+    fn parse_rejects_symbol_routing_all_wrong_case() {
+        let toml = skeleton_md().replace("symbol_routing = \"all\"", "symbol_routing = \"All\"");
+        let err = parse_config(&toml).expect_err("parse should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to parse config file:")
+                && msg.contains("symbol_routing string must be exactly \"all\""),
+            "got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_sessions() {
+        let toml = r#"
+sessions = []
+
+[connection]
+heartbeat_interval = 30
+max_reconnect_attempts = 10
+reconnect_backoff_ms = 1000
+
+[credentials.UAT]
+api_key_env = "CRYPTOCOM_API_KEY"
+api_secret_env = "CRYPTOCOM_API_SECRET"
+"#;
+        validate_err_contains(toml, "sessions must not be empty");
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_session_name() {
+        let toml = skeleton_md()
+            + r#"
+[[sessions]]
+name = "s1"
+role = "market_data"
+host = "fix-uat.crypto.com"
+port = 34403
+sender_comp_id = "S2"
+target_comp_id = "T2"
+credentials_ref = "UAT"
+symbol_routing = "all"
+"#;
+        validate_err_contains(&toml, "duplicate session name: s1");
+    }
+
+    #[test]
+    fn validate_rejects_two_order_management_sessions() {
+        let toml = r#"
+[connection]
+heartbeat_interval = 30
+max_reconnect_attempts = 10
+reconnect_backoff_ms = 1000
+
+[credentials.UAT]
+api_key_env = "CRYPTOCOM_API_KEY"
+api_secret_env = "CRYPTOCOM_API_SECRET"
+
+[[sessions]]
+name = "om1"
+role = "order_management"
+host = "fix-uat.crypto.com"
+port = 34404
+sender_comp_id = "S"
+target_comp_id = "T"
+credentials_ref = "UAT"
+
+[[sessions]]
+name = "om2"
+role = "order_management"
+host = "fix-uat.crypto.com"
+port = 34405
+sender_comp_id = "S2"
+target_comp_id = "T2"
+credentials_ref = "UAT"
+"#;
+        validate_err_contains(
+            toml,
+            "at most one session with role = order_management is allowed (found 2)",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_session_name() {
+        let toml = skeleton_md().replace("name = \"s1\"", "name = \"   \"");
+        validate_err_contains(&toml, "session name must not be empty");
+    }
+
+    #[test]
+    fn validate_rejects_empty_credentials_ref() {
+        let toml = skeleton_md().replace("credentials_ref = \"UAT\"", "credentials_ref = \"  \"");
+        validate_err_contains(&toml, "credentials_ref must not be empty");
+    }
+
+    #[test]
+    fn validate_rejects_unknown_credentials_ref() {
+        let toml = skeleton_md().replace("credentials_ref = \"UAT\"", "credentials_ref = \"NOPE\"");
+        validate_err_contains(&toml, "does not match any [credentials.*] block");
+    }
+
+    #[test]
+    fn validate_rejects_empty_api_key_env_name() {
+        let toml = skeleton_md().replace(
+            "api_key_env = \"CRYPTOCOM_API_KEY\"",
+            "api_key_env = \"  \"",
+        );
+        validate_err_contains(&toml, "credentials.UAT api_key_env must not be empty");
+    }
+
+    #[test]
+    fn validate_rejects_empty_api_secret_env_name() {
+        let toml = skeleton_md().replace(
+            "api_secret_env = \"CRYPTOCOM_API_SECRET\"",
+            "api_secret_env = \"\"",
+        );
+        validate_err_contains(&toml, "credentials.UAT api_secret_env must not be empty");
+    }
+
+    #[test]
+    fn validate_rejects_md_missing_symbol_routing() {
+        let toml = skeleton_md().replace("symbol_routing = \"all\"\n", "");
+        validate_err_contains(&toml, "role = market_data requires symbol_routing");
+    }
+
+    #[test]
+    fn validate_rejects_malformed_first_char_range() {
+        let toml = skeleton_md().replace(
+            "symbol_routing = \"all\"",
+            "symbol_routing = { first_char_ranges = [\"not-a-range\"] }",
+        );
+        validate_err_contains(&toml, "is not X-Y");
+    }
+
+    #[test]
+    fn validate_rejects_inverted_first_char_range() {
+        let toml = skeleton_md().replace(
+            "symbol_routing = \"all\"",
+            "symbol_routing = { first_char_ranges = [\"D-A\"] }",
+        );
+        validate_err_contains(&toml, "is inverted (start > end after uppercase)");
+    }
+
+    #[test]
+    fn validate_rejects_empty_first_char_ranges() {
+        let toml = skeleton_md().replace(
+            "symbol_routing = \"all\"",
+            "symbol_routing = { first_char_ranges = [] }",
+        );
+        validate_err_contains(&toml, "first_char_ranges must not be empty");
+    }
+
+    #[test]
+    fn validate_rejects_non_ascii_first_char_range() {
+        let toml = skeleton_md().replace(
+            "symbol_routing = \"all\"",
+            "symbol_routing = { first_char_ranges = [\"Å-Ö\"] }",
+        );
+        validate_err_contains(&toml, "must be ASCII");
+    }
+
+    #[test]
+    fn validate_rejects_host_with_scheme() {
+        let toml = skeleton_md().replace(
+            "host = \"fix-uat.crypto.com\"",
+            "host = \"tcp://fix-uat.crypto.com\"",
+        );
+        validate_err_contains(&toml, "host must not contain '://'");
+    }
+
+    #[test]
+    fn validate_rejects_host_with_whitespace() {
+        let toml = skeleton_md().replace(
+            "host = \"fix-uat.crypto.com\"",
+            "host = \"fix-uat.crypto.com \"",
+        );
+        validate_err_contains(&toml, "host must not contain whitespace");
+    }
+
+    #[test]
+    fn validate_accepts_zero_om_with_md() {
+        let mut c = parse_config(&skeleton_md()).unwrap();
+        validate_config(&mut c).unwrap();
+        assert_eq!(c.sessions[0].compiled_routing, Some(CompiledSymbolRouting::All));
+    }
+
+    #[test]
+    fn validate_accepts_om_with_zero_md() {
+        let toml = r#"
+[connection]
+heartbeat_interval = 30
+max_reconnect_attempts = 10
+reconnect_backoff_ms = 1000
+
+[credentials.UAT]
+api_key_env = "CRYPTOCOM_API_KEY"
+api_secret_env = "CRYPTOCOM_API_SECRET"
+
+[[sessions]]
+name = "om1"
+role = "order_management"
+host = "fix-uat.crypto.com"
+port = 34404
+sender_comp_id = "S"
+target_comp_id = "T"
+credentials_ref = "UAT"
+"#;
+        let mut c = parse_config(toml).unwrap();
+        validate_config(&mut c).unwrap();
+        assert!(c.sessions[0].compiled_routing.is_none());
+    }
+
+    #[test]
+    fn validate_ignores_symbol_routing_on_om() {
+        let toml = r#"
+[connection]
+heartbeat_interval = 30
+max_reconnect_attempts = 10
+reconnect_backoff_ms = 1000
+
+[credentials.UAT]
+api_key_env = "CRYPTOCOM_API_KEY"
+api_secret_env = "CRYPTOCOM_API_SECRET"
+
+[[sessions]]
+name = "om1"
+role = "order_management"
+host = "fix-uat.crypto.com"
+port = 34404
+sender_comp_id = "S"
+target_comp_id = "T"
+credentials_ref = "UAT"
+symbol_routing = "all"
+"#;
+        let mut c = parse_config(toml).unwrap();
+        validate_config(&mut c).unwrap();
+        assert!(c.sessions[0].compiled_routing.is_none());
+    }
+
+    fn parse_and_validate_with_env_names(key_env: &str, secret_env: &str) -> Config {
+        let toml = format!(
+            r#"
+[connection]
+heartbeat_interval = 30
+max_reconnect_attempts = 10
+reconnect_backoff_ms = 1000
+
+[credentials.UAT]
+api_key_env = "{key_env}"
+api_secret_env = "{secret_env}"
+
+[[sessions]]
+name = "s1"
+role = "market_data"
+host = "fix-uat.crypto.com"
+port = 34402
+sender_comp_id = "S"
+target_comp_id = "T"
+credentials_ref = "UAT"
+symbol_routing = "all"
+"#
+        );
+        let mut c = parse_config(&toml).unwrap();
+        validate_config(&mut c).unwrap();
+        c
+    }
+
+    #[test]
+    fn resolve_credentials_unset_is_err() {
+        let key = "HFT_LLD_TEST_KEY_UNSET_9f3c";
+        let secret = "HFT_LLD_TEST_SECRET_UNSET_9f3c";
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(secret);
+        }
+        let c = parse_and_validate_with_env_names(key, secret);
+        let err = resolve_credentials(&c).expect_err("unset must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is not set"), "got {msg:?}");
+        assert!(msg.contains(key), "got {msg:?}");
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(secret);
+        }
+    }
+
+    #[test]
+    fn resolve_credentials_empty_is_err() {
+        let key = "HFT_LLD_TEST_KEY_EMPTY";
+        let secret = "HFT_LLD_TEST_SECRET_EMPTY";
+        unsafe {
+            std::env::set_var(key, "");
+            std::env::set_var(secret, "not-empty");
+        }
+        let c = parse_and_validate_with_env_names(key, secret);
+        let err = resolve_credentials(&c).expect_err("empty must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is empty"), "got {msg:?}");
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(secret);
+        }
+    }
+
+    #[test]
+    fn resolve_credentials_whitespace_is_err() {
+        let key = "HFT_LLD_TEST_KEY_WS";
+        let secret = "HFT_LLD_TEST_SECRET_WS";
+        unsafe {
+            std::env::set_var(key, "   \t");
+            std::env::set_var(secret, "not-empty");
+        }
+        let c = parse_and_validate_with_env_names(key, secret);
+        let err = resolve_credentials(&c).expect_err("whitespace must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("is empty"), "got {msg:?}");
+        assert!(!msg.contains("is not set"), "got {msg:?}");
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(secret);
+        }
+    }
+
+    #[test]
+    fn resolve_credentials_success_and_debug_redacted() {
+        let key = "HFT_LLD_TEST_KEY_OK";
+        let secret = "HFT_LLD_TEST_SECRET_OK";
+        unsafe {
+            std::env::set_var(key, "dummy-key-value-xyz");
+            std::env::set_var(secret, "dummy-secret-value-xyz");
+        }
+        let c = parse_and_validate_with_env_names(key, secret);
+        let map = resolve_credentials(&c).unwrap();
+        let creds = map.get("UAT").expect("UAT ref");
+        assert_eq!(creds.api_key, "dummy-key-value-xyz");
+        assert_eq!(creds.api_secret, "dummy-secret-value-xyz");
+        let dbg = format!("{:?}", creds);
+        assert!(!dbg.contains("dummy-key-value-xyz"), "got {dbg:?}");
+        assert!(!dbg.contains("dummy-secret-value-xyz"), "got {dbg:?}");
+        assert!(dbg.contains("<redacted>"), "got {dbg:?}");
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(secret);
+        }
+    }
+
+    #[test]
+    fn resolve_credentials_skips_unused_block() {
+        let key = "HFT_LLD_TEST_KEY_USED";
+        let secret = "HFT_LLD_TEST_SECRET_USED";
+        let unused = "HFT_LLD_TEST_UNUSED_KEY";
+        unsafe {
+            std::env::set_var(key, "used-key");
+            std::env::set_var(secret, "used-secret");
+            std::env::remove_var(unused);
+        }
+        let toml = format!(
+            r#"
+[connection]
+heartbeat_interval = 30
+max_reconnect_attempts = 10
+reconnect_backoff_ms = 1000
+
+[credentials.UAT]
+api_key_env = "{key}"
+api_secret_env = "{secret}"
+
+[credentials.UNUSED]
+api_key_env = "{unused}"
+api_secret_env = "HFT_LLD_TEST_UNUSED_SECRET"
+
+[[sessions]]
+name = "s1"
+role = "market_data"
+host = "fix-uat.crypto.com"
+port = 34402
+sender_comp_id = "S"
+target_comp_id = "T"
+credentials_ref = "UAT"
+symbol_routing = "all"
+"#
+        );
+        let mut c = parse_config(&toml).unwrap();
+        validate_config(&mut c).unwrap();
+        let map = resolve_credentials(&c).unwrap();
+        assert!(map.contains_key("UAT"));
+        assert!(!map.contains_key("UNUSED"));
+        unsafe {
+            std::env::remove_var(key);
+            std::env::remove_var(secret);
+            std::env::remove_var(unused);
+        }
+    }
+}
+
+
 #[cfg(test)]
 mod connectivity_tests {
     use super::*;
@@ -6880,6 +7835,86 @@ mod connectivity_tests {
             ],
         );
         assert!(contents.contains(&marker));
+    }
+
+    #[tokio::test]
+    async fn config_driven_symbol_routing_records_only_admitted_symbols() -> Result<()> {
+        // two mock gateways, recorder on
+        let rec_all: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let rec_range: Arc<tokio::sync::Mutex<Vec<String>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let port_all = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                md_requested_symbols: Some(Arc::clone(&rec_all)),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let port_range = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                md_requested_symbols: Some(Arc::clone(&rec_range)),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let sess_all = FIXSession::new("TEST.MD.ALL", "MOCK.VENUE");
+        let sess_range = FIXSession::new("TEST.MD.RANGE", "MOCK.VENUE");
+        connect_and_logon(&sess_all, port_all).await?;
+        connect_and_logon(&sess_range, port_range).await?;
+
+        let allowlist = ["BTC_USDT", "ETH_USDT"];
+        let routing_all = CompiledSymbolRouting::All;
+        let routing_em = compile_symbol_routing(
+            "range",
+            &SymbolRouting::FirstCharRanges(vec!["E-M".into()]),
+        )?;
+
+        for sym in allowlist {
+            if session_admits_symbol(&routing_all, sym) {
+                sess_all.market_data_request(sym, 10).await?;
+            }
+        }
+        for sym in allowlist {
+            if session_admits_symbol(&routing_em, sym) {
+                sess_range.market_data_request(sym, 10).await?;
+            }
+        }
+
+        pump_messages(&sess_all, Duration::from_secs(3), |_| false).await?;
+        pump_messages(&sess_range, Duration::from_secs(3), |_| false).await?;
+
+        let got_all: HashSet<String> = rec_all.lock().await.iter().cloned().collect();
+        let got_range: HashSet<String> = rec_range.lock().await.iter().cloned().collect();
+        let expect_all: HashSet<String> = allowlist
+            .iter()
+            .filter(|s| session_admits_symbol(&routing_all, s))
+            .map(|s| s.to_string())
+            .collect();
+        let expect_range: HashSet<String> = allowlist
+            .iter()
+            .filter(|s| session_admits_symbol(&routing_em, s))
+            .map(|s| s.to_string())
+            .collect();
+
+        assert_eq!(got_all, expect_all, "all-recorder must equal admitted set");
+        assert_eq!(
+            got_range, expect_range,
+            "range-recorder must equal admitted set"
+        );
+        assert!(got_range.contains("ETH_USDT"), "overlap on ETH is required");
+        assert!(got_all.contains("ETH_USDT") && got_all.contains("BTC_USDT"));
+        assert!(!got_range.is_empty(), "range recorder must not be empty");
+        // Do NOT assert got_all.is_disjoint(&got_range).
+
+        // Optional corroboration
+        assert!(sess_all.get_best_quote("ETH_USDT").await.is_some());
+        assert!(sess_range.get_best_quote("ETH_USDT").await.is_some());
+        Ok(())
     }
 
     /// Status helper must not share fate with a held `order_books` mutex.
