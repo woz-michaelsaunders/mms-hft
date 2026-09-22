@@ -1,0 +1,182 @@
+[
+  {
+    "file": "loading-375.png",
+    "label": "Loading — Checking UAT identity; Run cases 1–4 disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "empty-375.png",
+    "label": "Empty — No results yet; Run cases 1–4 is the primary action",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "error-375.png",
+    "label": "Error — Cannot run on this host",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "success-375.png",
+    "label": "Success — Serving restored; per-case downtime",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-375.png",
+    "label": "Disabled — Plan only; mutating run disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "live-loading-375.png",
+    "label": "Live loading — Loading the order book",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "live-empty-375.png",
+    "label": "Live empty — Empty book (bid/ask 0; drill serving-before would fail)",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "live-error-375.png",
+    "label": "Live error — Cannot load the order book",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "live-success-375.png",
+    "label": "Live success — Order book updated (the drill HTTP probe)",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "live-disabled-375.png",
+    "label": "Live disabled — Symbol select off while a refresh is in flight",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "loading-768.png",
+    "label": "Loading — Checking UAT identity; Run cases 1–4 disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "empty-768.png",
+    "label": "Empty — No results yet; Run cases 1–4 is the primary action",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "error-768.png",
+    "label": "Error — Cannot run on this host",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "success-768.png",
+    "label": "Success — Serving restored; per-case downtime",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-768.png",
+    "label": "Disabled — Plan only; mutating run disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "live-loading-768.png",
+    "label": "Live loading — Loading the order book",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "live-empty-768.png",
+    "label": "Live empty — Empty book (bid/ask 0; drill serving-before would fail)",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "live-error-768.png",
+    "label": "Live error — Cannot load the order book",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "live-success-768.png",
+    "label": "Live success — Order book updated (the drill HTTP probe)",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "live-disabled-768.png",
+    "label": "Live disabled — Symbol select off while a refresh is in flight",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "loading-1280.png",
+    "label": "Loading — Checking UAT identity; Run cases 1–4 disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "empty-1280.png",
+    "label": "Empty — No results yet; Run cases 1–4 is the primary action",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "error-1280.png",
+    "label": "Error — Cannot run on this host",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "success-1280.png",
+    "label": "Success — Serving restored; per-case downtime",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-1280.png",
+    "label": "Disabled — Plan only; mutating run disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "live-loading-1280.png",
+    "label": "Live loading — Loading the order book",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "live-empty-1280.png",
+    "label": "Live empty — Empty book (bid/ask 0; drill serving-before would fail)",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "live-error-1280.png",
+    "label": "Live error — Cannot load the order book",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "live-success-1280.png",
+    "label": "Live success — Order book updated (the drill HTTP probe)",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "live-disabled-1280.png",
+    "label": "Live disabled — Symbol select off while a refresh is in flight",
+    "width": "1280",
+    "overflowing": false
+  }
+]

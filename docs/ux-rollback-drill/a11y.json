@@ -1,0 +1,317 @@
+[
+  {
+    "file": "loading-375.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-375.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-375.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-375.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-375.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "live-loading-375.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-empty-375.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-error-375.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-success-375.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-disabled-375.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "loading-768.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-768.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-768.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-768.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-768.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "live-loading-768.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-empty-768.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-error-768.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-success-768.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-disabled-768.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "loading-1280.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-1280.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-1280.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-1280.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-1280.png",
+    "surface": "cli",
+    "labelledCase": true,
+    "labelledTimeout": true,
+    "caseLabel": "Cases",
+    "timeoutLabel": "Swap timeout (seconds)",
+    "primaryAction": "Run cases 1–4",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "live-loading-1280.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-empty-1280.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-error-1280.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-success-1280.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  },
+  {
+    "file": "live-disabled-1280.png",
+    "surface": "live",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasDrillChrome": false
+  }
+]
