@@ -137,3 +137,31 @@ jobs:
             target/release/shadow_report
             sbom.cdx.json
             sbom.spdx.json
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install shellcheck
+        run: apt-get update -qq && apt-get install -y -qq --no-install-recommends shellcheck
+      - name: bash -n
+        run: |
+          bash -n scripts/deploy.sh
+          bash -n scripts/deploy-poll.sh
+          bash -n scripts/deploy-lib.sh
+          bash -n scripts/rollback-drill.sh
+          bash -n scripts/crash-loop-fix_server.sh
+      - name: shellcheck
+        run: |
+          shellcheck -x --severity=warning \
+            scripts/deploy.sh \
+            scripts/deploy-poll.sh \
+            scripts/deploy-lib.sh \
+            scripts/rollback-drill.sh \
+            scripts/crash-loop-fix_server.sh
+      - name: py_compile parser
+        run: python3 -m py_compile scripts/rollback-drill-parse-sessions.py
+      - name: example config byte-copy
+        run: cmp -s config.example.toml scripts/config.example.toml

@@ -2,6 +2,8 @@
 *.log
 *.db
 venv/
+__pycache__/
+*.pyc
 config.toml
 *.csv
 # runtime state — live FIX sequence numbers, must not be versioned
@@ -15,3 +17,8 @@ calibration/
 
 # Operator-managed venue CA files (`tls_ca_path`). Not secrets, not committed.
 certs/
+
+# on-box rollback drill artifacts (cwd). Do not commit.
+rollback-drill-results/
+.rollback-drill.lock
+.rollback-drill-reload.cursor
