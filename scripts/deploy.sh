@@ -24,6 +24,8 @@
 # Live /home/ubuntu/deploy.sh was not readable on this builder (home mode 0750,
 # host is not the UAT box). Operators must secret-review (C-REQ-4) against the
 # box copy before replacing it. Box behavior is unchanged until that copy.
+# After that review, re-diff health_check/rollback/snapshot_prev/swap_reload
+# against the live step bodies (Physical LLD PR1 slots 8–9).
 set -euo pipefail
 
 LIB="$(dirname "$0")/deploy-lib.sh"
