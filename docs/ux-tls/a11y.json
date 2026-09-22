@@ -1,0 +1,137 @@
+[
+  {
+    "file": "loading-375.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-375.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-375.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-375.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-375.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "loading-768.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-768.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-768.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-768.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-768.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "loading-1280.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-1280.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-1280.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-1280.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-1280.png",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "primaryAction": "Check sessions",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  }
+]
