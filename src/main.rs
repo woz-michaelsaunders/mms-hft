@@ -2,6 +2,7 @@ mod fix_protocol;
 mod order_book;
 mod order_book_buffer;
 mod sequencer;
+mod alerts;
 mod order_events;
 #[cfg(test)]
 mod mock_gateway;
@@ -15,7 +16,7 @@ use serde::{Deserialize, Deserializer};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, broadcast};
@@ -43,6 +44,8 @@ use axum::{
 use tower_http::cors::CorsLayer;
 
 const MAX_TICK_BUFFER: usize = 10_000;
+const STALE_THRESHOLD_MS: u64 = 30_000;
+const QUIET_FEED_LOG_MS: u64 = 60_000;
 const COMMAND_LOG_MD: &str = "fix_commands.log";
 const COMMAND_LOG_OM: &str = "OM_fix_command.log";
 const COMMAND_LOG_MAX_BYTES: u64 = 100 * 1024 * 1024; // 100 MiB; rotate iff len > this
@@ -980,6 +983,12 @@ pub struct FIXSession {
     /// included. Liveness of the TCP stream, as distinct from last_md_recv_ms
     /// which only tracks market data.
     last_inbound_ms: Arc<AtomicU64>,
+    /// Per-session in-process alert buffer (cap 200, FIFO). Tests poll this;
+    /// production operators grep `ALERT[` on the error log.
+    alerts: Arc<Mutex<VecDeque<alerts::Alert>>>,
+    /// Per-session reconnect-storm rolling window. First TCP connect is not a
+    /// reconnect; `record` returns Some only on the 3-in-window edge.
+    reconnect_storm: Arc<Mutex<alerts::ReconnectStormTracker>>,
     // Persistence allow-list for kdb capture (CAPTURE_SYMBOLS). Does not
     // affect FIX subscription or the in-memory Live book.
     capture_symbols: HashSet<String>,
@@ -1230,6 +1239,8 @@ impl FIXSession {
             sequencer: Arc::new(Mutex::new(sequencer::Sequencer::new())),
             last_md_recv_ms: Arc::new(AtomicU64::new(0)),
             last_inbound_ms: Arc::new(AtomicU64::new(0)),
+            alerts: Arc::new(Mutex::new(VecDeque::new())),
+            reconnect_storm: Arc::new(Mutex::new(alerts::ReconnectStormTracker::new())),
             capture_symbols: parse_capture_symbols(std::env::var("CAPTURE_SYMBOLS").ok().as_deref()),
         }
     }
@@ -1256,6 +1267,68 @@ impl FIXSession {
         log::info!("✅ Update channels set for session");
     }
 
+    /// Only writer of the per-session alert buffer and the greppable `ALERT[`
+    /// log line. Infallible: never returns Result, never uses `?`.
+    async fn emit_alert(&self, kind: alerts::AlertKind, detail: String) {
+        let session = alerts::sanitize_alert_text(&self.sender_comp_id);
+        let detail = alerts::sanitize_alert_text(&detail);
+        let at_ms = chrono::Utc::now().timestamp_millis() as u64;
+        let alert = alerts::Alert {
+            kind,
+            session: session.clone(),
+            detail: detail.clone(),
+            at_ms,
+        };
+        {
+            let mut buf = self.alerts.lock().await;
+            alerts::push_bounded(&mut buf, alert);
+        }
+        error!("ALERT[{kind}] session={session} {detail}");
+    }
+
+    /// Stall/quiet evaluation extracted from the MD watchdog loop so tests can
+    /// poke `last_inbound_ms` and tick without a 30s sleep. QuietFeed logs
+    /// only; Stalled emits StaleBook then tears the stream down.
+    async fn apply_feed_watchdog_tick(&self, now_ms: u64, name: &str) -> FeedHealth {
+        if !self.is_ready().await {
+            return FeedHealth::Ok;
+        }
+        let health = feed_health(
+            now_ms,
+            self.last_inbound_ms.load(Ordering::Relaxed),
+            self.last_md_recv_ms.load(Ordering::Relaxed),
+            STALE_THRESHOLD_MS,
+            QUIET_FEED_LOG_MS,
+        );
+        match health {
+            FeedHealth::QuietFeed { md_silent_ms } => {
+                info!(
+                    "📭 No market data on {} ({}) for {}ms — connection alive (heartbeats arriving), not reconnecting",
+                    name, self.sender_comp_id, md_silent_ms
+                );
+                health
+            }
+            FeedHealth::Stalled { silent_ms } => {
+                self.emit_alert(
+                    alerts::AlertKind::StaleBook,
+                    alerts::stale_book_detail(silent_ms),
+                )
+                .await;
+                warn!(
+                    "⚠️  Stalled stream on {} ({}) — nothing inbound for {}ms, forcing reconnect",
+                    name, self.sender_comp_id, silent_ms
+                );
+                *self.stream.lock().await = None;
+                *self.connection_state.lock().await = ConnectionState::Disconnected;
+                *self.is_connected.lock().await = false;
+                self.last_md_recv_ms.store(0, Ordering::Relaxed);
+                self.last_inbound_ms.store(0, Ordering::Relaxed);
+                health
+            }
+            FeedHealth::Ok => FeedHealth::Ok,
+        }
+    }
+
     /// Connect with automatic reconnection
     pub async fn connect_with_retry(&self, gateway_url: &str, max_attempts: u32, initial_backoff_ms: u64) -> Result<()> {
         let mut attempt = 0;
@@ -1273,6 +1346,18 @@ impl FIXSession {
 
                     *self.stream.lock().await = Some(stream);
                     *self.connection_state.lock().await = ConnectionState::Connected;
+                    let storm_count: Option<usize> = {
+                        let mut tracker = self.reconnect_storm.lock().await;
+                        let now_ms = chrono::Utc::now().timestamp_millis() as u64;
+                        tracker.record(now_ms)
+                    };
+                    if let Some(count) = storm_count {
+                        self.emit_alert(
+                            alerts::AlertKind::ReconnectStorm,
+                            alerts::reconnect_storm_detail(count),
+                        )
+                        .await;
+                    }
                     info!("✅ Connected successfully to FIX gateway at attempt {}", attempt);
                     return Ok(());
                 }
@@ -2310,6 +2395,11 @@ impl FIXSession {
                         return Ok(());
                     }
                     sequencer::SequenceResult::GapDetected { expected, received } => {
+                        self.emit_alert(
+                            alerts::AlertKind::SequenceGap,
+                            alerts::sequence_gap_detail(expected, received, msg.msg_type),
+                        )
+                        .await;
                         warn!(
                             "⚠️  Inbound sequence gap detected (type {}): expected {}, got {} — requesting recovery",
                             msg.msg_type, expected, received
@@ -6897,43 +6987,13 @@ async fn main() -> Result<()> {
             .map(|s| (Arc::clone(&s.handle), s.config.name.clone()))
             .collect();
         let _stale_feed_watchdog = tokio::spawn(async move {
-            const STALE_THRESHOLD_MS: u64 = 30_000;
-            const QUIET_FEED_LOG_MS: u64 = 60_000;
             let mut check_interval = interval(Duration::from_secs(15));
             check_interval.tick().await;
             loop {
                 check_interval.tick().await;
                 let now_ms = chrono::Utc::now().timestamp_millis() as u64;
                 for (sess, name) in &stale_sessions {
-                    if !sess.is_ready().await {
-                        continue;
-                    }
-                    let health = feed_health(
-                        now_ms,
-                        sess.last_inbound_ms.load(Ordering::Relaxed),
-                        sess.last_md_recv_ms.load(Ordering::Relaxed),
-                        STALE_THRESHOLD_MS,
-                        QUIET_FEED_LOG_MS,
-                    );
-                    if let FeedHealth::QuietFeed { md_silent_ms } = health {
-                        info!(
-                            "📭 No market data on {} ({}) for {}ms — connection alive (heartbeats arriving), not reconnecting",
-                            name, sess.sender_comp_id, md_silent_ms
-                        );
-                    }
-                    if let FeedHealth::Stalled { silent_ms } = health {
-                        warn!(
-                            "⚠️  Stalled stream on {} ({}) — nothing inbound for {}ms, forcing reconnect",
-                            name, sess.sender_comp_id, silent_ms
-                        );
-                        let mut stream = sess.stream.lock().await;
-                        *stream = None;
-                        drop(stream);
-                        *sess.connection_state.lock().await = ConnectionState::Disconnected;
-                        *sess.is_connected.lock().await = false;
-                        sess.last_md_recv_ms.store(0, Ordering::Relaxed);
-                        sess.last_inbound_ms.store(0, Ordering::Relaxed);
-                    }
+                    let _ = sess.apply_feed_watchdog_tick(now_ms, name).await;
                 }
             }
         });
@@ -7911,6 +7971,8 @@ max_notional = inf
 #[cfg(test)]
 mod connectivity_tests {
     use super::*;
+    use super::alerts::{self, AlertKind};
+    use std::sync::atomic::Ordering;
 
     /// Connect, logon, and block until the Logon ACK (35=A) is processed —
     /// mirrors what `message_loop` does in production, trimmed to what a
@@ -7960,6 +8022,21 @@ mod connectivity_tests {
             }
         }
         Ok(None)
+    }
+
+    async fn wait_for_alert(session: &FIXSession, kind: alerts::AlertKind, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        while Instant::now() < deadline {
+            let found = {
+                let buf = session.alerts.lock().await;
+                buf.iter().any(|a| a.kind == kind)
+            };
+            if found {
+                return true;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        false
     }
 
     fn cleanup_processed(cl_ord_id: &str) {
@@ -9449,6 +9526,125 @@ mod connectivity_tests {
                 instruction: Some("".to_string()),
                 id: Some("".to_string()),
             }
+        );
+        Ok(())
+    }
+
+    /// AC1: a ready MD session whose inbound stream has gone silent past the
+    /// 30s stall threshold emits StaleBook when the watchdog ticks. Poke
+    /// `last_inbound_ms` rather than sleeping 30s. QuietFeed (`last_md_recv_ms`)
+    /// is not this alert.
+    #[tokio::test]
+    async fn stale_book_alert_fires_on_stalled_inbound() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig::default(),
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+        assert!(session.is_ready().await);
+
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        session
+            .last_inbound_ms
+            .store(now.saturating_sub(45_000), Ordering::Relaxed);
+        let health = session.apply_feed_watchdog_tick(now, "test").await;
+        assert!(
+            matches!(health, FeedHealth::Stalled { silent_ms } if silent_ms >= 45_000),
+            "watchdog tick must classify the backdated inbound as Stalled, got {:?}",
+            health
+        );
+        assert!(
+            wait_for_alert(&session, AlertKind::StaleBook, Duration::from_secs(60)).await,
+            "StaleBook alert must appear in the session buffer within 60s"
+        );
+        Ok(())
+    }
+
+    /// AC2: ≥3 reconnects inside the rolling window emit ReconnectStorm.
+    /// The mock re-accepts after `disconnect_after_messages`, so each
+    /// application message trips a drop and the next `connect_with_retry`
+    /// is a counted reconnect. The initial `connect_and_logon` is the
+    /// uncounted first TCP.
+    #[tokio::test]
+    async fn reconnect_storm_alert_fires_on_repeated_disconnects() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                disconnect_after_messages: Some(1),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        for i in 1..=3 {
+            session.market_data_request("BTC_USDT", 10).await?;
+            let mut saw_disconnect = false;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                match tokio::time::timeout(Duration::from_millis(500), session.receive_message()).await {
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) => {
+                        saw_disconnect = true;
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+            assert!(
+                saw_disconnect,
+                "expected the mock to close the connection before reconnect {i}"
+            );
+            *session.connection_state.lock().await = ConnectionState::Disconnected;
+            *session.is_connected.lock().await = false;
+            connect_and_logon(&session, port).await?;
+        }
+
+        assert!(
+            wait_for_alert(&session, AlertKind::ReconnectStorm, Duration::from_secs(60)).await,
+            "ReconnectStorm alert must appear within 60s of the 3rd reconnect"
+        );
+        Ok(())
+    }
+
+    /// AC3: an induced inbound MsgSeqNum gap emits SequenceGap as soon as
+    /// `handle_message` sees `GapDetected`. Same mock knobs as the existing
+    /// capture-gap probe test.
+    #[tokio::test]
+    async fn sequence_gap_alert_fires_on_induced_gap() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                md_ticks_to_stream: 3,
+                induce_gap_at_tick: Some(2),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+        session.market_data_request("BTC_USDT", 10).await?;
+
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            pump_messages(&session, Duration::from_millis(250), |_| false).await?;
+            if wait_for_alert(&session, AlertKind::SequenceGap, Duration::from_millis(50)).await {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SequenceGap alert should appear within 60s of the induced gap"
+            );
+        }
+        assert!(
+            wait_for_alert(&session, AlertKind::SequenceGap, Duration::from_secs(60)).await,
+            "SequenceGap alert must remain in the session buffer"
         );
         Ok(())
     }
