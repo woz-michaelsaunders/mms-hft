@@ -6,6 +6,8 @@ mod alerts;
 mod order_events;
 #[cfg(test)]
 mod mock_gateway;
+#[cfg(test)]
+mod tls_test_listener;
 mod algo_runtime;
 
 use fix_server::{algo, kdb_integration, kdb_query};
@@ -14,10 +16,12 @@ use fix_protocol::{FIXMessage, tags};
 use log::{info, error, warn};
 use serde::{Deserialize, Deserializer};
 use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::collections::{HashMap, HashSet, VecDeque};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, broadcast};
 use tokio::task::JoinSet;
@@ -68,6 +72,57 @@ struct Config {
     risk: RiskConfig,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum TlsSetting {
+    #[default]
+    Off,
+    On,
+    Invalid,
+}
+
+impl TlsSetting {
+    fn is_enabled(&self) -> bool {
+        matches!(self, Self::On)
+    }
+    fn is_invalid(&self) -> bool {
+        matches!(self, Self::Invalid)
+    }
+}
+
+impl<'de> Deserialize<'de> for TlsSetting {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = TlsSetting;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "a boolean")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<TlsSetting, E> {
+                Ok(if v { TlsSetting::On } else { TlsSetting::Off })
+            }
+            fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<TlsSetting, E> {
+                Ok(TlsSetting::Invalid)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _v: i64) -> Result<TlsSetting, E> {
+                Ok(TlsSetting::Invalid)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _v: u64) -> Result<TlsSetting, E> {
+                Ok(TlsSetting::Invalid)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _v: f64) -> Result<TlsSetting, E> {
+                Ok(TlsSetting::Invalid)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _a: A) -> Result<TlsSetting, A::Error> {
+                Ok(TlsSetting::Invalid)
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, _m: M) -> Result<TlsSetting, M::Error> {
+                Ok(TlsSetting::Invalid)
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
 #[derive(Clone, Debug, serde::Deserialize)]
 struct SessionConfig {
     name: String,
@@ -87,6 +142,12 @@ struct SessionConfig {
     max_reconnect_attempts: Option<u32>,
     #[serde(default)]
     reconnect_backoff_ms: Option<u64>,
+    #[serde(default)]
+    tls: TlsSetting,
+    #[serde(default)]
+    tls_ca_path: Option<String>,
+    #[serde(default)]
+    tls_server_name: Option<String>,
     /// Filled by `validate_config` for `role = market_data` only. Always `None` on OM.
     #[serde(skip)]
     compiled_routing: Option<CompiledSymbolRouting>,
@@ -487,6 +548,63 @@ fn validate_config(config: &mut Config) -> Result<()> {
         }
     }
 
+    for session in &config.sessions {
+        if session.tls.is_invalid() {
+            bail!("session '{}' tls must be true or false", session.name);
+        }
+        if !session.tls.is_enabled() && session.tls_ca_path.is_some() {
+            bail!(
+                "session '{}' tls_ca_path is set but tls = false",
+                session.name
+            );
+        }
+        if !session.tls.is_enabled() && session.tls_server_name.is_some() {
+            bail!(
+                "session '{}' tls_server_name is set but tls = false",
+                session.name
+            );
+        }
+        if session.tls.is_enabled()
+            && session
+                .tls_ca_path
+                .as_deref()
+                .is_some_and(|s| s.trim().is_empty())
+        {
+            bail!("session '{}' tls_ca_path must not be empty", session.name);
+        }
+        if session.tls.is_enabled() {
+            if let Some(s) = session.tls_server_name.as_deref() {
+                if s.trim().is_empty() || s.chars().any(char::is_whitespace) || s.contains("://") {
+                    bail!(
+                        "session '{}' tls_server_name must be a hostname (no whitespace, no scheme)",
+                        session.name
+                    );
+                }
+            }
+        }
+        if session.tls.is_enabled() {
+            if let Some(path) = session.tls_ca_path.as_deref() {
+                if !path.trim().is_empty() {
+                    if std::fs::read(path).is_err() {
+                        bail!(
+                            "session '{}' tls_ca_path '{}' is not a readable file",
+                            session.name,
+                            path
+                        );
+                    }
+                    match load_trust_anchors(path) {
+                        Ok(certs) if !certs.is_empty() => {}
+                        _ => bail!(
+                            "session '{}' tls_ca_path '{}' is not a valid PEM or DER certificate",
+                            session.name,
+                            path
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -539,6 +657,58 @@ fn session_reconnect_backoff_ms(session: &SessionConfig, conn: &ConnectionConfig
 
 fn connect_addr(session: &SessionConfig) -> String {
     format!("{}:{}", session.host, session.port)
+}
+
+fn load_trust_anchors(path: &str) -> Result<Vec<native_tls::Certificate>> {
+    let bytes = std::fs::read(path).map_err(|e| anyhow!("failed to read tls_ca_path '{path}': {e}"))?;
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if text.contains(BEGIN) {
+            let mut certs = Vec::new();
+            let mut search_from = 0usize;
+            while let Some(brel) = text[search_from..].find(BEGIN) {
+                let begin_at = search_from + brel;
+                let after_begin = begin_at + BEGIN.len();
+                let Some(erel) = text[after_begin..].find(END) else {
+                    bail!("truncated PEM certificate in '{path}'");
+                };
+                let end_at = after_begin + erel + END.len();
+                let block = &text[begin_at..end_at];
+                let cert = native_tls::Certificate::from_pem(block.as_bytes())
+                    .map_err(|e| anyhow!("invalid PEM certificate in '{path}': {e}"))?;
+                certs.push(cert);
+                search_from = end_at;
+            }
+            if certs.is_empty() {
+                bail!("no CERTIFICATE blocks in '{path}'");
+            }
+            return Ok(certs);
+        }
+    }
+
+    let cert = native_tls::Certificate::from_der(&bytes)
+        .map_err(|e| anyhow!("invalid DER certificate in '{path}': {e}"))?;
+    Ok(vec![cert])
+}
+
+fn build_tls_connector(ca_path: Option<&str>) -> Result<tokio_native_tls::TlsConnector> {
+    let mut builder = native_tls::TlsConnector::builder();
+    builder.min_protocol_version(Some(native_tls::Protocol::Tlsv12));
+    if let Some(path) = ca_path {
+        builder.disable_built_in_roots(true);
+        let certs = load_trust_anchors(path)?;
+        let n = certs.len();
+        for cert in certs {
+            builder.add_root_certificate(cert);
+        }
+        info!("🔒 TLS trust anchor loaded from {path} ({n} certs)");
+    }
+    let native = builder
+        .build()
+        .map_err(|e| anyhow!("TLS connector build failed: {e}"))?;
+    Ok(tokio_native_tls::TlsConnector::from(native))
 }
 
 fn lookup_om(spawned: &[SpawnedSession]) -> Option<Arc<FIXSession>> {
@@ -925,8 +1095,59 @@ enum PendingMdIo {
     },
 }
 
+enum SessionStream {
+    Plain(tokio::net::TcpStream),
+    Tls(tokio_native_tls::TlsStream<tokio::net::TcpStream>),
+}
+
+impl AsyncRead for SessionStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SessionStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            SessionStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for SessionStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        match self.get_mut() {
+            SessionStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            SessionStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            SessionStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            SessionStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        match self.get_mut() {
+            SessionStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            SessionStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 pub struct FIXSession {
-    stream: Arc<Mutex<Option<TcpStream>>>,
+    stream: Arc<Mutex<Option<SessionStream>>>,
+    tls_enabled: bool,
+    tls_ca_path: Option<String>,
+    tls_domain: String,
     sender_comp_id: String,
     target_comp_id: String,
     seq_num: Arc<Mutex<u32>>,
@@ -1210,6 +1431,9 @@ impl FIXSession {
 
         FIXSession {
             stream: Arc::new(Mutex::new(None)),
+            tls_enabled: false,
+            tls_ca_path: None,
+            tls_domain: String::new(),
             sender_comp_id: sender.to_string(),
             target_comp_id: target.to_string(),
             seq_num: Arc::new(Mutex::new(initial_seq)),
@@ -1243,6 +1467,18 @@ impl FIXSession {
             reconnect_storm: Arc::new(Mutex::new(alerts::ReconnectStormTracker::new())),
             capture_symbols: parse_capture_symbols(std::env::var("CAPTURE_SYMBOLS").ok().as_deref()),
         }
+    }
+
+    fn with_transport(
+        mut self,
+        tls_enabled: bool,
+        tls_ca_path: Option<String>,
+        tls_domain: String,
+    ) -> Self {
+        self.tls_enabled = tls_enabled;
+        self.tls_ca_path = tls_ca_path;
+        self.tls_domain = tls_domain;
+        self
     }
 
     #[cfg(test)]
@@ -1329,6 +1565,29 @@ impl FIXSession {
         }
     }
 
+    async fn dial_session_stream(&self, gateway_url: &str) -> Result<SessionStream> {
+        let tcp = TcpStream::connect(gateway_url).await?;
+        let _ = tcp.set_nodelay(true);
+        if !self.tls_enabled {
+            return Ok(SessionStream::Plain(tcp));
+        }
+        if self.tls_domain.trim().is_empty() {
+            bail!("🔒 TLS enabled but SNI/verify domain is empty");
+        }
+        let connector = build_tls_connector(self.tls_ca_path.as_deref())?;
+        info!("🔒 TLS handshake starting (sni={})", self.tls_domain);
+        match connector.connect(&self.tls_domain, tcp).await {
+            Ok(tls) => {
+                info!("🔒 TLS handshake complete (sni={})", self.tls_domain);
+                Ok(SessionStream::Tls(tls))
+            }
+            Err(e) => {
+                error!("🔒 TLS handshake failed (sni={}): {e}", self.tls_domain);
+                Err(anyhow!("🔒 TLS handshake failed: {e}"))
+            }
+        }
+    }
+
     /// Connect with automatic reconnection
     pub async fn connect_with_retry(&self, gateway_url: &str, max_attempts: u32, initial_backoff_ms: u64) -> Result<()> {
         let mut attempt = 0;
@@ -1338,12 +1597,10 @@ impl FIXSession {
             attempt += 1;
             info!("Connection attempt {} to {}", attempt, gateway_url);
 
-            // Try connection with 30-second timeout (FIX gateways can be slow)
-            match tokio::time::timeout(Duration::from_secs(30), TcpStream::connect(gateway_url)).await {
+            // TCP + optional TLS handshake share the existing 30s timeout.
+            // Store the stream and mark Connected only after the timeout returns.
+            match tokio::time::timeout(Duration::from_secs(30), self.dial_session_stream(gateway_url)).await {
                 Ok(Ok(stream)) => {
-                    // Set TCP_NODELAY for faster FIX messaging
-                    let _ = stream.set_nodelay(true);
-
                     *self.stream.lock().await = Some(stream);
                     *self.connection_state.lock().await = ConnectionState::Connected;
                     let storm_count: Option<usize> = {
@@ -6686,13 +6943,23 @@ async fn main() -> Result<()> {
         let creds = resolved
             .get(&session.credentials_ref)
             .expect("validate_config + resolve_credentials");
-        let handle = Arc::new(FIXSession::new_with_credentials_and_kdb(
-            &session.sender_comp_id,
-            &session.target_comp_id,
-            &creds.api_key,
-            &creds.api_secret,
-            Arc::clone(&kdb_writer),
-        ));
+        let handle = Arc::new(
+            FIXSession::new_with_credentials_and_kdb(
+                &session.sender_comp_id,
+                &session.target_comp_id,
+                &creds.api_key,
+                &creds.api_secret,
+                Arc::clone(&kdb_writer),
+            )
+            .with_transport(
+                session.tls.is_enabled(),
+                session.tls_ca_path.clone(),
+                session
+                    .tls_server_name
+                    .clone()
+                    .unwrap_or_else(|| session.host.clone()),
+            ),
+        );
         handle
             .set_update_channels(order_update_tx.clone(), order_book_update_tx.clone())
             .await;
@@ -6702,16 +6969,23 @@ async fn main() -> Result<()> {
         let max = session_max_reconnect_attempts(session, &config.connection);
         let backoff = session_reconnect_backoff_ms(session, &config.connection);
 
-        info!(
-            "spawned session {} role={} {}:{} sender={} target={} credentials_ref={}",
+        let mut spawn_msg = format!(
+            "spawned session {} role={} {}:{} sender={} target={} credentials_ref={} tls={}",
             session.name,
             session.role,
             session.host,
             session.port,
             session.sender_comp_id,
             session.target_comp_id,
-            session.credentials_ref
+            session.credentials_ref,
+            session.tls.is_enabled(),
         );
+        if session.tls.is_enabled() {
+            if let Some(sni) = &session.tls_server_name {
+                spawn_msg.push_str(&format!(" sni={sni}"));
+            }
+        }
+        info!("{spawn_msg}");
 
         match session.role {
             SessionRole::OrderManagement => {
@@ -7964,6 +8238,160 @@ max_notional = inf
             check_exposure(&o, 0.0, &limits),
             Err(ExposureReject::InvalidCashQty)
         );
+    }
+
+    fn skeleton_md_plus(extra: &str) -> String {
+        format!("{}\n{extra}\n", skeleton_md())
+    }
+
+    #[test]
+    fn validate_omitted_tls_defaults_off() {
+        let mut c = parse_config(&skeleton_md()).unwrap();
+        validate_config(&mut c).unwrap();
+        assert_eq!(c.sessions[0].tls, TlsSetting::Off);
+        assert!(c.sessions[0].tls_ca_path.is_none());
+        assert!(c.sessions[0].tls_server_name.is_none());
+    }
+
+    #[test]
+    fn validate_tls_false_is_ok() {
+        let mut c = parse_config(&skeleton_md_plus("tls = false")).unwrap();
+        validate_config(&mut c).unwrap();
+        assert_eq!(c.sessions[0].tls, TlsSetting::Off);
+    }
+
+    #[test]
+    fn validate_tls_true_without_ca_is_ok() {
+        let mut c = parse_config(&skeleton_md_plus("tls = true")).unwrap();
+        validate_config(&mut c).unwrap();
+        assert!(c.sessions[0].tls.is_enabled());
+        assert!(c.sessions[0].tls_ca_path.is_none());
+    }
+
+    #[test]
+    fn validate_rejects_junk_tls_string() {
+        validate_err_contains(
+            &skeleton_md_plus("tls = \"yes\""),
+            "session 's1' tls must be true or false",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_junk_tls_integer() {
+        validate_err_contains(
+            &skeleton_md_plus("tls = 1"),
+            "session 's1' tls must be true or false",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_ca_path_when_tls_off() {
+        validate_err_contains(
+            &skeleton_md_plus("tls = false\ntls_ca_path = \"certs/venue-ca.pem\""),
+            "session 's1' tls_ca_path is set but tls = false",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_server_name_when_tls_off() {
+        validate_err_contains(
+            &skeleton_md_plus("tls = false\ntls_server_name = \"fix.example.com\""),
+            "session 's1' tls_server_name is set but tls = false",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_empty_tls_ca_path() {
+        validate_err_contains(
+            &skeleton_md_plus("tls = true\ntls_ca_path = \"\""),
+            "session 's1' tls_ca_path must not be empty",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_whitespace_tls_ca_path() {
+        validate_err_contains(
+            &skeleton_md_plus("tls = true\ntls_ca_path = \"   \""),
+            "session 's1' tls_ca_path must not be empty",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_tls_server_name() {
+        validate_err_contains(
+            &skeleton_md_plus("tls = true\ntls_server_name = \"https://fix.example.com\""),
+            "session 's1' tls_server_name must be a hostname (no whitespace, no scheme)",
+        );
+        validate_err_contains(
+            &skeleton_md_plus("tls = true\ntls_server_name = \"fix example.com\""),
+            "session 's1' tls_server_name must be a hostname (no whitespace, no scheme)",
+        );
+        validate_err_contains(
+            &skeleton_md_plus("tls = true\ntls_server_name = \"\""),
+            "session 's1' tls_server_name must be a hostname (no whitespace, no scheme)",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unreadable_tls_ca_path() {
+        validate_err_contains(
+            &skeleton_md_plus("tls = true\ntls_ca_path = \"/no/such/hft-tls-ca.pem\""),
+            "session 's1' tls_ca_path '/no/such/hft-tls-ca.pem' is not a readable file",
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_pem_tls_ca_path() {
+        let path = tls_test_listener::write_temp_bytes("hft-bad-ca", b"not-a-cert").unwrap();
+        let extra = format!("tls = true\ntls_ca_path = \"{}\"", path.display());
+        validate_err_contains(
+            &skeleton_md_plus(&extra),
+            &format!(
+                "session 's1' tls_ca_path '{}' is not a valid PEM or DER certificate",
+                path.display()
+            ),
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn validate_accepts_readable_pem_tls_ca_path() {
+        let pem = tls_test_listener::mint_self_signed_ca_pem("validate-ca").unwrap();
+        let path = tls_test_listener::write_temp_bytes("hft-good-ca", &pem).unwrap();
+        let extra = format!(
+            "tls = true\ntls_ca_path = \"{}\"\ntls_server_name = \"fix-prd.crypto.com\"",
+            path.display()
+        );
+        let mut c = parse_config(&skeleton_md_plus(&extra)).unwrap();
+        validate_config(&mut c).unwrap();
+        assert!(c.sessions[0].tls.is_enabled());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn example_configs_leave_tls_off() {
+        for src in [
+            include_str!("../config.example.toml"),
+            include_str!("../config.prd3.example.toml"),
+        ] {
+            let c = parse_config(src).unwrap();
+            for s in &c.sessions {
+                assert_eq!(s.tls, TlsSetting::Off);
+                assert!(s.tls_ca_path.is_none());
+                assert!(s.tls_server_name.is_none());
+            }
+            // Comment blocks may mention the key; no [[sessions]] row may set it.
+            for line in src.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('#') || trimmed.is_empty() {
+                    continue;
+                }
+                assert!(
+                    !trimmed.starts_with("tls ") && !trimmed.starts_with("tls="),
+                    "example session rows must omit tls (got {trimmed:?})"
+                );
+            }
+        }
     }
 }
 
@@ -9706,5 +10134,199 @@ mod calibrate_http_tests {
             injection.parse::<i64>().is_err(),
             "quoted injection must fail i64 parse before kdb_ts_atom"
         );
+    }
+}
+
+#[cfg(test)]
+mod tls_connector_tests {
+    use super::*;
+
+    #[test]
+    fn helpers_never_disable_verification() {
+        let src = include_str!("main.rs");
+        let prod = src
+            .split("mod config_tests")
+            .next()
+            .expect("production source precedes config_tests");
+        assert!(
+            !prod.contains("danger_accept_invalid_certs"),
+            "verification must never be bypassable"
+        );
+        assert!(
+            !prod.contains("danger_accept_invalid_hostnames"),
+            "hostname verification must stay on"
+        );
+        assert!(!prod.contains("use_sni(false)"), "SNI must stay enabled");
+        let disable = prod
+            .find("disable_built_in_roots(true)")
+            .expect("custom CA must replace system roots");
+        let add = prod
+            .find("add_root_certificate")
+            .expect("custom CA must be installed");
+        assert!(
+            disable < add,
+            "disable_built_in_roots must run before add_root_certificate"
+        );
+        assert!(
+            !prod.contains("TlsConnector::new()"),
+            "TlsConnector::new defaults min protocol to TLS 1.0"
+        );
+    }
+
+    #[test]
+    fn load_trust_anchors_parses_every_pem_block_and_der() {
+        let pem_a = tls_test_listener::mint_self_signed_ca_pem("bundle-a").unwrap();
+        let pem_b = tls_test_listener::mint_self_signed_ca_pem("bundle-b").unwrap();
+        let mut bundle = pem_a.clone();
+        bundle.extend_from_slice(&pem_b);
+        let pem_path = tls_test_listener::write_temp_bytes("hft-ca-bundle", &bundle).unwrap();
+        let certs = load_trust_anchors(pem_path.to_str().unwrap()).unwrap();
+        assert_eq!(certs.len(), 2, "every CERTIFICATE block is a trust anchor");
+        let _ = std::fs::remove_file(&pem_path);
+
+        let der = tls_test_listener::mint_self_signed_ca_der("der-ca").unwrap();
+        let der_path = tls_test_listener::write_temp_bytes("hft-ca-der", &der).unwrap();
+        let der_certs = load_trust_anchors(der_path.to_str().unwrap()).unwrap();
+        assert_eq!(der_certs.len(), 1);
+        let _ = std::fs::remove_file(&der_path);
+    }
+
+    #[tokio::test]
+    async fn exclusive_ca_rejects_untrusted_and_accepts_matching() {
+        let trusted = tls_test_listener::start_trusted().await.unwrap();
+        let untrusted = tls_test_listener::start_untrusted().await.unwrap();
+        let ca = trusted.ca_pem_path.to_str().unwrap();
+        let connector = build_tls_connector(Some(ca)).unwrap();
+
+        let tcp = TcpStream::connect(("127.0.0.1", untrusted.port))
+            .await
+            .unwrap();
+        assert!(
+            connector.connect("localhost", tcp).await.is_err(),
+            "exclusive CA store must reject a leaf signed by a different CA"
+        );
+
+        let tcp = TcpStream::connect(("127.0.0.1", trusted.port))
+            .await
+            .unwrap();
+        connector
+            .connect("localhost", tcp)
+            .await
+            .expect("matching CA must complete the handshake");
+    }
+}
+
+#[cfg(test)]
+mod tls_connectivity_tests {
+    use super::*;
+
+    async fn connect_and_logon(session: &FIXSession, port: u16) -> Result<()> {
+        session
+            .connect_with_retry(&format!("127.0.0.1:{}", port), 5, 20)
+            .await?;
+        session.logon(30).await?;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() > deadline {
+                return Err(anyhow!("Timed out waiting for Logon ACK"));
+            }
+            match tokio::time::timeout(Duration::from_millis(500), session.receive_message()).await {
+                Ok(Ok(msg)) => {
+                    let is_logon_ack = msg.msg_type == 'A';
+                    session.handle_message(&msg).await?;
+                    if is_logon_ack {
+                        *session.connection_state.lock().await = ConnectionState::Ready;
+                        return Ok(());
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    async fn wait_for_heartbeat(session: &FIXSession) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() > deadline {
+                return Err(anyhow!("Timed out waiting for Heartbeat"));
+            }
+            match tokio::time::timeout(Duration::from_millis(500), session.receive_message()).await {
+                Ok(Ok(msg)) => {
+                    session.handle_message(&msg).await?;
+                    if msg.msg_type == '0' {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_false_logon_against_plain_mock_gateway() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig::default(),
+        )
+        .await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        assert!(!session.tls_enabled);
+        connect_and_logon(&session, port).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_true_logon_and_heartbeat_against_trusted_listener() -> Result<()> {
+        let listener = tls_test_listener::start_trusted().await?;
+        let ca = listener.ca_pem_path.to_string_lossy().into_owned();
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE").with_transport(
+            true,
+            Some(ca),
+            "localhost".to_string(),
+        );
+        connect_and_logon(&session, listener.port).await?;
+        session.heartbeat().await?;
+        wait_for_heartbeat(&session).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_true_without_matching_ca_fails_closed() -> Result<()> {
+        let listener = tls_test_listener::start_untrusted().await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE").with_transport(
+            true,
+            None,
+            "localhost".to_string(),
+        );
+        let err = session
+            .connect_with_retry(&format!("127.0.0.1:{}", listener.port), 1, 20)
+            .await
+            .expect_err("untrusted certificate must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("TLS handshake failed") || msg.contains("Max reconnection"),
+            "unexpected connect error: {msg}"
+        );
+        assert!(
+            session.stream.lock().await.is_none(),
+            "failed handshake must not store a stream"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tls_true_with_matching_ca_path_succeeds() -> Result<()> {
+        let listener = tls_test_listener::start_trusted().await?;
+        let ca = listener.ca_pem_path.to_string_lossy().into_owned();
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE").with_transport(
+            true,
+            Some(ca),
+            "localhost".to_string(),
+        );
+        connect_and_logon(&session, listener.port).await?;
+        Ok(())
     }
 }
