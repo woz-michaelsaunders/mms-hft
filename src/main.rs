@@ -337,6 +337,73 @@ struct SymbolLimit {
     max_notional: f64,
 }
 
+#[derive(Debug)]
+struct Cli {
+    preflight: bool,
+    config_path: String,
+    logon_check: bool,
+    timeout_secs: u64,
+}
+
+#[derive(Debug)]
+enum CliParse {
+    Help,
+    Run(Cli),
+}
+
+enum CredStatus {
+    Ok(ResolvedCredentials),
+    Fail,
+}
+
+enum TcpCheckErr {
+    Timeout { secs: u64 },
+    Io(std::io::Error),
+}
+
+impl fmt::Display for TcpCheckErr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TcpCheckErr::Timeout { secs } => write!(f, "timed out after {secs}s"),
+            TcpCheckErr::Io(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+enum LogonAck {
+    Ok,
+    Reject,
+    Logout,
+    Timeout { secs: u64 },
+    Io(String),
+}
+
+enum LogonCell {
+    Skipped,
+    Ok,
+    Fail,
+}
+
+struct LogonCheckOutcome {
+    reachable: bool,
+    logon: LogonCell,
+}
+
+struct PreflightRow {
+    session: String,
+    role: SessionRole,
+    addr: String,
+    creds_ok: bool,
+    reachable: bool,
+    logon: LogonCell,
+}
+
+const PREFLIGHT_USAGE: &str = "USAGE: fix_server [--config PATH] | --preflight [--config PATH] [--logon-check] [--timeout-secs N] | --help";
+
+fn usage_error(first: &str) -> String {
+    format!("{first}\n{PREFLIGHT_USAGE}")
+}
+
 /// Append one line to `startup.log`, independent of the logging framework and
 /// of whatever pm2 is doing with our stdout/stderr.
 ///
@@ -364,11 +431,104 @@ fn startup_note(msg: &str) {
     let _ = std::io::stderr().flush();
 }
 
-// Load configuration from file
-fn load_config() -> Result<Config> {
-    let config_path = "config.toml";
-    let config_content = std::fs::read_to_string(config_path)
-        .map_err(|e| anyhow!("Failed to read config file {}: {}", config_path, e))?;
+fn print_preflight_help() {
+    println!(
+        "\
+USAGE:
+  fix_server [--config PATH]
+      LIVE server. Starts kdb, FIX sessions, loops, and (if OM is present) order entry.
+      Default PATH is config.toml.
+
+  fix_server --preflight [--config PATH] [--timeout-secs N]
+      Deploy GATE. Parses/validates config, checks credentials and TCP.
+      Does not start sessions, kdb, dashboard, algo, or ZMQ. Exit 0/1.
+
+  fix_server --preflight --logon-check [--config PATH] [--timeout-secs N]
+      Same gate, plus opt-in FIX Logon/Logout. Requires --preflight.
+      Venue-visible: Logon always sends 141=Y (sequence reset). Not the default gate.
+      Do not run against production as part of initial rollout.
+
+  fix_server --help
+
+--config PATH without --preflight is HFT-042 cutover (live process on that file),
+not a dry run. Unknown flags: exit 1."
+    );
+}
+
+/// Parse `std::env::args().skip(1)`. No clap. Fail closed.
+fn parse_cli<I, S>(args: I) -> Result<CliParse, String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let args: Vec<String> = args.into_iter().map(|s| s.as_ref().to_string()).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        return Ok(CliParse::Help);
+    }
+
+    let mut preflight = false;
+    let mut config_path: Option<String> = None;
+    let mut logon_check = false;
+    let mut timeout_secs: Option<u64> = None;
+    let mut timeout_present = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--preflight" => preflight = true,
+            "--logon-check" => logon_check = true,
+            "--config" => {
+                i += 1;
+                let raw = args.get(i).map(|s| s.as_str()).unwrap_or("");
+                if raw.trim().is_empty() {
+                    return Err(usage_error("fix_server: --config requires a path"));
+                }
+                config_path = Some(raw.to_string());
+            }
+            "--timeout-secs" => {
+                timeout_present = true;
+                i += 1;
+                let raw = args.get(i).map(|s| s.as_str());
+                match raw.and_then(|s| s.parse::<u64>().ok()).filter(|&n| n >= 1) {
+                    Some(n) => timeout_secs = Some(n),
+                    None => {
+                        return Err(usage_error(
+                            "fix_server: --timeout-secs must be a positive integer",
+                        ));
+                    }
+                }
+            }
+            other => {
+                return Err(usage_error(&format!(
+                    "fix_server: unknown argument: {other}"
+                )));
+            }
+        }
+        i += 1;
+    }
+
+    if logon_check && !preflight {
+        return Err(usage_error(
+            "fix_server: --logon-check requires --preflight",
+        ));
+    }
+    if timeout_present && !preflight {
+        return Err(usage_error(
+            "fix_server: --timeout-secs requires --preflight",
+        ));
+    }
+
+    Ok(CliParse::Run(Cli {
+        preflight,
+        config_path: config_path.unwrap_or_else(|| "config.toml".to_string()),
+        logon_check,
+        timeout_secs: timeout_secs.unwrap_or(5),
+    }))
+}
+
+fn load_config(path: &str) -> Result<Config> {
+    let config_content = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("Failed to read config file {}: {}", path, e))?;
     parse_config(&config_content)
 }
 
@@ -645,6 +805,38 @@ fn resolve_credentials(config: &Config) -> Result<HashMap<String, ResolvedCreden
     Ok(out)
 }
 
+/// First-seen order of used refs (same as `used_credential_refs`).
+/// On fail: eprintln the raw `read_env_nonempty` error once per ref, then Fail.
+fn collect_credentials(config: &Config) -> HashMap<String, CredStatus> {
+    let mut out = HashMap::new();
+    for ref_name in used_credential_refs(&config.sessions) {
+        let cred = config
+            .credentials
+            .get(&ref_name)
+            .expect("validate_config already required this credentials_ref");
+        match read_env_nonempty(&cred.api_key_env, &ref_name, "api_key_env") {
+            Err(e) => {
+                eprintln!("{e:#}");
+                out.insert(ref_name, CredStatus::Fail);
+            }
+            Ok(api_key) => match read_env_nonempty(&cred.api_secret_env, &ref_name, "api_secret_env")
+            {
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    out.insert(ref_name, CredStatus::Fail);
+                }
+                Ok(api_secret) => {
+                    out.insert(
+                        ref_name,
+                        CredStatus::Ok(ResolvedCredentials { api_key, api_secret }),
+                    );
+                }
+            },
+        }
+    }
+    out
+}
+
 fn session_heartbeat_interval(session: &SessionConfig, conn: &ConnectionConfig) -> u64 {
     session.heartbeat_interval.unwrap_or(conn.heartbeat_interval)
 }
@@ -657,6 +849,21 @@ fn session_reconnect_backoff_ms(session: &SessionConfig, conn: &ConnectionConfig
 
 fn connect_addr(session: &SessionConfig) -> String {
     format!("{}:{}", session.host, session.port)
+}
+
+/// One attempt. No retry. No FIX bytes. Drop the stream immediately on success.
+/// Bounds DNS + connect together.
+async fn check_tcp_reachable(host: &str, port: u16, timeout: Duration) -> Result<(), TcpCheckErr> {
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect((host, port))).await {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            Ok(())
+        }
+        Ok(Err(e)) => Err(TcpCheckErr::Io(e)),
+        Err(_elapsed) => Err(TcpCheckErr::Timeout {
+            secs: timeout.as_secs(),
+        }),
+    }
 }
 
 fn load_trust_anchors(path: &str) -> Result<Vec<native_tls::Certificate>> {
@@ -1585,6 +1792,26 @@ impl FIXSession {
                 error!("🔒 TLS handshake failed (sni={}): {e}", self.tls_domain);
                 Err(anyhow!("🔒 TLS handshake failed: {e}"))
             }
+        }
+    }
+
+    /// Single attempt. Stores stream + ConnectionState::Connected on success.
+    /// Does NOT set Ready. Does NOT record ReconnectStorm. Does NOT retry.
+    /// Calls `dial_session_stream` (plain TCP or TLS handshake as live).
+    async fn connect_once(&self, gateway_url: &str, timeout: Duration) -> Result<(), TcpCheckErr> {
+        match tokio::time::timeout(timeout, self.dial_session_stream(gateway_url)).await {
+            Ok(Ok(stream)) => {
+                *self.stream.lock().await = Some(stream);
+                *self.connection_state.lock().await = ConnectionState::Connected;
+                Ok(())
+            }
+            Ok(Err(e)) => Err(TcpCheckErr::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e.to_string(),
+            ))),
+            Err(_elapsed) => Err(TcpCheckErr::Timeout {
+                secs: timeout.as_secs(),
+            }),
         }
     }
 
@@ -6855,6 +7082,309 @@ async fn display_market_data_debug(sessions: &[(Arc<FIXSession>, String, u16)]) 
     println!("╚════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝");
 }
 
+async fn wait_logon_ack(session: &FIXSession, budget: Duration) -> LogonAck {
+    let start = Instant::now();
+    loop {
+        let remaining = budget.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
+            return LogonAck::Timeout {
+                secs: budget.as_secs(),
+            };
+        }
+        match tokio::time::timeout(remaining, session.receive_message()).await {
+            Err(_elapsed) => {
+                return LogonAck::Timeout {
+                    secs: budget.as_secs(),
+                };
+            }
+            Ok(Ok(msg)) => match msg.msg_type {
+                'A' => return LogonAck::Ok,
+                '3' => return LogonAck::Reject,
+                '5' => return LogonAck::Logout,
+                _ => continue,
+            },
+            Ok(Err(e)) => {
+                let s = e.to_string();
+                if s.contains("waiting for more data") || s.contains("waiting for message start") {
+                    continue;
+                }
+                return LogonAck::Io(s);
+            }
+        }
+    }
+}
+
+async fn drop_preflight_session(session: &FIXSession) {
+    *session.stream.lock().await = None;
+    *session.connection_state.lock().await = ConnectionState::Disconnected;
+    *session.is_connected.lock().await = false;
+}
+
+async fn run_logon_check_session(
+    session_cfg: &SessionConfig,
+    creds: &CredStatus,
+    conn: &ConnectionConfig,
+    timeout: Duration,
+) -> LogonCheckOutcome {
+    let addr = connect_addr(session_cfg);
+    let name = session_cfg.name.as_str();
+    match creds {
+        CredStatus::Fail => {
+            let tcp = check_tcp_reachable(&session_cfg.host, session_cfg.port, timeout).await;
+            let reachable = tcp.is_ok();
+            if let Err(e) = tcp {
+                eprintln!("session '{name}' {addr}: {e}");
+            }
+            LogonCheckOutcome {
+                reachable,
+                logon: LogonCell::Fail,
+            }
+        }
+        CredStatus::Ok(resolved) => {
+            let session = FIXSession::new_with_credentials(
+                &session_cfg.sender_comp_id,
+                &session_cfg.target_comp_id,
+                &resolved.api_key,
+                &resolved.api_secret,
+            )
+            .with_transport(
+                session_cfg.tls.is_enabled(),
+                session_cfg.tls_ca_path.clone(),
+                session_cfg
+                    .tls_server_name
+                    .clone()
+                    .unwrap_or_else(|| session_cfg.host.clone()),
+            );
+            if let Err(e) = session.connect_once(&addr, timeout).await {
+                eprintln!("session '{name}' {addr}: {e}");
+                return LogonCheckOutcome {
+                    reachable: false,
+                    logon: LogonCell::Fail,
+                };
+            }
+
+            let hb = session_heartbeat_interval(session_cfg, conn);
+            let sent = match session_cfg.role {
+                SessionRole::OrderManagement => {
+                    match tokio::time::timeout(timeout, session.logon(hb)).await {
+                        Ok(Ok(())) => true,
+                        Ok(Err(e)) => {
+                            eprintln!("session '{name}' logon: {e}");
+                            false
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "session '{name}' logon: timed out after {}s",
+                                timeout.as_secs()
+                            );
+                            false
+                        }
+                    }
+                }
+                SessionRole::MarketData => {
+                    match tokio::time::timeout(timeout, session.logon_market_data(hb)).await {
+                        Ok(Ok(())) => true,
+                        Ok(Err(e)) => {
+                            eprintln!("session '{name}' logon: {e}");
+                            false
+                        }
+                        Err(_) => {
+                            eprintln!(
+                                "session '{name}' logon: timed out after {}s",
+                                timeout.as_secs()
+                            );
+                            false
+                        }
+                    }
+                }
+            };
+
+            let logon = if sent {
+                match wait_logon_ack(&session, timeout).await {
+                    LogonAck::Ok => LogonCell::Ok,
+                    LogonAck::Reject => {
+                        eprintln!("session '{name}' logon: reject");
+                        LogonCell::Fail
+                    }
+                    LogonAck::Logout => {
+                        eprintln!("session '{name}' logon: logout");
+                        LogonCell::Fail
+                    }
+                    LogonAck::Timeout { secs } => {
+                        eprintln!("session '{name}' logon: timed out after {secs}s");
+                        LogonCell::Fail
+                    }
+                    LogonAck::Io(s) => {
+                        eprintln!("session '{name}' logon: {s}");
+                        LogonCell::Fail
+                    }
+                }
+            } else {
+                LogonCell::Fail
+            };
+
+            if sent {
+                let _ = tokio::time::timeout(timeout, session.logout()).await;
+            }
+            drop_preflight_session(&session).await;
+            LogonCheckOutcome {
+                reachable: true,
+                logon,
+            }
+        }
+    }
+}
+
+fn format_table(rows: &[PreflightRow]) -> String {
+    let headers = ["session", "role", "host:port", "creds", "reachable", "logon"];
+    let mut cells: Vec<[String; 6]> = Vec::with_capacity(rows.len());
+    for r in rows {
+        let creds = if r.creds_ok { "ok" } else { "fail" };
+        let reachable = if r.reachable { "true" } else { "false" };
+        let logon = match r.logon {
+            LogonCell::Skipped => "skipped",
+            LogonCell::Ok => "ok",
+            LogonCell::Fail => "fail",
+        };
+        cells.push([
+            r.session.clone(),
+            r.role.to_string(),
+            r.addr.clone(),
+            creds.to_string(),
+            reachable.to_string(),
+            logon.to_string(),
+        ]);
+    }
+    let mut widths = [0usize; 6];
+    for (i, h) in headers.iter().enumerate() {
+        widths[i] = h.len();
+    }
+    for row in &cells {
+        for (i, c) in row.iter().enumerate() {
+            widths[i] = widths[i].max(c.len());
+        }
+    }
+    let pad = |s: &str, w: usize| format!("{s:<w$}");
+    let mut out = String::new();
+    let header_line = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| pad(h, widths[i]))
+        .collect::<Vec<_>>()
+        .join("  ");
+    out.push_str(header_line.trim_end());
+    out.push('\n');
+    for row in &cells {
+        let line = row
+            .iter()
+            .enumerate()
+            .map(|(i, c)| pad(c, widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ");
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+fn print_table(rows: &[PreflightRow]) {
+    print!("{}", format_table(rows));
+}
+
+fn preflight_exit_code(rows: &[PreflightRow], logon_check: bool) -> i32 {
+    for row in rows {
+        if !row.creds_ok || !row.reachable {
+            return 1;
+        }
+        if logon_check && !matches!(row.logon, LogonCell::Ok) {
+            return 1;
+        }
+    }
+    0
+}
+
+async fn run_preflight(cli: &Cli) -> i32 {
+    let timeout = Duration::from_secs(cli.timeout_secs);
+
+    let mut config = match load_config(&cli.config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e:#}");
+            return 1;
+        }
+    };
+    if let Err(e) = validate_config(&mut config) {
+        eprintln!("{e:#}");
+        return 1;
+    }
+
+    let cred_map = collect_credentials(&config);
+    let n = config.sessions.len();
+    eprintln!(
+        "Checking {n} session{}. Timeout {}s. Logon check is {}.",
+        if n == 1 { "" } else { "s" },
+        cli.timeout_secs,
+        if cli.logon_check { "on" } else { "off" },
+    );
+    let mut rows: Vec<PreflightRow> = Vec::with_capacity(n);
+
+    if !cli.logon_check {
+        let mut tcp_results: Vec<Option<Result<(), TcpCheckErr>>> = (0..n).map(|_| None).collect();
+        let mut set: JoinSet<(usize, Result<(), TcpCheckErr>)> = JoinSet::new();
+        for (i, session) in config.sessions.iter().enumerate() {
+            let host = session.host.clone();
+            let port = session.port;
+            set.spawn(async move { (i, check_tcp_reachable(&host, port, timeout).await) });
+        }
+        while let Some(joined) = set.join_next().await {
+            if let Ok((i, result)) = joined {
+                tcp_results[i] = Some(result);
+            }
+        }
+        for (i, session) in config.sessions.iter().enumerate() {
+            let creds_ok = matches!(
+                cred_map.get(&session.credentials_ref),
+                Some(CredStatus::Ok(_))
+            );
+            let tcp = tcp_results[i].take().unwrap_or_else(|| {
+                Err(TcpCheckErr::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "tcp check did not complete",
+                )))
+            });
+            let reachable = tcp.is_ok();
+            if let Err(e) = &tcp {
+                eprintln!("session '{}' {}: {}", session.name, connect_addr(session), e);
+            }
+            rows.push(PreflightRow {
+                session: session.name.clone(),
+                role: session.role,
+                addr: connect_addr(session),
+                creds_ok,
+                reachable,
+                logon: LogonCell::Skipped,
+            });
+        }
+    } else {
+        let fail = CredStatus::Fail;
+        for session in &config.sessions {
+            let creds = cred_map.get(&session.credentials_ref).unwrap_or(&fail);
+            let creds_ok = matches!(creds, CredStatus::Ok(_));
+            let out = run_logon_check_session(session, creds, &config.connection, timeout).await;
+            rows.push(PreflightRow {
+                session: session.name.clone(),
+                role: session.role,
+                addr: connect_addr(session),
+                creds_ok,
+                reachable: out.reachable,
+                logon: out.logon,
+            });
+        }
+    }
+
+    print_table(&rows);
+    preflight_exit_code(&rows, cli.logon_check)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -6862,15 +7392,35 @@ async fn main() -> Result<()> {
         .filter_level(log::LevelFilter::Info)
         .init();
 
+    let cli = match parse_cli(std::env::args().skip(1)) {
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+        Ok(CliParse::Help) => {
+            print_preflight_help();
+            std::process::exit(0);
+        }
+        Ok(CliParse::Run(c)) => c,
+    };
+
+    if cli.preflight {
+        let code = run_preflight(&cli).await;
+        std::process::exit(code);
+    }
+
     startup_note("starting");
 
-    let mut config = match load_config() {
+    let mut config = match load_config(&cli.config_path) {
         Ok(c) => {
-            startup_note("config.toml loaded");
+            startup_note(&format!("{} loaded", cli.config_path));
             c
         }
         Err(e) => {
-            startup_note(&format!("FATAL: could not load config.toml: {e:#}"));
+            startup_note(&format!(
+                "FATAL: could not load {}: {e:#}",
+                cli.config_path
+            ));
             return Err(e);
         }
     };
@@ -7531,11 +8081,20 @@ symbol_routing = "all"
     fn parse_config_prd3_example_file() {
         let src = include_str!("../config.prd3.example.toml");
         let c = parse_config(src).unwrap();
-        assert_eq!(c.sessions.len(), 5);
-        assert!(c
+        assert_eq!(c.sessions.len(), 6);
+
+        let om = c
             .sessions
             .iter()
-            .all(|s| s.role != SessionRole::OrderManagement));
+            .find(|s| s.name == "prd3_om")
+            .expect("prd3_om row");
+        assert_eq!(om.role, SessionRole::OrderManagement);
+        assert_eq!(om.port, 31302);
+        assert_eq!(om.credentials_ref, "PRD3");
+        assert!(src.contains("name             = \"prd3_om\""));
+        assert!(!src.contains("# NOT ENABLED — order entry pending separate approval"));
+        assert!(src.contains("config.prd3.toml"));
+        assert!(!src.contains("Copy to config.toml"));
 
         let first_md = c
             .sessions
@@ -7596,7 +8155,6 @@ symbol_routing = "all"
             c.credentials["PRD3"].api_secret_env,
             "CRYPTOCOM_PRD3_API_SECRET"
         );
-        assert!(src.contains("# NOT ENABLED — order entry pending separate approval"));
         assert!(src.contains("31302"));
         assert!(src.contains("REPLACE_WITH_VENUE_ASSIGNED_"));
         assert!(!src.contains("api_key ="));
@@ -7607,6 +8165,155 @@ symbol_routing = "all"
         assert_eq!(c.connection.heartbeat_interval, 30);
         assert_eq!(c.connection.max_reconnect_attempts, 10);
         assert_eq!(c.connection.reconnect_backoff_ms, 1000);
+    }
+
+    fn usage_err(args: &[&str]) -> String {
+        match parse_cli(args.iter().copied()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected usage error for {args:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_help_wins_even_with_garbage() {
+        match parse_cli(["--preflight", "--nope", "--help"]) {
+            Ok(CliParse::Help) => {}
+            other => panic!("expected Help, got {other:?}"),
+        }
+        match parse_cli(["-h", "--timeout-secs", "0"]) {
+            Ok(CliParse::Help) => {}
+            other => panic!("expected Help, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_preflight_defaults() {
+        match parse_cli(["--preflight"]) {
+            Ok(CliParse::Run(c)) => {
+                assert!(c.preflight);
+                assert_eq!(c.config_path, "config.toml");
+                assert!(!c.logon_check);
+                assert_eq!(c.timeout_secs, 5);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_preflight_all_flags() {
+        match parse_cli([
+            "--preflight",
+            "--config",
+            "config.prd3.toml",
+            "--logon-check",
+            "--timeout-secs",
+            "7",
+        ]) {
+            Ok(CliParse::Run(c)) => {
+                assert!(c.preflight);
+                assert_eq!(c.config_path, "config.prd3.toml");
+                assert!(c.logon_check);
+                assert_eq!(c.timeout_secs, 7);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_live_config_path() {
+        match parse_cli(["--config", "other.toml"]) {
+            Ok(CliParse::Run(c)) => {
+                assert!(!c.preflight);
+                assert_eq!(c.config_path, "other.toml");
+                assert!(!c.logon_check);
+                assert_eq!(c.timeout_secs, 5);
+            }
+            other => panic!("expected Run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_unknown_and_equals_form() {
+        let err = usage_err(&["--preflight", "--nope"]);
+        assert!(err.starts_with("fix_server: unknown argument: --nope"), "{err}");
+        assert!(err.contains(PREFLIGHT_USAGE), "{err}");
+        let err = usage_err(&["--config=foo"]);
+        assert!(
+            err.starts_with("fix_server: unknown argument: --config=foo"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn format_table_columns_left_align_without_trailing_pad() {
+        let table = format_table(&[
+            PreflightRow {
+                session: "prd3_md_others_34405".into(),
+                role: SessionRole::MarketData,
+                addr: "127.0.0.1:34405".into(),
+                creds_ok: true,
+                reachable: true,
+                logon: LogonCell::Skipped,
+            },
+            PreflightRow {
+                session: "om".into(),
+                role: SessionRole::OrderManagement,
+                addr: "127.0.0.1:1".into(),
+                creds_ok: false,
+                reachable: false,
+                logon: LogonCell::Fail,
+            },
+        ]);
+        let mut lines = table.lines();
+        let header = lines.next().expect("header");
+        let row1 = lines.next().expect("row1");
+        let row2 = lines.next().expect("row2");
+        assert!(lines.next().is_none());
+        assert!(!header.ends_with(' '));
+        assert!(!row1.ends_with(' '));
+        assert!(!row2.ends_with(' '));
+        let role_at = header.find("role").expect("role header");
+        let creds_at = header.find("creds").expect("creds header");
+        let reachable_at = header.find("reachable").expect("reachable header");
+        let logon_at = header.find("logon").expect("logon header");
+        assert_eq!(&row1[role_at..role_at + 11], "market_data");
+        assert_eq!(&row2[role_at..role_at + 16], "order_management");
+        assert_eq!(&row1[creds_at..creds_at + 2], "ok");
+        assert_eq!(&row2[creds_at..creds_at + 4], "fail");
+        assert_eq!(&row1[reachable_at..reachable_at + 4], "true");
+        assert_eq!(&row2[reachable_at..reachable_at + 5], "false");
+        assert_eq!(&row1[logon_at..], "skipped");
+        assert_eq!(&row2[logon_at..], "fail");
+        assert!(header.contains("host:port"));
+    }
+
+    #[test]
+    fn parse_cli_timeout_and_logon_require_preflight() {
+        let err = usage_err(&["--logon-check"]);
+        assert!(
+            err.starts_with("fix_server: --logon-check requires --preflight"),
+            "{err}"
+        );
+        let err = usage_err(&["--timeout-secs", "5"]);
+        assert!(
+            err.starts_with("fix_server: --timeout-secs requires --preflight"),
+            "{err}"
+        );
+        let err = usage_err(&["--preflight", "--timeout-secs", "0"]);
+        assert!(
+            err.starts_with("fix_server: --timeout-secs must be a positive integer"),
+            "{err}"
+        );
+        let err = usage_err(&["--preflight", "--timeout-secs"]);
+        assert!(
+            err.starts_with("fix_server: --timeout-secs must be a positive integer"),
+            "{err}"
+        );
+        let err = usage_err(&["--preflight", "--config"]);
+        assert!(
+            err.starts_with("fix_server: --config requires a path"),
+            "{err}"
+        );
     }
 
     #[test]
