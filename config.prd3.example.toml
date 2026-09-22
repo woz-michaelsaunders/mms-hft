@@ -11,6 +11,13 @@
 # Keep BTC 34402 first among MD. Do not put ETH first.
 # Adding a session = append [[sessions]] + restart, zero main.rs change.
 # host is a hostname, NOT a URL — do not paste tcp://…
+#
+# TLS is opt-in per [[sessions]] row and defaults off (omit `tls`, or tls = false).
+# Plain TCP + TCP_NODELAY is unchanged until a venue requires an encrypted socket:
+#   tls = true
+#   tls_ca_path = "certs/venue-ca.pem"     # optional exclusive trust-anchor PEM/DER
+#   tls_server_name = "fix.example.com"    # optional SNI / hostname verify (defaults to host)
+# Do not set tls = true here until the venue confirms the PrivateLink TLS requirement.
 
 [subscriptions]
 symbols = ["BTC_USDT", "BTC_USD", "BTCUSD-PERP"]

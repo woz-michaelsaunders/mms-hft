@@ -1,0 +1,414 @@
+{
+  "dark": {
+    "live_elements": [
+      {
+        "selector": "body",
+        "text": "Wozinga HFT platform\n                \n                    Markets 2\n            ",
+        "fg": "#e8eef2",
+        "bg": "#161c22",
+        "ratio": 14.67,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": ".md-strip-title",
+        "text": "Market data sessions",
+        "fg": "#e8eef2",
+        "bg": "#161c22",
+        "ratio": 14.67,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": ".md-strip-lead",
+        "text": "Live session health, sampled without waiting on book locks. A skipped sample is ",
+        "fg": "#a9b6c2",
+        "bg": "#161c22",
+        "ratio": 8.3,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#mdStatusRefreshBtn",
+        "text": "Check sessions",
+        "fg": "#08131f",
+        "bg": "#4c8dff",
+        "ratio": 5.84,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#mdStatusBanner",
+        "text": "No market-data sessionsNo sessions are registered. They appear here when the ser",
+        "fg": "#a9b6c2",
+        "bg": "#232d37",
+        "ratio": 6.76,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#mdStatusBanner .house-banner-title",
+        "text": "No market-data sessions",
+        "fg": "#a9b6c2",
+        "bg": "#161c22",
+        "ratio": 8.3,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#mdStatusEmpty p",
+        "text": "Use Check sessions after the process is up. This strip lists every market-data F",
+        "fg": "#a9b6c2",
+        "bg": "#161c22",
+        "ratio": 8.3,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "label[for=\"symbolSelect\"]",
+        "text": "Symbol",
+        "fg": "#e8eef2",
+        "bg": "#161c22",
+        "ratio": 14.67,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#symbolSelect",
+        "text": "BTC_USDTETH_USDT",
+        "fg": "#e8eef2",
+        "bg": "#232d37",
+        "ratio": 11.95,
+        "pass_aa": true,
+        "disabled": false
+      }
+    ],
+    "token_pairs": [
+      {
+        "fg_token": "--text",
+        "bg_token": "--bg",
+        "fg": "#e8eef2",
+        "bg": "#161c22",
+        "use": "body text on page",
+        "ratio": 14.67,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text",
+        "bg_token": "--surface",
+        "fg": "#e8eef2",
+        "bg": "#1c242c",
+        "use": "body text on surface",
+        "ratio": 13.41,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text-muted",
+        "bg_token": "--bg",
+        "fg": "#a9b6c2",
+        "bg": "#161c22",
+        "use": "muted lead on page",
+        "ratio": 8.3,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text-muted",
+        "bg_token": "--surface",
+        "fg": "#a9b6c2",
+        "bg": "#1c242c",
+        "use": "muted on surface",
+        "ratio": 7.59,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--danger",
+        "bg_token": "--danger-bg",
+        "fg": "#ff6b6b",
+        "bg": "#3a1414",
+        "use": "error banner",
+        "ratio": 5.87,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--success",
+        "bg_token": "--success-bg",
+        "fg": "#3fbf60",
+        "bg": "#10301d",
+        "use": "success banner / ready chip",
+        "ratio": 6.04,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--info",
+        "bg_token": "--info-bg",
+        "fg": "#58a6ff",
+        "bg": "#10233d",
+        "use": "loading banner",
+        "ratio": 6.25,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--warning",
+        "bg_token": "--warning-bg",
+        "fg": "#e0ac1f",
+        "bg": "#332707",
+        "use": "skipped-sample chip",
+        "ratio": 7.04,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--accent-contrast",
+        "bg_token": "--accent",
+        "fg": "#08131f",
+        "bg": "#4c8dff",
+        "use": "Check sessions primary button",
+        "ratio": 5.84,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text",
+        "bg_token": "--surface-2",
+        "fg": "#e8eef2",
+        "bg": "#232d37",
+        "use": "input text on field surface",
+        "ratio": 11.95,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text-faint",
+        "bg_token": "--bg",
+        "fg": "#8b98a4",
+        "bg": "#161c22",
+        "use": "faint status",
+        "ratio": 5.82,
+        "pass_aa": true
+      }
+    ],
+    "tokens": {
+      "--bg": "#161c22",
+      "--surface": "#1c242c",
+      "--surface-2": "#232d37",
+      "--text": "#e8eef2",
+      "--text-muted": "#a9b6c2",
+      "--text-faint": "#8b98a4",
+      "--border": "#333d47",
+      "--accent": "#4c8dff",
+      "--accent-contrast": "#08131f",
+      "--accent-hover": "#6ba0ff",
+      "--success": "#3fbf60",
+      "--success-bg": "#10301d",
+      "--warning": "#e0ac1f",
+      "--warning-bg": "#332707",
+      "--danger": "#ff6b6b",
+      "--danger-bg": "#3a1414",
+      "--info": "#58a6ff",
+      "--info-bg": "#10233d"
+    }
+  },
+  "light": {
+    "live_elements": [
+      {
+        "selector": "body",
+        "text": "Wozinga HFT platform\n                \n                    Markets 2\n            ",
+        "fg": "#1b2430",
+        "bg": "#f5f7fa",
+        "ratio": 14.58,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": ".md-strip-title",
+        "text": "Market data sessions",
+        "fg": "#1b2430",
+        "bg": "#f5f7fa",
+        "ratio": 14.58,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": ".md-strip-lead",
+        "text": "Live session health, sampled without waiting on book locks. A skipped sample is ",
+        "fg": "#4c5a68",
+        "bg": "#f5f7fa",
+        "ratio": 6.59,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#mdStatusRefreshBtn",
+        "text": "Check sessions",
+        "fg": "#ffffff",
+        "bg": "#1f5fd6",
+        "ratio": 5.73,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#mdStatusBanner",
+        "text": "No market-data sessionsNo sessions are registered. They appear here when the ser",
+        "fg": "#4c5a68",
+        "bg": "#eef1f5",
+        "ratio": 6.24,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#mdStatusBanner .house-banner-title",
+        "text": "No market-data sessions",
+        "fg": "#4c5a68",
+        "bg": "#f5f7fa",
+        "ratio": 6.59,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#mdStatusEmpty p",
+        "text": "Use Check sessions after the process is up. This strip lists every market-data F",
+        "fg": "#4c5a68",
+        "bg": "#f5f7fa",
+        "ratio": 6.59,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "label[for=\"symbolSelect\"]",
+        "text": "Symbol",
+        "fg": "#1b2430",
+        "bg": "#f5f7fa",
+        "ratio": 14.58,
+        "pass_aa": true,
+        "disabled": false
+      },
+      {
+        "selector": "#symbolSelect",
+        "text": "BTC_USDTETH_USDT",
+        "fg": "#1b2430",
+        "bg": "#eef1f5",
+        "ratio": 13.82,
+        "pass_aa": true,
+        "disabled": false
+      }
+    ],
+    "token_pairs": [
+      {
+        "fg_token": "--text",
+        "bg_token": "--bg",
+        "fg": "#1b2430",
+        "bg": "#f5f7fa",
+        "use": "body text on page",
+        "ratio": 14.58,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text",
+        "bg_token": "--surface",
+        "fg": "#1b2430",
+        "bg": "#ffffff",
+        "use": "body text on surface",
+        "ratio": 15.65,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text-muted",
+        "bg_token": "--bg",
+        "fg": "#4c5a68",
+        "bg": "#f5f7fa",
+        "use": "muted lead on page",
+        "ratio": 6.59,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text-muted",
+        "bg_token": "--surface",
+        "fg": "#4c5a68",
+        "bg": "#ffffff",
+        "use": "muted on surface",
+        "ratio": 7.07,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--danger",
+        "bg_token": "--danger-bg",
+        "fg": "#b4232a",
+        "bg": "#fbe6e6",
+        "use": "error banner",
+        "ratio": 5.46,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--success",
+        "bg_token": "--success-bg",
+        "fg": "#1a7f37",
+        "bg": "#e5f6ea",
+        "use": "success banner / ready chip",
+        "ratio": 4.52,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--info",
+        "bg_token": "--info-bg",
+        "fg": "#0969da",
+        "bg": "#e6f0fd",
+        "use": "loading banner",
+        "ratio": 4.51,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--warning",
+        "bg_token": "--warning-bg",
+        "fg": "#8a6400",
+        "bg": "#fbf1d6",
+        "use": "skipped-sample chip",
+        "ratio": 4.78,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--accent-contrast",
+        "bg_token": "--accent",
+        "fg": "#ffffff",
+        "bg": "#1f5fd6",
+        "use": "Check sessions primary button",
+        "ratio": 5.73,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text",
+        "bg_token": "--surface-2",
+        "fg": "#1b2430",
+        "bg": "#eef1f5",
+        "use": "input text on field surface",
+        "ratio": 13.82,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text-faint",
+        "bg_token": "--bg",
+        "fg": "#5f6d7a",
+        "bg": "#f5f7fa",
+        "use": "faint status",
+        "ratio": 4.95,
+        "pass_aa": true
+      }
+    ],
+    "tokens": {
+      "--bg": "#f5f7fa",
+      "--surface": "#ffffff",
+      "--surface-2": "#eef1f5",
+      "--text": "#1b2430",
+      "--text-muted": "#4c5a68",
+      "--text-faint": "#5f6d7a",
+      "--border": "#d7dde3",
+      "--accent": "#1f5fd6",
+      "--accent-contrast": "#ffffff",
+      "--accent-hover": "#164ab0",
+      "--success": "#1a7f37",
+      "--success-bg": "#e5f6ea",
+      "--warning": "#8a6400",
+      "--warning-bg": "#fbf1d6",
+      "--danger": "#b4232a",
+      "--danger-bg": "#fbe6e6",
+      "--info": "#0969da",
+      "--info-bg": "#e6f0fd"
+    }
+  }
+}

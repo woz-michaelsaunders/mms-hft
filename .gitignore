@@ -12,3 +12,6 @@ calibration/
 
 # rotated logs (*.log alone misses .log.1 / .log.2.gz)
 *.log.*
+
+# Operator-managed venue CA files (`tls_ca_path`). Not secrets, not committed.
+certs/

@@ -27,6 +27,13 @@ api_secret_env = "CRYPTOCOM_API_SECRET"
 # tick autosave, ZMQ, algo market leg, and the web Live tab. Do not reorder
 # BTC below ETH (or any other MD row) unless you intend to move those books.
 # host is a hostname, NOT a URL — do not paste tcp://…
+#
+# TLS is opt-in per [[sessions]] row and defaults off (omit `tls`, or tls = false).
+# Plain TCP + TCP_NODELAY is unchanged until a venue requires an encrypted socket:
+#   tls = true
+#   tls_ca_path = "certs/venue-ca.pem"     # optional exclusive trust-anchor PEM/DER
+#   tls_server_name = "fix.example.com"    # optional SNI / hostname verify (defaults to host)
+# Do not set tls = true here until the venue confirms the requirement. UAT stays plain TCP.
 
 [[sessions]]
 name             = "uat_om"
