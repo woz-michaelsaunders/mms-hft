@@ -75,34 +75,32 @@ INJECTED=0
 
 print_help() {
   cat <<'EOF'
-rollback-drill.sh — UAT-only rehearsal that drives real deploy.sh and asserts rollback restores serving.
+Rollback drill — UAT-only rehearsal that drives real deploy.sh and proves rollback restores serving.
 
-USAGE
-  rollback-drill.sh                      run cases 1-4 (operator default)
-  rollback-drill.sh --all                alias of no-args
-  rollback-drill.sh --dry-run            plan cases 1-4; no pause, no lock, no snapshot
+Usage
+  rollback-drill.sh                      run cases 1–4 (primary action)
+  rollback-drill.sh --all                same as no arguments
+  rollback-drill.sh --dry-run            plan cases 1–4; do not pause, lock, or snapshot
   rollback-drill.sh --dry-run --case N   plan one case
   rollback-drill.sh --case N             rerun one case after a fail
-  rollback-drill.sh --help
+  rollback-drill.sh --help               print this help and exit
+  rollback-drill.sh --timeout-s 180      swap timeout in seconds (mutating runs only; default 180)
 
-  optional on mutating runs: --timeout-s 180   (default 180)
+Cases
+  1  Bad config schema: empty sessions (sessions = []; HFT-042). Expect automatic rollback.
+  2  Crash-loop wrapper. Expect automatic rollback even while pm2 reports online.
+  3  Starts but never logs on (host 127.0.0.1:1). Expect a warning and no automatic rollback; this drill restores.
+  4  Previous binary missing after relocate. Expect a loud fail. Skip if the loud-fail marker is not shipped.
 
-CASES
-  1  empty sessions default (sessions = []; HFT-042). Not a parse-fail. Not kdb FATAL.
-  2  crash-loop wrapper (crash-loop-fix_server.sh). pm2 autorestart=false is a box blocker.
-  3  unreachable host 127.0.0.1:1. deploy.sh must NOT auto-rollback; the drill restores.
-  4  relocate .prev between snapshot and swap; deploy.sh loud-fail if live is silent.
-     Skip if deploy.sh has no LOUD_FAIL_MISSING_PREV marker (PR3 not shipped).
-
-EXITS
-  0   pass (or Case 4 expected-skip)
+Exits
+  0   pass (or case 4 expected skip)
   1   case assertion failed
-  2   preflight / usage
-  124 hang/timeout after emergency_restore (not a Case 4 pass)
+  2   preflight or usage error
+  124 hang or timeout after emergency restore (not a case 4 pass)
 
 UAT only. The script refuses non-UAT hosts. Do not export ROLLBACK_DRILL —
 the drill sets it on the deploy.sh child; the poller unsets it.
-Does not pause, lock, or snapshot under --dry-run.
+--dry-run does not pause, lock, or snapshot. Mutating deploy stays disabled.
 EOF
 }
 
@@ -901,19 +899,19 @@ prev_layout_line() {
 
 fail_case() {
   local n=$1 reason=$2
-  say "❌ rollback-drill: case ${n} FAIL reason=${reason}"
-  err "ERROR: case ${n} failed; box should be on known-good — verify serving before anything else"
+  say "❌ rollback-drill: case ${n} failed. Reason: ${reason}."
+  err "ERROR: case ${n} failed. Confirm the box is on the known-good pair and serving before anything else."
   WORST_EXIT=1
 }
 
 pass_case() {
   local n=$1 auto=$2 dexit=$3
-  say "✅ rollback-drill: case ${n} PASS auto_rollback=${auto} deploy_exit=${dexit}"
+  say "✅ rollback-drill: case ${n} passed. Auto rollback=${auto} deploy exit=${dexit}."
 }
 
 print_dry_run() {
-  say "⚠️  --dry-run: no pause, no lock, no snapshot. Plan only."
-  say "rollback-drill plan"
+  say "⚠️  Plan only. Mutating deploy is disabled: no pause, no lock, no snapshot."
+  say "Rollback drill plan"
   say "  host          UAT (asserted by box identity, not by exported env)"
   if [[ "${#CASE_SET[@]}" -eq 4 ]]; then
     say "  cases         1 2 3 4"
@@ -925,25 +923,28 @@ print_dry_run() {
   say "  poller        ${POLLER_TIMER} + .service (will not pause)"
   say "  lock          ${LOCK_PATH} (will not take)"
   say "  timeout_s     ${SWAP_TIMEOUT_S}"
-  say "  serving       NEW Logon in pm2 logs after reload cursor + 📊 Order Book: after that Logon"
-  say "                + HTTP best_bid/best_ask > 0 when :8080 is bound"
+  say "  serving       a new Logon in pm2 logs after the reload cursor, then an order-book line after that Logon"
+  say "                plus HTTP best_bid and best_ask greater than 0 when :8080 is bound"
   say "  secrets       env values and config.toml contents will not be logged"
   say "  case 4        skip if deploy.sh has no ${LOUD_FAIL_MARKER} marker"
-  say "✅ dry-run complete"
+  say "✅ Dry-run complete. Run without --dry-run to execute the selected cases."
 }
 
 preflight() {
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    say "Checking UAT identity and current serving. Mutating deploy stays disabled until these checks pass."
+  fi
   if [[ "$(id -u)" -eq 0 ]]; then
-    die2 "ERROR: preflight: host $(hostname -s) is not the UAT box — rollback-drill is UAT only"
+    die2 "ERROR: preflight: refuse to run as root. Run as ubuntu on the UAT box."
   fi
   if [[ ! -x "$DEPLOY" ]]; then
-    die2 "ERROR: preflight: deploy.sh not found at ${DEPLOY}"
+    die2 "ERROR: preflight: deploy.sh not found at ${DEPLOY}."
   fi
   if [[ ! -f "$LIB" || ! -f "$PARSER" || ! -f "$FIXTURE" || ! -f "$EXAMPLE_CONFIG" ]]; then
-    die2 "ERROR: preflight: deploy.sh not found at ${DEPLOY}"
+    die2 "ERROR: preflight: a required sibling is missing (deploy-lib.sh, parser, fixture, or example config) next to ${DEPLOY}."
   fi
   if [[ "${#UAT_HOST_ALLOWLIST[@]}" -eq 0 ]]; then
-    err "ERROR: preflight: host $(hostname -s) is not the UAT box — rollback-drill is UAT only"
+    err "ERROR: preflight: hostname allowlist is empty. Fill the UAT host list before running."
     exit 2
   fi
   check_i1 || exit 2
@@ -1237,8 +1238,8 @@ run_case4() {
   local name=missing_prev_loud_fail
   say "✅ rollback-drill: start case=4 timeout_s=${SWAP_TIMEOUT_S}"
   if ! loud_fail_shipped; then
-    say "⚠️  Case 4 skipped: loud-fail not shipped on this box (no ${LOUD_FAIL_MARKER} in deploy.sh). Not a failure."
-    say "✅ rollback-drill: case 4 SKIP"
+    say "⚠️  Case 4 skipped: loud-fail is not shipped on this box (no ${LOUD_FAIL_MARKER} in deploy.sh). This is not a failure."
+    say "✅ rollback-drill: case 4 skipped."
     record_case 4 "$name" skip loud_fail_not_yet_implemented false "" "" "" ""
     return 0
   fi
@@ -1380,21 +1381,21 @@ for o in rows:
     res = (o.get("result") or "").upper()
     if res == "PASS":
         p += 1
-        print("case {n}  PASS  downtime_ms={d}  serving_confirmed_ms={c}  auto_rollback={a}  deploy_exit={e}".format(
+        print("case {n}  passed  downtime_ms={d}  serving_confirmed_ms={c}  auto_rollback={a}  deploy_exit={e}".format(
             n=n, d=o.get("downtime_ms"), c=o.get("serving_confirmed_ms"),
             a=str(o.get("auto_rollback")).lower() if isinstance(o.get("auto_rollback"), bool) else o.get("auto_rollback"),
             e=o.get("deploy_exit")))
     elif res == "SKIP":
         s += 1
-        print("case {n}  SKIP  reason={r}".format(n=n, r=o.get("reason")))
+        print("case {n}  skipped  reason={r}".format(n=n, r=o.get("reason")))
     elif res == "TIMEOUT":
         t += 1
         f += 1
-        print("case {n}  FAIL  reason=timeout".format(n=n))
+        print("case {n}  failed  reason=timeout".format(n=n))
     else:
         f += 1
-        print("case {n}  FAIL  reason={r}".format(n=n, r=o.get("reason")))
-print("p=%d s=%d f=%d" % (p, s, f))
+        print("case {n}  failed  reason={r}".format(n=n, r=o.get("reason")))
+print("passed=%d skipped=%d failed=%d" % (p, s, f))
 PY
   fi
 }
@@ -1492,18 +1493,18 @@ for o in rows:
         auto = o.get("auto_rollback")
         if isinstance(auto, bool):
             auto = "true" if auto else "false"
-        print("case {n}  PASS  downtime_ms={d}  serving_confirmed_ms={c}  auto_rollback={a}   deploy_exit={e}".format(
+        print("case {n}  passed  downtime_ms={d}  serving_confirmed_ms={c}  auto_rollback={a}   deploy_exit={e}".format(
             n=n, d=o.get("downtime_ms"), c=o.get("serving_confirmed_ms"), a=auto, e=o.get("deploy_exit")))
     elif res == "skip":
-        print("case {n}  SKIP  reason={r}".format(n=n, r=o.get("reason")))
+        print("case {n}  skipped  reason={r}".format(n=n, r=o.get("reason")))
     else:
-        print("case {n}  FAIL  reason={r}".format(n=n, r=o.get("reason") or res))
+        print("case {n}  failed  reason={r}".format(n=n, r=o.get("reason") or res))
 PY
     local line
     if [[ "$WORST_EXIT" -eq 0 ]]; then
-      say "✅ rollback-drill: ALL complete (${p} pass, ${s} skip, ${f} fail)"
+      say "✅ rollback-drill: all selected cases complete (${p} passed, ${s} skipped, ${f} failed)."
     else
-      say "❌ rollback-drill: ALL complete (${p} pass, ${s} skip, ${f} fail)"
+      say "❌ rollback-drill: all selected cases complete (${p} passed, ${s} skipped, ${f} failed)."
     fi
     say "jsonl ${JSONL}"
   fi
