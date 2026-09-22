@@ -1,11 +1,13 @@
 # PRD3 PrivateLink template — docs, not deployed.
-# Copy to config.toml, fill CompIDs, export CRYPTOCOM_PRD3_API_KEY / CRYPTOCOM_PRD3_API_SECRET.
-# chmod 0600 config.toml
+# Copy to config.prd3.toml (NOT config.toml — that is UAT). Fill CompIDs, export
+# CRYPTOCOM_PRD3_API_KEY / CRYPTOCOM_PRD3_API_SECRET.
+# chmod 0600 config.prd3.toml
 # Never commit secrets. Export named env vars; no defaults unlike KDB_HOST.
 #
-# This file is MD-only while orders stay commented: the process will spawn five
-# MD session task-pairs and will NOT bind :8080 (no dashboard). That is the
-# designed empty state, not a missing-feature bug.
+# Live start (`fix_server --config config.prd3.toml`) is a production cutover,
+# not a dry run. Including the OM row means a live start will spawn order entry
+# (dashboard bind is OM ∧ primary MD). Run this first:
+#   fix_server --preflight --config config.prd3.toml
 #
 # Primary-book contract: the first role = "market_data" row is autosave / ZMQ.
 # Keep BTC 34402 first among MD. Do not put ETH first.
@@ -26,15 +28,14 @@ symbols = ["BTC_USDT", "BTC_USD", "BTCUSD-PERP"]
 api_key_env    = "CRYPTOCOM_PRD3_API_KEY"
 api_secret_env = "CRYPTOCOM_PRD3_API_SECRET"
 
-# [[sessions]]
-# name             = "prd3_om"
-# role             = "order_management"
-# host             = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com"
-# port             = 31302
-# sender_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_SENDER"
-# target_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_TARGET"
-# credentials_ref  = "PRD3"
-# NOT ENABLED — order entry pending separate approval
+[[sessions]]
+name             = "prd3_om"
+role             = "order_management"
+host             = "vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com"
+port             = 31302
+sender_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_SENDER"
+target_comp_id   = "REPLACE_WITH_VENUE_ASSIGNED_TARGET"
+credentials_ref  = "PRD3"
 
 [[sessions]]
 name             = "prd3_md_btc"

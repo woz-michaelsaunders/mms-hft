@@ -5,6 +5,7 @@ venv/
 __pycache__/
 *.pyc
 config.toml
+config.prd3.toml
 *.csv
 # runtime state — live FIX sequence numbers, must not be versioned
 data/seqnum_*.txt
