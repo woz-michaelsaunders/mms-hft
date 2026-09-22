@@ -7266,23 +7266,22 @@ fn format_table(rows: &[PreflightRow]) -> String {
     }
     let pad = |s: &str, w: usize| format!("{s:<w$}");
     let mut out = String::new();
-    out.push_str(
-        &headers
-            .iter()
-            .enumerate()
-            .map(|(i, h)| pad(h, widths[i]))
-            .collect::<Vec<_>>()
-            .join("  "),
-    );
+    let header_line = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| pad(h, widths[i]))
+        .collect::<Vec<_>>()
+        .join("  ");
+    out.push_str(header_line.trim_end());
     out.push('\n');
     for row in &cells {
-        out.push_str(
-            &row.iter()
-                .enumerate()
-                .map(|(i, c)| pad(c, widths[i]))
-                .collect::<Vec<_>>()
-                .join("  "),
-        );
+        let line = row
+            .iter()
+            .enumerate()
+            .map(|(i, c)| pad(c, widths[i]))
+            .collect::<Vec<_>>()
+            .join("  ");
+        out.push_str(line.trim_end());
         out.push('\n');
     }
     out
@@ -7320,10 +7319,16 @@ async fn run_preflight(cli: &Cli) -> i32 {
     }
 
     let cred_map = collect_credentials(&config);
-    let mut rows: Vec<PreflightRow> = Vec::with_capacity(config.sessions.len());
+    let n = config.sessions.len();
+    eprintln!(
+        "Checking {n} session{}. Timeout {}s. Logon check is {}.",
+        if n == 1 { "" } else { "s" },
+        cli.timeout_secs,
+        if cli.logon_check { "on" } else { "off" },
+    );
+    let mut rows: Vec<PreflightRow> = Vec::with_capacity(n);
 
     if !cli.logon_check {
-        let n = config.sessions.len();
         let mut tcp_results: Vec<Option<Result<(), TcpCheckErr>>> = (0..n).map(|_| None).collect();
         let mut set: JoinSet<(usize, Result<(), TcpCheckErr>)> = JoinSet::new();
         for (i, session) in config.sessions.iter().enumerate() {
@@ -8237,6 +8242,49 @@ symbol_routing = "all"
             err.starts_with("fix_server: unknown argument: --config=foo"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn format_table_columns_left_align_without_trailing_pad() {
+        let table = format_table(&[
+            PreflightRow {
+                session: "prd3_md_others_34405".into(),
+                role: SessionRole::MarketData,
+                addr: "127.0.0.1:34405".into(),
+                creds_ok: true,
+                reachable: true,
+                logon: LogonCell::Skipped,
+            },
+            PreflightRow {
+                session: "om".into(),
+                role: SessionRole::OrderManagement,
+                addr: "127.0.0.1:1".into(),
+                creds_ok: false,
+                reachable: false,
+                logon: LogonCell::Fail,
+            },
+        ]);
+        let mut lines = table.lines();
+        let header = lines.next().expect("header");
+        let row1 = lines.next().expect("row1");
+        let row2 = lines.next().expect("row2");
+        assert!(lines.next().is_none());
+        assert!(!header.ends_with(' '));
+        assert!(!row1.ends_with(' '));
+        assert!(!row2.ends_with(' '));
+        let role_at = header.find("role").expect("role header");
+        let creds_at = header.find("creds").expect("creds header");
+        let reachable_at = header.find("reachable").expect("reachable header");
+        let logon_at = header.find("logon").expect("logon header");
+        assert_eq!(&row1[role_at..role_at + 11], "market_data");
+        assert_eq!(&row2[role_at..role_at + 16], "order_management");
+        assert_eq!(&row1[creds_at..creds_at + 2], "ok");
+        assert_eq!(&row2[creds_at..creds_at + 4], "fail");
+        assert_eq!(&row1[reachable_at..reachable_at + 4], "true");
+        assert_eq!(&row2[reachable_at..reachable_at + 5], "false");
+        assert_eq!(&row1[logon_at..], "skipped");
+        assert_eq!(&row2[logon_at..], "fail");
+        assert!(header.contains("host:port"));
     }
 
     #[test]

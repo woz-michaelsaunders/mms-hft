@@ -1,0 +1,182 @@
+[
+  {
+    "file": "loading-375.png",
+    "label": "Loading — Checking sessions; Run preflight disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "empty-375.png",
+    "label": "Empty — No sessions in this config; Run preflight is the primary action",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "error-375.png",
+    "label": "Error — Environment variable is not set",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "success-375.png",
+    "label": "Success — Every requested check passed; logon skipped",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-375.png",
+    "label": "Disabled — Logon check is off; FIX Logon disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "md-loading-375.png",
+    "label": "MD loading — Loading market-data sessions",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "md-empty-375.png",
+    "label": "MD empty — No market-data sessions",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "md-error-375.png",
+    "label": "MD error — Cannot reach market-data status",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "md-success-375.png",
+    "label": "MD success — Sessions sampled (the rows preflight gates)",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "md-disabled-375.png",
+    "label": "MD disabled — Check sessions off while a refresh is in flight",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "loading-768.png",
+    "label": "Loading — Checking sessions; Run preflight disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "empty-768.png",
+    "label": "Empty — No sessions in this config; Run preflight is the primary action",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "error-768.png",
+    "label": "Error — Environment variable is not set",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "success-768.png",
+    "label": "Success — Every requested check passed; logon skipped",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-768.png",
+    "label": "Disabled — Logon check is off; FIX Logon disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "md-loading-768.png",
+    "label": "MD loading — Loading market-data sessions",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "md-empty-768.png",
+    "label": "MD empty — No market-data sessions",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "md-error-768.png",
+    "label": "MD error — Cannot reach market-data status",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "md-success-768.png",
+    "label": "MD success — Sessions sampled (the rows preflight gates)",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "md-disabled-768.png",
+    "label": "MD disabled — Check sessions off while a refresh is in flight",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "loading-1280.png",
+    "label": "Loading — Checking sessions; Run preflight disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "empty-1280.png",
+    "label": "Empty — No sessions in this config; Run preflight is the primary action",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "error-1280.png",
+    "label": "Error — Environment variable is not set",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "success-1280.png",
+    "label": "Success — Every requested check passed; logon skipped",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-1280.png",
+    "label": "Disabled — Logon check is off; FIX Logon disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "md-loading-1280.png",
+    "label": "MD loading — Loading market-data sessions",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "md-empty-1280.png",
+    "label": "MD empty — No market-data sessions",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "md-error-1280.png",
+    "label": "MD error — Cannot reach market-data status",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "md-success-1280.png",
+    "label": "MD success — Sessions sampled (the rows preflight gates)",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "md-disabled-1280.png",
+    "label": "MD disabled — Check sessions off while a refresh is in flight",
+    "width": "1280",
+    "overflowing": false
+  }
+]

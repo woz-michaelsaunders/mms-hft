@@ -1,0 +1,317 @@
+[
+  {
+    "file": "loading-375.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-375.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-375.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-375.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-375.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "md-loading-375.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-empty-375.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-error-375.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-success-375.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-disabled-375.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "loading-768.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-768.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-768.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-768.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-768.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "md-loading-768.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-empty-768.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-error-768.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-success-768.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-disabled-768.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "loading-1280.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-1280.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-1280.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-1280.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-1280.png",
+    "surface": "cli",
+    "labelledConfig": true,
+    "labelledTimeout": true,
+    "configLabel": "Config path",
+    "timeoutLabel": "Timeout (seconds)",
+    "primaryAction": "Run preflight",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "md-loading-1280.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-empty-1280.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-error-1280.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-success-1280.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  },
+  {
+    "file": "md-disabled-1280.png",
+    "surface": "md",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasPreflightChrome": false
+  }
+]
