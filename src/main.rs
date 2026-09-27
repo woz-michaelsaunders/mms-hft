@@ -537,6 +537,40 @@ fn parse_config(toml_str: &str) -> Result<Config> {
         .map_err(|e| anyhow!("Failed to parse config file: {}", e))
 }
 
+/// Tags whose values are credentials or authentication material and must never
+/// reach a log file. 553 is the API key itself, 554 the HMAC signature, 554's
+/// input includes the key, and 96/95 are the nonce the signature is computed
+/// over. Logs are 0644 and rotate rather than shred, so anything printed here
+/// outlives the process on disk — the whole point of moving secrets out of
+/// config.toml into a 0600 env file was to keep them off disk.
+fn is_secret_tag(tag: usize) -> bool {
+    matches!(tag, 553 | 554)
+}
+
+/// Render a field value for logging, redacting credential tags.
+fn redact_tag(tag: usize, value: &str) -> String {
+    if is_secret_tag(tag) {
+        format!("<redacted {} chars>", value.len())
+    } else {
+        value.to_string()
+    }
+}
+
+/// Redact credential fields out of a rendered FIX message before logging it.
+/// Operates on the pipe- or SOH-delimited form.
+fn redact_fix_text(text: &str) -> String {
+    text.split('|')
+        .map(|field| match field.split_once('=') {
+            Some((t, v)) => match t.trim().parse::<usize>() {
+                Ok(tag) if is_secret_tag(tag) => format!("{t}=<redacted {} chars>", v.len()),
+                _ => field.to_string(),
+            },
+            None => field.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 fn parse_char_range(session_name: &str, raw: &str) -> Result<CharRange> {
     let chars: Vec<char> = raw.chars().collect();
     if chars.len() != 3 || chars[1] != '-' {
@@ -1951,8 +1985,9 @@ impl FIXSession {
         info!("  MsgSeqNum (34): {}", seq_num);
         info!("  RawData (96): {}", raw_data);
         info!("  RawDataLength (95): {}", raw_data_len);
-        info!("  Signature input: {}", signature_input);
-        info!("  Digital Signature (554): {}", signature_hex);
+        // Never log signature_input: it is "public/auth" + seq + API KEY + nonce.
+        info!("  Signature input: <redacted {} chars>", signature_input.len());
+        info!("  Digital Signature (554): <redacted {} chars>", signature_hex.len());
         self.send_message(&msg).await?;
 
         // Don't set Ready yet - wait for ACK first
@@ -4075,24 +4110,18 @@ impl FIXSession {
             for (&tag, value) in &msg.fields {
                 if tag == 96 {
                     info!("  Tag {}: {} (RawData - length: {})", tag, value, value.len());
-                } else if tag == 554 {
-                    info!("  Tag {}: {} (Password/Signature - first 16 chars: {})", tag, value, &value[..std::cmp::min(16, value.len())]);
                 } else if tag != 8 && tag != 9 && tag != 93 { // Skip checksum fields for brevity
-                    info!("  Tag {}: {}", tag, value);
+                    info!("  Tag {}: {}", tag, redact_tag(tag, value));
                 }
             }
 
-            // Log raw message hex
-            let hex_str = encoded.iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join("");
-            info!("DEBUG: Raw message (hex, first 200 chars): {}", &hex_str[..std::cmp::min(200, hex_str.len())]);
-
-            // Log readable format with SOH markers
-            let readable = String::from_utf8_lossy(&encoded)
-                .replace('\x01', "|");
-            info!("DEBUG: Readable format (first 300 chars): {}", &readable[..std::cmp::min(300, readable.len())]);
+            // The raw hex dump is the entire Logon, API key and signature
+            // included, so it cannot be logged at all for this message type.
+            // The readable form is logged with credential tags redacted.
+            let readable = redact_fix_text(
+                &String::from_utf8_lossy(&encoded).replace('\x01', "|"),
+            );
+            info!("DEBUG: Readable format (redacted, first 300 chars): {}", &readable[..std::cmp::min(300, readable.len())]);
         } else if msg.msg_type == 'D' {
             // NewOrderSingle message - log all fields for debugging
             info!("DEBUG: NewOrderSingle message fields:");
@@ -11035,5 +11064,40 @@ mod tls_connectivity_tests {
         );
         connect_and_logon(&session, listener.port).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod credential_redaction {
+    use super::*;
+
+    /// The production API key was written to fix-server-error.log in clear on
+    /// 2026-09-27 (tag 553), along with the full HMAC signature (554). Logs are
+    /// 0644 and rotate rather than shred, so anything printed outlives the
+    /// process — which defeats having moved secrets into a 0600 env file.
+    #[test]
+    fn logon_text_never_carries_the_key_or_signature() {
+        let key = "GgCUxN3bnbudpmbvqRBK43";
+        let sig = "571932fca5e7517184f54fb71bffb6652a59d63464717db8385e95aae169cc15";
+        let raw = format!(
+            "8=FIX.4.4|9=215|35=A|49=PRD3.WOZINGA_OTHERS.MD.00|56=PRD3.CDC.MD|34=1|\
+             52=20260927-17:29:40.008|95=13|96=1790530180008|98=0|108=5|553={key}|554={sig}|141=Y|10=194|"
+        );
+        let out = redact_fix_text(&raw);
+        assert!(!out.contains(key), "API key leaked: {out}");
+        assert!(!out.contains(sig), "signature leaked: {out}");
+        // Non-secret routing fields must survive, or the log stops being useful.
+        assert!(out.contains("49=PRD3.WOZINGA_OTHERS.MD.00"), "sender lost: {out}");
+        assert!(out.contains("96=1790530180008"), "nonce lost: {out}");
+        assert!(out.contains("553=<redacted 22 chars>"), "553 not redacted: {out}");
+    }
+
+    /// A 16-character prefix of a secret is still a secret.
+    #[test]
+    fn redact_tag_hides_key_and_signature_but_not_others() {
+        assert_eq!(redact_tag(553, "GgCUxN3bnbudpmbvqRBK43"), "<redacted 22 chars>");
+        assert_eq!(redact_tag(554, "571932fca5e75171"), "<redacted 16 chars>");
+        assert_eq!(redact_tag(49, "PRD3.CDC.MD"), "PRD3.CDC.MD");
+        assert_eq!(redact_tag(96, "1790530180008"), "1790530180008");
     }
 }
