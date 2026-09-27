@@ -3,7 +3,8 @@
 // Optimized for high-speed bulk inserts
 
 use anyhow::{anyhow, Result};
-use log::{debug, info, error, warn};
+use log::{debug, error, info, warn};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Utc;
@@ -53,8 +54,20 @@ fn fmt_seq(seq: Option<u32>) -> String {
     }
 }
 
+fn fmt_f64(x: f64) -> String {
+    format!("{}f", x)
+}
+
 fn kdb_now_ns() -> i64 {
     Utc::now().timestamp_nanos_opt().unwrap_or(0) - KDB_TIMESTAMP_OFFSET_NS
+}
+
+fn truncate_q_snippet(q: &str) -> String {
+    if q.len() <= 200 {
+        q.to_string()
+    } else {
+        format!("{}...", &q[..197])
+    }
 }
 
 // Batch buffer structures
@@ -72,7 +85,7 @@ struct OwnTrade {
 }
 
 #[derive(Clone)]
-struct OrderBookLevel {
+pub(crate) struct OrderBookLevel {
     timestamp: i64,
     symbol: String,
     side: char,
@@ -83,7 +96,7 @@ struct OrderBookLevel {
 }
 
 #[derive(Clone)]
-struct Trade {
+pub(crate) struct Trade {
     timestamp: i64,
     symbol: String,
     price: f64,
@@ -92,7 +105,7 @@ struct Trade {
 }
 
 #[derive(Clone)]
-struct Snapshot {
+pub(crate) struct Snapshot {
     timestamp: i64,
     symbol: String,
     best_bid: f64,
@@ -119,6 +132,669 @@ pub enum ProbeEvent {
     OverflowGap { symbol: String, drop_count: u32 },
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MdStats {
+    pub levels_enqueued: u64,
+    pub levels_flushed: u64,
+    pub levels_replay_errors: u64,
+    pub levels_flush_errors: u64,
+    pub trades_enqueued: u64,
+    pub trades_flushed: u64,
+    pub trades_replay_errors: u64,
+    pub trades_flush_errors: u64,
+    pub snapshots_enqueued: u64,
+    pub snapshots_flushed: u64,
+    pub snapshots_replay_errors: u64,
+    pub snapshots_flush_errors: u64,
+    pub flush_skips: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MdKind { Levels, Trades, Snapshots, OwnTrades, CaptureGaps }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CharCol { Side, Action }
+
+#[derive(Debug)]
+pub(crate) struct FormatSkip;
+
+#[derive(Clone, Copy, Debug)]
+enum LogKind {
+    ReplayEnqueue = 0,
+    ReplayLevel,
+    ReplayTrade,
+    ReplaySnapshot,
+    FlushQLevels,
+    FlushQTrades,
+    FlushQSnapshots,
+    FlushQOwnTrades,
+    FlushQGaps,
+    FlushTransportLevels,
+    FlushTransportTrades,
+    FlushTransportSnapshots,
+    FlushTransportOwnTrades,
+    FlushTransportGaps,
+    ClosedAlphabet,
+}
+const LOG_KIND_LEN: usize = 15;
+
+fn log_kind_for(kind: MdKind, q: bool) -> LogKind {
+    match (kind, q) {
+        (MdKind::Levels, true) => LogKind::FlushQLevels,
+        (MdKind::Trades, true) => LogKind::FlushQTrades,
+        (MdKind::Snapshots, true) => LogKind::FlushQSnapshots,
+        (MdKind::OwnTrades, true) => LogKind::FlushQOwnTrades,
+        (MdKind::CaptureGaps, true) => LogKind::FlushQGaps,
+        (MdKind::Levels, false) => LogKind::FlushTransportLevels,
+        (MdKind::Trades, false) => LogKind::FlushTransportTrades,
+        (MdKind::Snapshots, false) => LogKind::FlushTransportSnapshots,
+        (MdKind::OwnTrades, false) => LogKind::FlushTransportOwnTrades,
+        (MdKind::CaptureGaps, false) => LogKind::FlushTransportGaps,
+    }
+}
+
+struct MdCounters {
+    levels_enqueued: AtomicU64,
+    levels_flushed: AtomicU64,
+    levels_replay_errors: AtomicU64,
+    levels_flush_errors: AtomicU64,
+    trades_enqueued: AtomicU64,
+    trades_flushed: AtomicU64,
+    trades_replay_errors: AtomicU64,
+    trades_flush_errors: AtomicU64,
+    snapshots_enqueued: AtomicU64,
+    snapshots_flushed: AtomicU64,
+    snapshots_replay_errors: AtomicU64,
+    snapshots_flush_errors: AtomicU64,
+    flush_skips: AtomicU64,
+    last_log_ms: [AtomicU64; LOG_KIND_LEN],
+}
+
+impl MdCounters {
+    fn new() -> Self {
+        Self {
+            levels_enqueued: AtomicU64::new(0),
+            levels_flushed: AtomicU64::new(0),
+            levels_replay_errors: AtomicU64::new(0),
+            levels_flush_errors: AtomicU64::new(0),
+            trades_enqueued: AtomicU64::new(0),
+            trades_flushed: AtomicU64::new(0),
+            trades_replay_errors: AtomicU64::new(0),
+            trades_flush_errors: AtomicU64::new(0),
+            snapshots_enqueued: AtomicU64::new(0),
+            snapshots_flushed: AtomicU64::new(0),
+            snapshots_replay_errors: AtomicU64::new(0),
+            snapshots_flush_errors: AtomicU64::new(0),
+            flush_skips: AtomicU64::new(0),
+            last_log_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn should_log(&self, kind: LogKind) -> bool {
+        let now = Utc::now().timestamp_millis().max(0) as u64;
+        let slot = kind as usize;
+        let last = self.last_log_ms[slot].load(Ordering::Relaxed);
+        if last == 0 || now.saturating_sub(last) >= 1000 {
+            self.last_log_ms[slot].store(now, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn sampled_error(&self, kind: LogKind, msg: String) {
+        if self.should_log(kind) {
+            error!("{}", msg);
+        }
+    }
+
+    fn sampled_info(&self, kind: LogKind, msg: String) {
+        if self.should_log(kind) {
+            info!("{}", msg);
+        }
+    }
+
+    fn snapshot(&self) -> MdStats {
+        MdStats {
+            levels_enqueued: self.levels_enqueued.load(Ordering::Relaxed),
+            levels_flushed: self.levels_flushed.load(Ordering::Relaxed),
+            levels_replay_errors: self.levels_replay_errors.load(Ordering::Relaxed),
+            levels_flush_errors: self.levels_flush_errors.load(Ordering::Relaxed),
+            trades_enqueued: self.trades_enqueued.load(Ordering::Relaxed),
+            trades_flushed: self.trades_flushed.load(Ordering::Relaxed),
+            trades_replay_errors: self.trades_replay_errors.load(Ordering::Relaxed),
+            trades_flush_errors: self.trades_flush_errors.load(Ordering::Relaxed),
+            snapshots_enqueued: self.snapshots_enqueued.load(Ordering::Relaxed),
+            snapshots_flushed: self.snapshots_flushed.load(Ordering::Relaxed),
+            snapshots_replay_errors: self.snapshots_replay_errors.load(Ordering::Relaxed),
+            snapshots_flush_errors: self.snapshots_flush_errors.load(Ordering::Relaxed),
+            flush_skips: self.flush_skips.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum FlushErr {
+    Transport(anyhow::Error),
+    Q { message: String, q_snippet: String },
+}
+
+impl std::fmt::Display for FlushErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlushErr::Transport(e) => write!(f, "transport: {e}"),
+            FlushErr::Q { message, q_snippet } => {
+                write!(f, "q error '{message}' q={q_snippet}")
+            }
+        }
+    }
+}
+
+fn flush_err_q(message: impl Into<String>, q: &str) -> FlushErr {
+    FlushErr::Q {
+        message: message.into(),
+        q_snippet: truncate_q_snippet(q),
+    }
+}
+
+fn level_row_ok(l: &OrderBookLevel) -> bool {
+    matches!(l.side, 'B' | 'A') && matches!(l.action, 'N' | 'C' | 'D')
+}
+
+pub(crate) fn format_char_column(chars: &[char], kind: CharCol) -> Result<String, FormatSkip> {
+    if chars.is_empty() {
+        return Err(FormatSkip);
+    }
+    let ok = |c: char| match kind {
+        CharCol::Side => matches!(c, 'B' | 'A'),
+        CharCol::Action => matches!(c, 'N' | 'C' | 'D'),
+    };
+    if chars.iter().any(|&c| !ok(c)) {
+        return Err(FormatSkip);
+    }
+    if chars.len() == 1 {
+        Ok(format!("*\"{}\"", chars[0]))
+    } else {
+        Ok(format!("\"{}\"", chars.iter().collect::<String>()))
+    }
+}
+
+pub(crate) fn format_levels_insert_q(batch: &[OrderBookLevel]) -> Option<String> {
+    let kept: Vec<&OrderBookLevel> = batch.iter().filter(|l| level_row_ok(l)).collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let times: Vec<String> = kept.iter().map(|l| format!("`timestamp${}", l.timestamp)).collect();
+    let symbols: Vec<String> = kept.iter().map(|l| format!("`{}", l.symbol)).collect();
+    let sides: Vec<char> = kept.iter().map(|l| l.side).collect();
+    let actions: Vec<char> = kept.iter().map(|l| l.action).collect();
+    let prices: Vec<String> = kept.iter().map(|l| fmt_f64(l.price)).collect();
+    let sizes: Vec<String> = kept.iter().map(|l| fmt_f64(l.size)).collect();
+    let seqs: Vec<String> = kept.iter().map(|l| fmt_seq(l.seq_num)).collect();
+    let side_col = format_char_column(&sides, CharCol::Side)
+        .expect("kept rows are closed-alphabet; FormatSkip is a bug");
+    let action_col = format_char_column(&actions, CharCol::Action)
+        .expect("kept rows are closed-alphabet; FormatSkip is a bug");
+    let (sides_q, actions_q) = if kept.len() == 1 {
+        (format!("({})", side_col), format!("({})", action_col))
+    } else {
+        (side_col, action_col)
+    };
+    Some(format!(
+        "`orderbook_levels insert (({});({});{};({});({});{};({}))",
+        times.join(";"),
+        symbols.join(";"),
+        sides_q,
+        prices.join(";"),
+        sizes.join(";"),
+        actions_q,
+        seqs.join(";")
+    ))
+}
+
+pub(crate) fn format_trades_insert_q(batch: &[Trade]) -> Option<String> {
+    if batch.is_empty() {
+        return None;
+    }
+    let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
+    let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
+    let prices: Vec<String> = batch.iter().map(|t| fmt_f64(t.price)).collect();
+    let sizes: Vec<String> = batch.iter().map(|t| fmt_f64(t.size)).collect();
+    let seqs: Vec<String> = batch.iter().map(|t| fmt_seq(t.seq_num)).collect();
+    Some(format!(
+        "`trades insert (({});({});({});({});({}))",
+        times.join(";"),
+        symbols.join(";"),
+        prices.join(";"),
+        sizes.join(";"),
+        seqs.join(";")
+    ))
+}
+
+pub(crate) fn format_snapshots_insert_q(batch: &[Snapshot]) -> Option<String> {
+    if batch.is_empty() {
+        return None;
+    }
+    let times: Vec<String> = batch.iter().map(|s| format!("`timestamp${}", s.timestamp)).collect();
+    let symbols: Vec<String> = batch.iter().map(|s| format!("`{}", s.symbol)).collect();
+    let best_bids: Vec<String> = batch.iter().map(|s| fmt_f64(s.best_bid)).collect();
+    let best_asks: Vec<String> = batch.iter().map(|s| fmt_f64(s.best_ask)).collect();
+    let best_bid_sizes: Vec<String> = batch.iter().map(|s| fmt_f64(s.best_bid_size)).collect();
+    let best_ask_sizes: Vec<String> = batch.iter().map(|s| fmt_f64(s.best_ask_size)).collect();
+    let spreads: Vec<String> = batch.iter().map(|s| fmt_f64(s.spread)).collect();
+    let seqs: Vec<String> = batch.iter().map(|s| fmt_seq(s.seq_num)).collect();
+    Some(format!(
+        "`orderbook_snapshots insert (({});({});({});({});({});({});({});({}))",
+        times.join(";"),
+        symbols.join(";"),
+        best_bids.join(";"),
+        best_asks.join(";"),
+        best_bid_sizes.join(";"),
+        best_ask_sizes.join(";"),
+        spreads.join(";"),
+        seqs.join(";")
+    ))
+}
+
+fn format_own_trades_insert_q(batch: &[OwnTrade]) -> Option<String> {
+    if batch.is_empty() {
+        return None;
+    }
+    let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
+    let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
+    let sides: Vec<String> = batch.iter().map(|t| format!("`{}", t.side)).collect();
+    let last_pxs: Vec<String> = batch.iter().map(|t| fmt_f64(t.last_px)).collect();
+    let last_qtys: Vec<String> = batch.iter().map(|t| fmt_f64(t.last_qty)).collect();
+    let avg_pxs: Vec<String> = batch.iter().map(|t| fmt_f64(t.avg_px)).collect();
+    let cl_ord_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.cl_ord_id)).collect();
+    let order_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.order_id)).collect();
+    let exec_types: Vec<String> = batch.iter().map(|t| format!("`{}", t.exec_type)).collect();
+    Some(format!(
+        "`own_trades insert (({});({});({});({});({});({});({});({});({}))",
+        times.join(";"),
+        symbols.join(";"),
+        sides.join(";"),
+        last_pxs.join(";"),
+        last_qtys.join(";"),
+        avg_pxs.join(";"),
+        cl_ord_ids.join(";"),
+        order_ids.join(";"),
+        exec_types.join(";")
+    ))
+}
+
+fn format_capture_gaps_insert_q(batch: &[CaptureGap]) -> Option<String> {
+    if batch.is_empty() {
+        return None;
+    }
+    let times: Vec<String> = batch.iter().map(|g| format!("`timestamp${}", g.timestamp)).collect();
+    let symbols: Vec<String> = batch.iter().map(|g| {
+        format!("`$\"{}\"", escape_kdb_string(&g.symbol))
+    }).collect();
+    let expected: Vec<String> = batch.iter().map(|g| format!("{}j", g.expected_seq)).collect();
+    let received: Vec<String> = batch.iter().map(|g| format!("{}j", g.received_seq)).collect();
+    let sizes: Vec<String> = batch.iter().map(|g| format!("{}j", g.gap_size)).collect();
+    Some(format!(
+        "`capture_gaps insert (({});({});({});({});({}))",
+        times.join(";"),
+        symbols.join(";"),
+        expected.join(";"),
+        received.join(";"),
+        sizes.join(";")
+    ))
+}
+
+pub(crate) async fn execute_insert_and_check(
+    stream: &mut QStream,
+    q: &str,
+) -> Result<(), FlushErr> {
+    match stream.send_sync_message(&q).await {
+        Ok(k) if k.get_type() == qtype::ERROR => {
+            Err(flush_err_q(k.get_error_string().unwrap_or("unknown").to_string(), q))
+        }
+        Ok(_) => Ok(()),
+        Err(e) => Err(FlushErr::Transport(anyhow!("sync insert failed: {e}"))),
+    }
+}
+
+pub(crate) async fn execute_single_insert_locked(
+    stream: &mut QStream,
+    q: &str,
+) -> Result<(), FlushErr> {
+    stream
+        .send_async_message(&q)
+        .await
+        .map_err(|e| FlushErr::Transport(anyhow!("async insert failed: {e}")))
+}
+
+pub(crate) async fn bind_and_drop_connected(
+    connected: &tokio::sync::Mutex<bool>,
+) -> bool {
+    let g = connected.lock().await;
+    let v = *g;
+    drop(g);
+    v
+}
+
+async fn requeue_front<T>(buf: &Arc<tokio::sync::Mutex<VecDeque<T>>>, batch: Vec<T>) {
+    let mut g = buf.lock().await;
+    for item in batch.into_iter().rev() {
+        g.push_front(item);
+    }
+}
+
+fn bump_flush_errors(counters: &MdCounters, kind: MdKind) {
+    match kind {
+        MdKind::Levels => {
+            counters.levels_flush_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        MdKind::Trades => {
+            counters.trades_flush_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        MdKind::Snapshots => {
+            counters.snapshots_flush_errors.fetch_add(1, Ordering::Relaxed);
+        }
+        MdKind::OwnTrades | MdKind::CaptureGaps => {}
+    }
+}
+
+async fn apply_flush_result<T: Send>(
+    connected: &Arc<tokio::sync::Mutex<bool>>,
+    stream: &Arc<Mutex<Option<QStream>>>,
+    buf: &Arc<tokio::sync::Mutex<VecDeque<T>>>,
+    batch: Vec<T>,
+    sent_len: usize,
+    kind: MdKind,
+    result: Result<(), FlushErr>,
+    counters: &MdCounters,
+) {
+    match result {
+        Ok(()) => {
+            match kind {
+                MdKind::Levels => {
+                    counters.levels_flushed.fetch_add(sent_len as u64, Ordering::Relaxed);
+                }
+                MdKind::Trades => {
+                    counters.trades_flushed.fetch_add(sent_len as u64, Ordering::Relaxed);
+                }
+                MdKind::Snapshots => {
+                    counters.snapshots_flushed.fetch_add(sent_len as u64, Ordering::Relaxed);
+                }
+                MdKind::OwnTrades | MdKind::CaptureGaps => {}
+            }
+            debug!("flushed kind={:?} sent_len={}", kind, sent_len);
+        }
+        Err(FlushErr::Transport(e)) => {
+            *connected.lock().await = false;
+            let _ = stream.lock().await.take();
+            requeue_front(buf, batch).await;
+            bump_flush_errors(counters, kind);
+            counters.sampled_error(
+                log_kind_for(kind, false),
+                format!("kdb flush transport kind={:?} err={}", kind, e),
+            );
+        }
+        Err(FlushErr::Q { message, q_snippet }) => {
+            let batch_len = batch.len();
+            drop(batch);
+            bump_flush_errors(counters, kind);
+            counters.sampled_error(
+                log_kind_for(kind, true),
+                format!(
+                    "kdb flush Q kind={:?} batch_len={} message={} q={}",
+                    kind, batch_len, message, q_snippet
+                ),
+            );
+        }
+    }
+}
+
+struct StreamAbortGuard {
+    connected: Arc<tokio::sync::Mutex<bool>>,
+    stream: Arc<Mutex<Option<QStream>>>,
+    armed: bool,
+}
+
+impl StreamAbortGuard {
+    fn disarmed(
+        connected: &Arc<tokio::sync::Mutex<bool>>,
+        stream: &Arc<Mutex<Option<QStream>>>,
+    ) -> Self {
+        Self {
+            connected: Arc::clone(connected),
+            stream: Arc::clone(stream),
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StreamAbortGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(mut c) = self.connected.try_lock() {
+            *c = false;
+        }
+        if let Ok(mut s) = self.stream.try_lock() {
+            let _ = s.take();
+        }
+    }
+}
+
+async fn timer_flush_sync<T: Send>(
+    connected: &Arc<tokio::sync::Mutex<bool>>,
+    stream: &Arc<Mutex<Option<QStream>>>,
+    buf: &Arc<tokio::sync::Mutex<VecDeque<T>>>,
+    format: fn(&[T]) -> Option<String>,
+    kind: MdKind,
+    counters: &MdCounters,
+) {
+    let mut abort_guard = StreamAbortGuard::disarmed(connected, stream);
+    let mut stream_guard = stream.lock().await;
+    let qstream = match stream_guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    let mut buf_g = buf.lock().await;
+    if buf_g.is_empty() {
+        return;
+    }
+    let batch: Vec<_> = buf_g.drain(..).collect();
+    drop(buf_g);
+    let Some(q) = format(&batch) else {
+        return;
+    };
+    let sent_len = batch.len();
+    abort_guard.arm();
+    let result = execute_insert_and_check(qstream, &q).await;
+    abort_guard.disarm();
+    drop(stream_guard);
+    apply_flush_result(connected, stream, buf, batch, sent_len, kind, result, counters).await;
+}
+
+async fn timer_flush_levels(
+    connected: &Arc<tokio::sync::Mutex<bool>>,
+    stream: &Arc<Mutex<Option<QStream>>>,
+    buf: &Arc<tokio::sync::Mutex<VecDeque<OrderBookLevel>>>,
+    counters: &MdCounters,
+) {
+    let mut abort_guard = StreamAbortGuard::disarmed(connected, stream);
+    let mut stream_guard = stream.lock().await;
+    let qstream = match stream_guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    let mut buf_g = buf.lock().await;
+    if buf_g.is_empty() {
+        return;
+    }
+    let batch: Vec<_> = buf_g.drain(..).collect();
+    drop(buf_g);
+    let skipped = batch.iter().filter(|l| !level_row_ok(l)).count();
+    if skipped > 0 {
+        counters.levels_flush_errors.fetch_add(skipped as u64, Ordering::Relaxed);
+        counters.sampled_error(
+            LogKind::ClosedAlphabet,
+            format!(
+                "kdb closed-alphabet skip kind=levels skipped={} batch_len={}",
+                skipped,
+                batch.len()
+            ),
+        );
+    }
+    let Some(q) = format_levels_insert_q(&batch) else {
+        return;
+    };
+    let sent_len = batch.len() - skipped;
+    abort_guard.arm();
+    let result = execute_insert_and_check(qstream, &q).await;
+    abort_guard.disarm();
+    drop(stream_guard);
+    apply_flush_result(
+        connected,
+        stream,
+        buf,
+        batch,
+        sent_len,
+        MdKind::Levels,
+        result,
+        counters,
+    )
+    .await;
+}
+
+async fn timer_flush_async<T: Send>(
+    connected: &Arc<tokio::sync::Mutex<bool>>,
+    stream: &Arc<Mutex<Option<QStream>>>,
+    buf: &Arc<tokio::sync::Mutex<VecDeque<T>>>,
+    format: fn(&[T]) -> Option<String>,
+    kind: MdKind,
+    counters: &MdCounters,
+) {
+    let mut abort_guard = StreamAbortGuard::disarmed(connected, stream);
+    let mut stream_guard = stream.lock().await;
+    let qstream = match stream_guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
+    let mut buf_g = buf.lock().await;
+    if buf_g.is_empty() {
+        return;
+    }
+    let batch: Vec<_> = buf_g.drain(..).collect();
+    drop(buf_g);
+    let Some(q) = format(&batch) else {
+        return;
+    };
+    let sent_len = batch.len();
+    abort_guard.arm();
+    let result = execute_single_insert_locked(qstream, &q).await;
+    abort_guard.disarm();
+    drop(stream_guard);
+    apply_flush_result(connected, stream, buf, batch, sent_len, kind, result, counters).await;
+}
+
+async fn try_flush_write_path<T: Send>(
+    connected: &Arc<tokio::sync::Mutex<bool>>,
+    stream: &Arc<Mutex<Option<QStream>>>,
+    buf: &Arc<tokio::sync::Mutex<VecDeque<T>>>,
+    format: fn(&[T]) -> Option<String>,
+    kind: MdKind,
+    counters: &MdCounters,
+    increment_skip_on_disconnected: bool,
+) {
+    let mut abort_guard = StreamAbortGuard::disarmed(connected, stream);
+    let conn_g = match connected.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            counters.flush_skips.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    if !*conn_g {
+        drop(conn_g);
+        if increment_skip_on_disconnected {
+            counters.flush_skips.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+    let mut stream_g = match stream.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            counters.flush_skips.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    drop(conn_g);
+    let qstream = match stream_g.as_mut() {
+        Some(s) => s,
+        None => {
+            counters.flush_skips.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    };
+    let mut buf_g = buf.lock().await;
+    if buf_g.is_empty() {
+        return;
+    }
+    let batch: Vec<_> = buf_g.drain(..).collect();
+    drop(buf_g);
+    let Some(q) = format(&batch) else {
+        return;
+    };
+    abort_guard.arm();
+    let result = execute_single_insert_locked(qstream, &q).await;
+    abort_guard.disarm();
+    drop(stream_g);
+    let sent_len = batch.len();
+    apply_flush_result(connected, stream, buf, batch, sent_len, kind, result, counters).await;
+}
+
+#[cfg(test)]
+async fn flush_send_sync(
+    connected: &Arc<tokio::sync::Mutex<bool>>,
+    stream: &Arc<Mutex<Option<QStream>>>,
+    q: &str,
+) -> Result<(), FlushErr> {
+    let mut abort_guard = StreamAbortGuard::disarmed(connected, stream);
+    let mut stream_guard = stream.lock().await;
+    let qstream = match stream_guard.as_mut() {
+        Some(s) => s,
+        None => return Err(FlushErr::Transport(anyhow!("stream not available"))),
+    };
+    abort_guard.arm();
+    let result = execute_insert_and_check(qstream, q).await;
+    abort_guard.disarm();
+    result
+}
+
+#[cfg(test)]
+async fn flush_send_async(
+    connected: &Arc<tokio::sync::Mutex<bool>>,
+    stream: &Arc<Mutex<Option<QStream>>>,
+    q: &str,
+) -> Result<(), FlushErr> {
+    let mut abort_guard = StreamAbortGuard::disarmed(connected, stream);
+    let mut stream_guard = stream.lock().await;
+    let qstream = match stream_guard.as_mut() {
+        Some(s) => s,
+        None => return Err(FlushErr::Transport(anyhow!("stream not available"))),
+    };
+    abort_guard.arm();
+    let result = execute_single_insert_locked(qstream, q).await;
+    abort_guard.disarm();
+    result
+}
+
 /// kdb+ IPC connection manager using kxkdb library with batched writes for maximum performance
 pub struct KdbWriter {
     stream: Arc<Mutex<Option<QStream>>>,
@@ -137,6 +813,8 @@ pub struct KdbWriter {
     batch_size: usize,
 
     probe: Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
+    counters: Arc<MdCounters>,
+    fail_next_write: AtomicBool,
 }
 
 impl KdbWriter {
@@ -153,7 +831,72 @@ impl KdbWriter {
             capture_gap_buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             batch_size: 100, // Flush when buffer reaches 100 items
             probe: Arc::new(std::sync::Mutex::new(Vec::new())),
+            counters: Arc::new(MdCounters::new()),
+            fail_next_write: AtomicBool::new(false),
         }
+    }
+
+    pub fn on_replay_write_err(
+        &self,
+        kind: &'static str,
+        symbol: &str,
+        seq: Option<u32>,
+        err: &anyhow::Error,
+    ) {
+        let log_kind = match kind {
+            "level" => {
+                self.counters.levels_replay_errors.fetch_add(1, Ordering::Relaxed);
+                LogKind::ReplayLevel
+            }
+            "trade" => {
+                self.counters.trades_replay_errors.fetch_add(1, Ordering::Relaxed);
+                LogKind::ReplayTrade
+            }
+            "snapshot" => {
+                self.counters.snapshots_replay_errors.fetch_add(1, Ordering::Relaxed);
+                LogKind::ReplaySnapshot
+            }
+            _ => LogKind::ReplayEnqueue,
+        };
+        self.counters.sampled_error(
+            log_kind,
+            format!(
+                "kdb replay write error symbol={} kind={} seq={:?} err={}",
+                symbol, kind, seq, err
+            ),
+        );
+    }
+
+    pub fn sampled_replay_enqueue(&self, symbol: &str, n_level: u64, n_trade: u64, n_snap: u64) {
+        self.counters.sampled_info(
+            LogKind::ReplayEnqueue,
+            format!(
+                "kdb replay enqueue symbol={} levels={} trades={} snapshots={}",
+                symbol, n_level, n_trade, n_snap
+            ),
+        );
+    }
+
+    /// Next `write_order_book_level` / `write_trade` / `write_snapshot` returns
+    /// `Err(anyhow!("injected write error"))` without enqueue, then clears the flag.
+    pub fn inject_next_write_err(&self) {
+        self.fail_next_write.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn level_buffer_len(&self) -> usize {
+        self.level_buffer.lock().await.len()
+    }
+
+    pub async fn trade_buffer_len(&self) -> usize {
+        self.trade_buffer.lock().await.len()
+    }
+
+    pub async fn snapshot_buffer_len(&self) -> usize {
+        self.snapshot_buffer.lock().await.len()
+    }
+
+    pub fn md_stats(&self) -> MdStats {
+        self.counters.snapshot()
     }
 
     /// Connect to kdb+ server via IPC. Fatal to the process if this returns Err
@@ -201,7 +944,8 @@ impl KdbWriter {
         }
     }
 
-    /// Start background task to periodically flush buffers
+    /// Start background task to periodically flush buffers.
+    /// Snapshots/own_trades/gaps async first, then levels/trades sync.
     fn start_flush_task(&self) {
         let level_buf = Arc::clone(&self.level_buffer);
         let trade_buf = Arc::clone(&self.trade_buffer);
@@ -210,60 +954,55 @@ impl KdbWriter {
         let gap_buf = Arc::clone(&self.capture_gap_buffer);
         let stream = Arc::clone(&self.stream);
         let connected = Arc::clone(&self.connected);
-        let batch_size = self.batch_size;
+        let counters = Arc::clone(&self.counters);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(FLUSH_INTERVAL_MS));
             loop {
                 interval.tick().await;
-
-                if *connected.lock().await {
-                    let mut levels = level_buf.lock().await;
-                    if !levels.is_empty() {
-                        let batch: Vec<_> = levels.drain(..).collect();
-                        drop(levels);
-                        if let Err(e) = Self::flush_levels_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &level_buf, batch, "level", e).await;
-                        }
-                    }
-
-                    let mut trades = trade_buf.lock().await;
-                    if !trades.is_empty() {
-                        let batch: Vec<_> = trades.drain(..).collect();
-                        drop(trades);
-                        if let Err(e) = Self::flush_trades_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &trade_buf, batch, "trade", e).await;
-                        }
-                    }
-
-                    let mut snapshots = snapshot_buf.lock().await;
-                    if !snapshots.is_empty() {
-                        let batch: Vec<_> = snapshots.drain(..).collect();
-                        drop(snapshots);
-                        if let Err(e) = Self::flush_snapshots_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &snapshot_buf, batch, "snapshot", e).await;
-                        }
-                    }
-
-                    let mut own_trades = own_trade_buf.lock().await;
-                    if !own_trades.is_empty() {
-                        let batch: Vec<_> = own_trades.drain(..).collect();
-                        drop(own_trades);
-                        if let Err(e) = Self::flush_own_trades_batch(&stream, &batch).await {
-                            warn!("Failed to flush own_trades batch: {}", e);
-                        }
-                    }
-
-                    let mut gaps = gap_buf.lock().await;
-                    if !gaps.is_empty() {
-                        let batch: Vec<_> = gaps.drain(..).collect();
-                        drop(gaps);
-                        if let Err(e) = Self::flush_capture_gaps_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &gap_buf, batch, "capture_gap", e).await;
-                        }
-                    }
+                let is_conn = bind_and_drop_connected(connected.as_ref()).await;
+                if !is_conn {
+                    counters.flush_skips.fetch_add(1, Ordering::Relaxed);
+                    continue;
                 }
-                let _ = batch_size; // suppress unused warning
+
+                timer_flush_async(
+                    &connected,
+                    &stream,
+                    &snapshot_buf,
+                    format_snapshots_insert_q,
+                    MdKind::Snapshots,
+                    counters.as_ref(),
+                )
+                .await;
+                timer_flush_async(
+                    &connected,
+                    &stream,
+                    &own_trade_buf,
+                    format_own_trades_insert_q,
+                    MdKind::OwnTrades,
+                    counters.as_ref(),
+                )
+                .await;
+                timer_flush_async(
+                    &connected,
+                    &stream,
+                    &gap_buf,
+                    format_capture_gaps_insert_q,
+                    MdKind::CaptureGaps,
+                    counters.as_ref(),
+                )
+                .await;
+                timer_flush_levels(&connected, &stream, &level_buf, counters.as_ref()).await;
+                timer_flush_sync(
+                    &connected,
+                    &stream,
+                    &trade_buf,
+                    format_trades_insert_q,
+                    MdKind::Trades,
+                    counters.as_ref(),
+                )
+                .await;
             }
         });
     }
@@ -282,7 +1021,8 @@ impl KdbWriter {
         tokio::spawn(async move {
             let mut backoff = initial;
             loop {
-                if *connected.lock().await {
+                let is_conn = bind_and_drop_connected(connected.as_ref()).await;
+                if is_conn {
                     backoff = initial;
                     tokio::time::sleep(tokio::time::Duration::from_millis(RECONNECT_POLL_MS)).await;
                     continue;
@@ -340,16 +1080,6 @@ impl KdbWriter {
         }
     }
 
-    /// Fire-and-forget bulk insert — sends an async message (no response wait).
-    /// Used by all flush_*_batch functions for high-throughput data writes.
-    async fn execute_single_insert(stream: &Arc<Mutex<Option<QStream>>>, q_code: &str) -> Result<()> {
-        let mut stream_guard = stream.lock().await;
-        let qstream = stream_guard.as_mut()
-            .ok_or_else(|| anyhow!("Stream not available"))?;
-        qstream.send_async_message(&q_code).await
-            .map_err(|e| anyhow!("Async insert failed: {}", e))
-    }
-
     /// Execute a q expression via IPC using kxkdb (sync for initialization)
     #[allow(dead_code)]
     async fn execute_q(&self, q_code: &str) -> Result<()> {
@@ -357,23 +1087,6 @@ impl KdbWriter {
             return Err(anyhow!("Not connected to kdb+"));
         }
         Self::execute_q_on_stream(&self.stream, q_code).await
-    }
-
-    async fn requeue_on_flush_err<T>(
-        connected: &Arc<tokio::sync::Mutex<bool>>,
-        stream: &Arc<Mutex<Option<QStream>>>,
-        buf: &Arc<tokio::sync::Mutex<VecDeque<T>>>,
-        batch: Vec<T>,
-        what: &str,
-        err: anyhow::Error,
-    ) {
-        warn!("Failed to flush {} batch: {} — dropping kdb latch and re-queuing", what, err);
-        *connected.lock().await = false;
-        let _ = stream.lock().await.take();
-        let mut buf = buf.lock().await;
-        for item in batch.into_iter().rev() {
-            buf.push_front(item);
-        }
     }
 
     async fn emit_overflow_gap(&self, dropped_symbols: &[String]) {
@@ -410,164 +1123,22 @@ impl KdbWriter {
         let buffer_len = buffer.len();
         drop(buffer);
 
-        if buffer_len >= self.batch_size && *self.connected.lock().await {
-            let mut buffer = self.capture_gap_buffer.lock().await;
-            let batch: Vec<_> = buffer.drain(..).collect();
-            drop(buffer);
-            if let Err(e) = Self::flush_capture_gaps_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(
-                    &self.connected,
-                    &self.stream,
-                    &self.capture_gap_buffer,
-                    batch,
-                    "capture_gap",
-                    e,
-                ).await;
-            }
+        if buffer_len >= self.batch_size {
+            try_flush_write_path(
+                &self.connected,
+                &self.stream,
+                &self.capture_gap_buffer,
+                format_capture_gaps_insert_q,
+                MdKind::CaptureGaps,
+                self.counters.as_ref(),
+                false,
+            )
+            .await;
         }
     }
 
-    /// Flush a batch of order book levels using a single bulk insert command
-    async fn flush_levels_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[OrderBookLevel]) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        debug!("🔄 Flushing {} order book levels to kdb+", batch.len());
-
-        let times: Vec<String> = batch.iter().map(|l| format!("`timestamp${}", l.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|l| format!("`{}", l.symbol)).collect();
-        let sides: Vec<String> = batch.iter().map(|l| format!("`{}", l.side)).collect();
-        let prices: Vec<String> = batch.iter().map(|l| format!("{}f", l.price)).collect();
-        let sizes: Vec<String> = batch.iter().map(|l| format!("{}f", l.size)).collect();
-        let actions: Vec<String> = batch.iter().map(|l| format!("`{}", l.action)).collect();
-        let seqs: Vec<String> = batch.iter().map(|l| fmt_seq(l.seq_num)).collect();
-
-        let q_code = format!(
-            "`orderbook_levels insert (({});({});({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), sides.join(";"),
-            prices.join(";"), sizes.join(";"), actions.join(";"),
-            seqs.join(";")
-        );
-
-        match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => {
-                debug!("✅ Flushed {} order book levels", batch.len());
-                Ok(())
-            }
-            Err(e) => {
-                warn!("❌ Failed to bulk-insert order book levels: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Flush a batch of trades using a single bulk insert command
-    async fn flush_trades_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[Trade]) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        debug!("🔄 Flushing {} trades to kdb+", batch.len());
-
-        let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
-        let prices: Vec<String> = batch.iter().map(|t| format!("{}f", t.price)).collect();
-        let sizes: Vec<String> = batch.iter().map(|t| format!("{}f", t.size)).collect();
-        let seqs: Vec<String> = batch.iter().map(|t| fmt_seq(t.seq_num)).collect();
-
-        let q_code = format!(
-            "`trades insert (({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), prices.join(";"), sizes.join(";"),
-            seqs.join(";")
-        );
-
-        match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => {
-                debug!("✅ Flushed {} trades", batch.len());
-                Ok(())
-            }
-            Err(e) => {
-                warn!("❌ Failed to bulk-insert trades: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Flush a batch of snapshots using a single bulk insert command
-    async fn flush_snapshots_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[Snapshot]) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        debug!("🔄 Flushing {} snapshots to kdb+", batch.len());
-
-        let times: Vec<String> = batch.iter().map(|s| format!("`timestamp${}", s.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|s| format!("`{}", s.symbol)).collect();
-        let best_bids: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid)).collect();
-        let best_asks: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_ask)).collect();
-        let best_bid_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid_size)).collect();
-        let best_ask_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_ask_size)).collect();
-        let spreads: Vec<String> = batch.iter().map(|s| format!("{}f", s.spread)).collect();
-        let seqs: Vec<String> = batch.iter().map(|s| fmt_seq(s.seq_num)).collect();
-
-        let q_code = format!(
-            "`orderbook_snapshots insert (({});({});({});({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), best_bids.join(";"),
-            best_asks.join(";"), best_bid_sizes.join(";"),
-            best_ask_sizes.join(";"), spreads.join(";"), seqs.join(";")
-        );
-
-        match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => {
-                debug!("✅ Flushed {} snapshots", batch.len());
-                Ok(())
-            }
-            Err(e) => {
-                warn!("❌ Failed to bulk-insert snapshots: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    async fn flush_capture_gaps_batch(
-        stream: &Arc<Mutex<Option<QStream>>>,
-        batch: &[CaptureGap],
-    ) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        debug!("🔄 Flushing {} capture gaps to kdb+", batch.len());
-
-        let times: Vec<String> = batch.iter()
-            .map(|g| format!("`timestamp${}", g.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|g| {
-            format!("`$\"{}\"", escape_kdb_string(&g.symbol))
-        }).collect();
-        let expected: Vec<String> = batch.iter().map(|g| format!("{}j", g.expected_seq)).collect();
-        let received: Vec<String> = batch.iter().map(|g| format!("{}j", g.received_seq)).collect();
-        let sizes: Vec<String> = batch.iter().map(|g| format!("{}j", g.gap_size)).collect();
-        let q_code = format!(
-            "`capture_gaps insert (({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), expected.join(";"),
-            received.join(";"), sizes.join(";")
-        );
-
-        match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => {
-                debug!("✅ Flushed {} capture gaps", batch.len());
-                Ok(())
-            }
-            Err(e) => {
-                warn!("❌ Failed to bulk-insert capture gaps: {}", e);
-                Err(e)
-            }
-        }
-    }
-
-    /// Write order book level update to kdb+ (buffered, batched). Always enqueues
-    /// even when disconnected; flush only happens while connected.
+    /// Write order book level update to kdb+ (buffered). Always enqueues even when
+    /// disconnected. Drain is timer-only (sync) so `'type` is observable.
     pub async fn write_order_book_level(
         &self,
         symbol: &str,
@@ -577,6 +1148,9 @@ impl KdbWriter {
         action: char,
         seq_num: Option<u32>,
     ) -> Result<()> {
+        if self.fail_next_write.swap(false, Ordering::SeqCst) {
+            return Err(anyhow!("injected write error"));
+        }
         let timestamp = kdb_now_ns();
 
         let level = OrderBookLevel {
@@ -608,21 +1182,11 @@ impl KdbWriter {
         };
 
         debug!("📦 Buffered order book level. Buffer size: {}", buffer_len);
-
-        if buffer_len >= self.batch_size && *self.connected.lock().await {
-            let mut buffer = self.level_buffer.lock().await;
-            let batch: Vec<_> = buffer.drain(..).collect();
-            drop(buffer);
-
-            if let Err(e) = Self::flush_levels_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.level_buffer, batch, "level", e).await;
-            }
-        }
-
+        self.counters.levels_enqueued.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Write trade to kdb+ (buffered, batched)
+    /// Write trade to kdb+ (buffered). Drain is timer-only (sync).
     pub async fn write_trade(
         &self,
         symbol: &str,
@@ -631,6 +1195,9 @@ impl KdbWriter {
         timestamp: i64,
         seq_num: Option<u32>,
     ) -> Result<()> {
+        if self.fail_next_write.swap(false, Ordering::SeqCst) {
+            return Err(anyhow!("injected write error"));
+        }
         let trade = Trade {
             timestamp: timestamp - KDB_TIMESTAMP_OFFSET_NS,
             symbol: symbol.to_string(),
@@ -639,7 +1206,7 @@ impl KdbWriter {
             seq_num,
         };
 
-        let buffer_len = {
+        {
             let mut buffer = self.trade_buffer.lock().await;
             if buffer.len() >= MAX_KDB_BUFFER {
                 let drop_count = buffer.len() / 2;
@@ -650,27 +1217,17 @@ impl KdbWriter {
                 self.emit_overflow_gap(&symbols).await;
                 let mut buffer = self.trade_buffer.lock().await;
                 buffer.push_back(trade);
-                buffer.len()
             } else {
                 buffer.push_back(trade);
-                buffer.len()
-            }
-        };
-
-        if buffer_len >= self.batch_size && *self.connected.lock().await {
-            let mut buffer = self.trade_buffer.lock().await;
-            let batch: Vec<_> = buffer.drain(..).collect();
-            drop(buffer);
-
-            if let Err(e) = Self::flush_trades_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.trade_buffer, batch, "trade", e).await;
             }
         }
 
+        self.counters.trades_enqueued.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Write best bid/ask snapshot to kdb+ (buffered, batched)
+    /// Write best bid/ask snapshot to kdb+ (buffered, batched). Threshold flush is
+    /// async + try_lock; contention skip is success.
     pub async fn write_snapshot(
         &self,
         symbol: &str,
@@ -681,6 +1238,9 @@ impl KdbWriter {
         spread: f64,
         seq_num: Option<u32>,
     ) -> Result<()> {
+        if self.fail_next_write.swap(false, Ordering::SeqCst) {
+            return Err(anyhow!("injected write error"));
+        }
         let timestamp = kdb_now_ns();
 
         let snapshot = Snapshot {
@@ -712,14 +1272,19 @@ impl KdbWriter {
             }
         };
 
-        if buffer_len >= self.batch_size && *self.connected.lock().await {
-            let mut buffer = self.snapshot_buffer.lock().await;
-            let batch: Vec<_> = buffer.drain(..).collect();
-            drop(buffer);
+        self.counters.snapshots_enqueued.fetch_add(1, Ordering::Relaxed);
 
-            if let Err(e) = Self::flush_snapshots_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.snapshot_buffer, batch, "snapshot", e).await;
-            }
+        if buffer_len >= self.batch_size {
+            try_flush_write_path(
+                &self.connected,
+                &self.stream,
+                &self.snapshot_buffer,
+                format_snapshots_insert_q,
+                MdKind::Snapshots,
+                self.counters.as_ref(),
+                true,
+            )
+            .await;
         }
 
         Ok(())
@@ -744,39 +1309,7 @@ impl KdbWriter {
         Ok(())
     }
 
-    /// Flush a batch of own execution fills using a single bulk insert command
-    async fn flush_own_trades_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[OwnTrade]) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        debug!("🔄 Flushing {} own trades to kdb+", batch.len());
-
-        let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
-        let sides: Vec<String> = batch.iter().map(|t| format!("`{}", t.side)).collect();
-        let last_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_px)).collect();
-        let last_qtys: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_qty)).collect();
-        let avg_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.avg_px)).collect();
-        let cl_ord_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.cl_ord_id)).collect();
-        let order_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.order_id)).collect();
-        let exec_types: Vec<String> = batch.iter().map(|t| format!("`{}", t.exec_type)).collect();
-
-        let q_code = format!(
-            "`own_trades insert (({});({});({});({});({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), sides.join(";"),
-            last_pxs.join(";"), last_qtys.join(";"), avg_pxs.join(";"),
-            cl_ord_ids.join(";"), order_ids.join(";"), exec_types.join(";")
-        );
-
-        match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => debug!("✅ Flushed {} own trades", batch.len()),
-            Err(e) => warn!("❌ Failed to bulk-insert own trades: {}", e),
-        }
-        Ok(())
-    }
-
-    /// Write an own execution fill to kdb+ (buffered)
+    /// Write an own execution fill to kdb+ (buffered).
     /// Call this from the FIX execution report handler when ExecType is F (partial) or 2 (full fill).
     pub async fn write_own_trade(
         &self,
@@ -789,7 +1322,11 @@ impl KdbWriter {
         order_id: &str,
         exec_type: char,
     ) -> Result<()> {
-        if !*self.connected.lock().await {
+        let connected = match self.connected.try_lock() {
+            Ok(g) => *g,
+            Err(_) => return Ok(()),
+        };
+        if !connected {
             return Ok(());
         }
 
@@ -807,22 +1344,28 @@ impl KdbWriter {
             exec_type,
         };
 
-        let mut buffer = self.own_trade_buffer.lock().await;
-
-        if buffer.len() >= MAX_KDB_BUFFER {
-            let drop_count = buffer.len() / 2;
-            buffer.drain(..drop_count);
-            warn!("⚠️  kdb own_trade buffer overflow — dropped {} oldest entries", drop_count);
-        }
-
-        buffer.push_back(own_trade);
-
-        if buffer.len() >= self.batch_size {
-            let batch: Vec<_> = buffer.drain(..).collect();
-            drop(buffer);
-            if let Err(e) = Self::flush_own_trades_batch(&self.stream, &batch).await {
-                warn!("Failed to flush own_trades batch: {}", e);
+        let buffer_len = {
+            let mut buffer = self.own_trade_buffer.lock().await;
+            if buffer.len() >= MAX_KDB_BUFFER {
+                let drop_count = buffer.len() / 2;
+                buffer.drain(..drop_count);
+                warn!("⚠️  kdb own_trade buffer overflow — dropped {} oldest entries", drop_count);
             }
+            buffer.push_back(own_trade);
+            buffer.len()
+        };
+
+        if buffer_len >= self.batch_size {
+            try_flush_write_path(
+                &self.connected,
+                &self.stream,
+                &self.own_trade_buffer,
+                format_own_trades_insert_q,
+                MdKind::OwnTrades,
+                self.counters.as_ref(),
+                true,
+            )
+            .await;
         }
 
         Ok(())
@@ -863,10 +1406,16 @@ impl KdbWriter {
                 timestamp, symbol, sec_id_str, exch_str, escaped_attrs
             );
 
-            if let Ok(()) = Self::execute_single_insert(&self.stream, q_code.as_str()).await {
-                success_count += 1;
-            } else {
-                warn!("❌ Failed to insert security: {}", symbol);
+            let mut stream_guard = self.stream.lock().await;
+            match stream_guard.as_mut() {
+                Some(qs) => {
+                    if execute_single_insert_locked(qs, q_code.as_str()).await.is_ok() {
+                        success_count += 1;
+                    } else {
+                        warn!("❌ Failed to insert security: {}", symbol);
+                    }
+                }
+                None => warn!("❌ Failed to insert security: {}", symbol),
             }
         }
 
@@ -1054,32 +1603,35 @@ impl KdbWriter {
     pub async fn disconnect(&self) {
         *self.connected.lock().await = false;
 
-        // Flush remaining buffers
         let levels: Vec<_> = self.level_buffer.lock().await.drain(..).collect();
         let trades: Vec<_> = self.trade_buffer.lock().await.drain(..).collect();
         let snapshots: Vec<_> = self.snapshot_buffer.lock().await.drain(..).collect();
         let own_trades: Vec<_> = self.own_trade_buffer.lock().await.drain(..).collect();
         let gaps: Vec<_> = self.capture_gap_buffer.lock().await.drain(..).collect();
 
-        if !levels.is_empty() {
-            let _ = Self::flush_levels_batch(&self.stream, &levels).await;
-        }
-        if !trades.is_empty() {
-            let _ = Self::flush_trades_batch(&self.stream, &trades).await;
-        }
-        if !snapshots.is_empty() {
-            let _ = Self::flush_snapshots_batch(&self.stream, &snapshots).await;
-        }
-        if !own_trades.is_empty() {
-            let _ = Self::flush_own_trades_batch(&self.stream, &own_trades).await;
-        }
-        if !gaps.is_empty() {
-            let _ = Self::flush_capture_gaps_batch(&self.stream, &gaps).await;
-        }
-
-        if let Some(mut stream) = self.stream.lock().await.take() {
-            if let Err(e) = stream.shutdown().await {
-                warn!("Error shutting down kdb+ connection: {}", e);
+        {
+            let mut stream_guard = self.stream.lock().await;
+            if let Some(qs) = stream_guard.as_mut() {
+                if let Some(q) = format_levels_insert_q(&levels) {
+                    let _ = execute_single_insert_locked(qs, &q).await;
+                }
+                if let Some(q) = format_trades_insert_q(&trades) {
+                    let _ = execute_single_insert_locked(qs, &q).await;
+                }
+                if let Some(q) = format_snapshots_insert_q(&snapshots) {
+                    let _ = execute_single_insert_locked(qs, &q).await;
+                }
+                if let Some(q) = format_own_trades_insert_q(&own_trades) {
+                    let _ = execute_single_insert_locked(qs, &q).await;
+                }
+                if let Some(q) = format_capture_gaps_insert_q(&gaps) {
+                    let _ = execute_single_insert_locked(qs, &q).await;
+                }
+            }
+            if let Some(stream) = stream_guard.take() {
+                if let Err(e) = stream.shutdown().await {
+                    warn!("Error shutting down kdb+ connection: {}", e);
+                }
             }
         }
         info!("🔌 Disconnected from kdb+");
@@ -1117,10 +1669,6 @@ pub async fn query_table_once(host: &str, port: u16, q: &str) -> anyhow::Result<
 
 #[cfg(test)]
 impl KdbWriter {
-    pub(crate) async fn level_buffer_len(&self) -> usize {
-        self.level_buffer.lock().await.len()
-    }
-
     pub(crate) async fn capture_gap_buffer_len(&self) -> usize {
         self.capture_gap_buffer.lock().await.len()
     }
@@ -1133,11 +1681,109 @@ impl KdbWriter {
             .map(|g| (g.symbol.clone(), g.expected_seq, g.received_seq, g.gap_size))
             .collect()
     }
+
+    pub(crate) async fn connected_for_test(&self) -> bool {
+        *self.connected.lock().await
+    }
+
+    pub(crate) async fn set_connected_for_test(&self, v: bool) {
+        *self.connected.lock().await = v;
+    }
+
+    pub(crate) async fn stream_is_some_for_test(&self) -> bool {
+        self.stream.lock().await.is_some()
+    }
+
+    pub(crate) async fn install_stream_for_test(&self, s: QStream) {
+        *self.stream.lock().await = Some(s);
+    }
+
+    pub(crate) async fn apply_flush_result_levels_for_test(
+        &self,
+        batch: Vec<OrderBookLevel>,
+        result: Result<(), FlushErr>,
+    ) {
+        let sent_len = batch.len();
+        apply_flush_result(
+            &self.connected,
+            &self.stream,
+            &self.level_buffer,
+            batch,
+            sent_len,
+            MdKind::Levels,
+            result,
+            self.counters.as_ref(),
+        )
+        .await;
+    }
+
+    pub(crate) async fn send_sync_with_abort_guard_for_test(&self, q: &str) -> Result<(), FlushErr> {
+        flush_send_sync(&self.connected, &self.stream, q).await
+    }
+
+    pub(crate) async fn send_async_with_abort_guard_for_test(&self, q: &str) -> Result<(), FlushErr> {
+        flush_send_async(&self.connected, &self.stream, q).await
+    }
+}
+
+#[cfg(test)]
+async fn spawn_kdb_handshake_then_hang() -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 2];
+        if sock.read_exact(&mut buf).await.is_err() {
+            return;
+        }
+        let _ = sock.write_all(&[0x03]).await;
+        std::future::pending::<()>().await;
+    });
+    port
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn sample_level(symbol: &str, side: char, action: char) -> OrderBookLevel {
+        OrderBookLevel {
+            timestamp: 1,
+            symbol: symbol.to_string(),
+            side,
+            price: 1.0,
+            size: 1.0,
+            action,
+            seq_num: Some(7),
+        }
+    }
+
+    fn sample_trade(symbol: &str) -> Trade {
+        Trade {
+            timestamp: 1,
+            symbol: symbol.to_string(),
+            price: 1.0,
+            size: 1.0,
+            seq_num: Some(7),
+        }
+    }
+
+    fn sample_snapshot(symbol: &str, n: f64) -> Snapshot {
+        Snapshot {
+            timestamp: 1,
+            symbol: symbol.to_string(),
+            best_bid: n,
+            best_ask: n + 1.0,
+            best_bid_size: 3.0,
+            best_ask_size: 4.0,
+            spread: 1.0,
+            seq_num: Some(7),
+        }
+    }
 
     #[test]
     fn escape_kdb_string_quotes_and_backslashes() {
@@ -1211,5 +1857,236 @@ mod tests {
             "gap-buffer overflow must not emit OverflowGap, got {:?}",
             evs
         );
+    }
+
+    // --- PR-A / PR-B ---
+
+    #[tokio::test]
+    async fn storm_gate_q_err_does_not_drop_latch_or_requeue() {
+        let w = KdbWriter::new("127.0.0.1".into(), 1);
+        w.set_connected_for_test(true).await;
+        w.write_order_book_level("BTC_USDT", 'B', 1.0, 1.0, 'N', Some(7)).await.unwrap();
+        let batch: Vec<_> = w.level_buffer.lock().await.drain(..).collect();
+        w.apply_flush_result_levels_for_test(
+            batch,
+            Err(FlushErr::Q {
+                message: "type".into(),
+                q_snippet: "`orderbook_levels insert ...".into(),
+            }),
+        )
+        .await;
+        assert!(w.connected_for_test().await);
+        assert!(!w.stream_is_some_for_test().await);
+        assert_eq!(w.level_buffer_len().await, 0);
+        assert!(w.md_stats().levels_flush_errors >= 1);
+        assert_eq!(w.md_stats().levels_flushed, 0);
+    }
+
+    #[tokio::test]
+    async fn transport_err_drops_latch_and_requeues() {
+        let w = KdbWriter::new("127.0.0.1".into(), 1);
+        w.set_connected_for_test(true).await;
+        w.write_order_book_level("BTC_USDT", 'B', 1.0, 1.0, 'N', Some(7)).await.unwrap();
+        let batch: Vec<_> = w.level_buffer.lock().await.drain(..).collect();
+        w.apply_flush_result_levels_for_test(
+            batch,
+            Err(FlushErr::Transport(anyhow!("tcp reset"))),
+        )
+        .await;
+        assert!(!w.connected_for_test().await);
+        assert_eq!(w.level_buffer_len().await, 1);
+        assert!(w.md_stats().levels_flush_errors >= 1);
+        assert_eq!(w.md_stats().levels_flushed, 0);
+    }
+
+    #[tokio::test]
+    async fn write_path_try_lock_stream_held_does_not_await_buffer_stays() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let w = KdbWriter::new("127.0.0.1".into(), 1);
+            w.set_connected_for_test(true).await;
+            let _hold = w.stream.lock().await;
+            for _ in 0..100 {
+                w.write_snapshot("BTC_USDT", 1.0, 2.0, 3.0, 4.0, 1.0, Some(1))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(w.snapshot_buffer_len().await, 100);
+            assert!(w.md_stats().flush_skips >= 1);
+        })
+        .await
+        .expect("try_lock skip must not await the held stream");
+    }
+
+    #[tokio::test]
+    async fn write_path_try_lock_connected_held_does_not_await_buffer_stays() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let w = KdbWriter::new("127.0.0.1".into(), 1);
+            w.set_connected_for_test(true).await;
+            let _hold = w.connected.lock().await;
+            for _ in 0..100 {
+                w.write_snapshot("BTC_USDT", 1.0, 2.0, 3.0, 4.0, 1.0, Some(1))
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(w.snapshot_buffer_len().await, 100);
+            assert!(w.md_stats().flush_skips >= 1);
+        })
+        .await
+        .expect("try_lock skip must not await the held connected mutex");
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_does_not_reuse_stream_with_latch_up() {
+        let port = spawn_kdb_handshake_then_hang().await;
+        let qs = QStream::connect(ConnectionMethod::TCP, "127.0.0.1", port, "")
+            .await
+            .expect("handshake stub must complete QStream::connect");
+        let w = Arc::new(KdbWriter::new("127.0.0.1".into(), port));
+        w.install_stream_for_test(qs).await;
+        w.set_connected_for_test(true).await;
+        let w2 = Arc::clone(&w);
+        let handle = tokio::spawn(async move {
+            w2.send_sync_with_abort_guard_for_test("`1").await
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        handle.abort();
+        let _ = handle.await;
+        assert!(!w.connected_for_test().await, "armed abort must drop the latch");
+        assert!(
+            !w.stream_is_some_for_test().await,
+            "armed abort must take the stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_path_cancelled_send_does_not_reuse_stream_with_latch_up() {
+        let port = spawn_kdb_handshake_then_hang().await;
+        let qs = QStream::connect(ConnectionMethod::TCP, "127.0.0.1", port, "")
+            .await
+            .expect("handshake stub must complete QStream::connect");
+        let w = Arc::new(KdbWriter::new("127.0.0.1".into(), port));
+        w.install_stream_for_test(qs).await;
+        w.set_connected_for_test(true).await;
+        let w2 = Arc::clone(&w);
+        // send_async is write-only; a small payload completes before abort.
+        // Fill the TCP window so write_all stays armed while the peer never reads.
+        let huge = "a".repeat(8 * 1024 * 1024);
+        let handle = tokio::spawn(async move {
+            w2.send_async_with_abort_guard_for_test(&huge).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+        assert!(!w.connected_for_test().await);
+        assert!(!w.stream_is_some_for_test().await);
+    }
+
+    #[tokio::test]
+    async fn timer_connected_bind_and_drop_releases_lock() {
+        let m = tokio::sync::Mutex::new(true);
+        assert!(bind_and_drop_connected(&m).await);
+        assert!(m.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn reconnect_connected_bind_and_drop_releases_lock() {
+        // start_reconnect_task uses bind_and_drop_connected and must not hold
+        // the guard across sleep. Same helper as the timer path.
+        let m = tokio::sync::Mutex::new(false);
+        assert!(!bind_and_drop_connected(&m).await);
+        assert!(m.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_snapshot_enqueues_when_disconnected() {
+        let w = KdbWriter::new("127.0.0.1".into(), 1);
+        w.write_snapshot("BTC_USDT", 1.0, 2.0, 3.0, 4.0, 1.0, Some(7))
+            .await
+            .unwrap();
+        assert!(w.drain_probe().is_empty(), "probe is recorded at replay, not write_*");
+        assert_eq!(w.snapshot_buffer_len().await, 1);
+    }
+
+    #[tokio::test]
+    async fn write_path_levels_threshold_does_not_drain() {
+        let w = KdbWriter::new("127.0.0.1".into(), 1);
+        w.set_connected_for_test(true).await;
+        for _ in 0..100 {
+            w.write_order_book_level("BTC_USDT", 'B', 1.0, 1.0, 'N', Some(1))
+                .await
+                .unwrap();
+        }
+        for _ in 0..100 {
+            w.write_trade("BTC_USDT", 1.0, 1.0, 0, Some(1)).await.unwrap();
+        }
+        assert_eq!(w.level_buffer_len().await, 100);
+        assert_eq!(w.trade_buffer_len().await, 100);
+        assert_eq!(w.md_stats().levels_flushed, 0);
+        assert_eq!(w.md_stats().trades_flushed, 0);
+        assert_eq!(w.md_stats().flush_skips, 0);
+    }
+
+    #[test]
+    fn truncate_q_snippet_201_byte_ascii() {
+        let q = "a".repeat(201);
+        let t = truncate_q_snippet(&q);
+        assert_eq!(t.len(), 200);
+        assert!(t.ends_with("..."));
+    }
+
+    #[test]
+    fn format_levels_insert_q_n1_emits_char_atom_star_quote() {
+        let q = format_levels_insert_q(&[sample_level("ETH_USDT", 'B', 'N')]).unwrap();
+        assert!(q.contains("*\""), "n=1 must emit char atom");
+        assert!(q.contains("*\"B\""), "got {q}");
+        assert!(q.contains("*\"N\""), "got {q}");
+        assert!(!q.contains("`B"), "must not emit kdb symbol for side, got {q}");
+        assert!(!q.contains("(\"B\")"), "must not emit 10h char without star, got {q}");
+    }
+
+    #[test]
+    fn format_levels_insert_q_n2_emits_char_vector() {
+        let q = format_levels_insert_q(&[
+            sample_level("S1", 'B', 'N'),
+            sample_level("S2", 'A', 'C'),
+        ])
+        .unwrap();
+        assert!(q.contains("\"BA\""), "got {q}");
+        assert!(q.contains("\"NC\""), "got {q}");
+        assert!(!q.contains("`B"), "got {q}");
+        assert!(!q.contains("*\"B\""), "got {q}");
+    }
+
+    #[test]
+    fn format_trades_insert_q_n1_type_aligned() {
+        let q = format_trades_insert_q(&[sample_trade("ETH_USDT")]).unwrap();
+        assert!(q.starts_with("`trades insert "));
+        assert_eq!(q.matches('(').count(), 6, "five parenthesized columns plus outer, got {q}");
+        assert!(!q.contains("*\""), "trades have no char columns, got {q}");
+    }
+
+    #[test]
+    fn format_levels_insert_q_closed_alphabet_skips_bad_row() {
+        let q = format_levels_insert_q(&[
+            sample_level("ETH_USDT", 'X', 'N'),
+            sample_level("ETH_USDT", 'B', 'N'),
+        ]);
+        let q = q.expect("mixed batch with a valid sibling must still format");
+        assert!(q.contains("*\"B\""), "got {q}");
+        assert!(!q.contains('X'), "must not interpolate unexpected side, got {q}");
+    }
+
+    #[test]
+    fn format_snapshots_insert_q_still_valid_insert() {
+        let q1 = format_snapshots_insert_q(&[sample_snapshot("ETH_USDT", 1.0)]).unwrap();
+        assert!(q1.starts_with("`orderbook_snapshots insert "));
+        assert_eq!(q1.matches('(').count(), 9, "8 parenthesized columns plus outer, got {q1}");
+        let q2 = format_snapshots_insert_q(&[
+            sample_snapshot("ETH_USDT", 1.0),
+            sample_snapshot("ETH_USDT", 2.0),
+        ])
+        .unwrap();
+        assert!(q2.starts_with("`orderbook_snapshots insert "));
+        assert_eq!(q2.matches('(').count(), 9, "got {q2}");
     }
 }

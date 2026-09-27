@@ -13,7 +13,7 @@ mod algo_runtime;
 use fix_server::{algo, kdb_integration, kdb_query};
 use anyhow::{anyhow, bail, Result};
 use fix_protocol::{FIXMessage, tags};
-use log::{info, error, warn};
+use log::{debug, info, error, warn};
 use serde::{Deserialize, Deserializer};
 use std::fmt;
 use std::pin::Pin;
@@ -1697,6 +1697,16 @@ impl FIXSession {
     #[cfg(test)]
     pub fn drain_capture_probe(&self) -> Vec<kdb_integration::ProbeEvent> {
         self.kdb_writer.drain_probe()
+    }
+
+    #[cfg(test)]
+    pub fn kdb_writer_for_test(&self) -> &KdbWriter {
+        self.kdb_writer.as_ref()
+    }
+
+    #[cfg(test)]
+    pub async fn replay_pending_md_io_for_test(&self, symbol: &str, pending: Vec<PendingMdIo>) {
+        self.replay_pending_md_io(symbol, pending).await;
     }
     
     /// Set event-driven update channels
@@ -4012,43 +4022,75 @@ impl FIXSession {
     }
 
     /// Replay deferred kdb writes after `order_books` has been dropped.
-    /// Error policy matches the previous in-lock call sites: kdb failure is ignored.
     /// Persistence is gated by CAPTURE_SYMBOLS; the in-memory book is already applied.
+    /// Enqueue `Result` is handled: log + `on_replay_write_err` (no silent `let _ =`).
     async fn replay_pending_md_io(&self, symbol: &str, pending: Vec<PendingMdIo>) {
         if !self.capture_symbols.contains(symbol) {
             return;
         }
+        let mut n_level = 0u64;
+        let mut n_trade = 0u64;
+        let mut n_snap = 0u64;
         for io in pending {
             match io {
                 PendingMdIo::Level { side, price, size, action, seq_num } => {
+                    n_level += 1;
                     #[cfg(test)]
                     self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
                         kind: "level", symbol: symbol.to_string(), seq_num,
                     });
-                    let _ = self.kdb_writer
+                    if let Err(e) = self.kdb_writer
                         .write_order_book_level(symbol, side, price, size, action, seq_num)
-                        .await;
+                        .await
+                    {
+                        error!(
+                            "kdb replay write error symbol={} kind=level seq={:?} err={}",
+                            symbol, seq_num, e
+                        );
+                        self.kdb_writer.on_replay_write_err("level", symbol, seq_num, &e);
+                    }
                 }
                 PendingMdIo::Trade { price, size, timestamp, seq_num } => {
+                    n_trade += 1;
                     #[cfg(test)]
                     self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
                         kind: "trade", symbol: symbol.to_string(), seq_num,
                     });
-                    let _ = self.kdb_writer
+                    if let Err(e) = self.kdb_writer
                         .write_trade(symbol, price, size, timestamp, seq_num)
-                        .await;
+                        .await
+                    {
+                        error!(
+                            "kdb replay write error symbol={} kind=trade seq={:?} err={}",
+                            symbol, seq_num, e
+                        );
+                        self.kdb_writer.on_replay_write_err("trade", symbol, seq_num, &e);
+                    }
                 }
                 PendingMdIo::Snapshot { best_bid, best_ask, best_bid_size, best_ask_size, spread, seq_num } => {
+                    n_snap += 1;
                     #[cfg(test)]
                     self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
                         kind: "snapshot", symbol: symbol.to_string(), seq_num,
                     });
-                    let _ = self.kdb_writer
+                    if let Err(e) = self.kdb_writer
                         .write_snapshot(symbol, best_bid, best_ask, best_bid_size, best_ask_size, spread, seq_num)
-                        .await;
+                        .await
+                    {
+                        error!(
+                            "kdb replay write error symbol={} kind=snapshot seq={:?} err={}",
+                            symbol, seq_num, e
+                        );
+                        self.kdb_writer.on_replay_write_err("snapshot", symbol, seq_num, &e);
+                    }
                 }
             }
         }
+        debug!(
+            "kdb replay symbol={} levels={} trades={} snapshots={}",
+            symbol, n_level, n_trade, n_snap
+        );
+        self.kdb_writer.sampled_replay_enqueue(symbol, n_level, n_trade, n_snap);
     }
 
     // Private helper methods
@@ -9971,6 +10013,97 @@ mod connectivity_tests {
     #[test]
     fn capture_symbols_invalid_charset_dropped() {
         assert!(parse_capture_symbols(Some("BTC-USDT")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn replay_write_err_increments_replay_errors() {
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        session.kdb_writer_for_test().inject_next_write_err();
+        session
+            .replay_pending_md_io_for_test(
+                "BTC_USDT",
+                vec![PendingMdIo::Level {
+                    side: 'B',
+                    price: 1.0,
+                    size: 1.0,
+                    action: 'N',
+                    seq_num: Some(1),
+                }],
+            )
+            .await;
+        assert!(session.kdb_writer_for_test().md_stats().levels_replay_errors >= 1);
+        assert_eq!(session.kdb_writer_for_test().level_buffer_len().await, 0);
+        let evs = session.drain_capture_probe();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                kdb_integration::ProbeEvent::PendingMdIo { kind: "level", .. }
+            )),
+            "probe is recorded before write, got {:?}",
+            evs
+        );
+    }
+
+    #[tokio::test]
+    async fn ac4_bin_replay_level_trade_snapshot_probes_and_buffers() {
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        session
+            .replay_pending_md_io_for_test(
+                "BTC_USDT",
+                vec![
+                    PendingMdIo::Level {
+                        side: 'B',
+                        price: 1.0,
+                        size: 1.0,
+                        action: 'N',
+                        seq_num: Some(1),
+                    },
+                    PendingMdIo::Trade {
+                        price: 1.0,
+                        size: 1.0,
+                        timestamp: 0,
+                        seq_num: Some(2),
+                    },
+                    PendingMdIo::Snapshot {
+                        best_bid: 1.0,
+                        best_ask: 2.0,
+                        best_bid_size: 3.0,
+                        best_ask_size: 4.0,
+                        spread: 1.0,
+                        seq_num: Some(3),
+                    },
+                ],
+            )
+            .await;
+        let evs = session.drain_capture_probe();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                kdb_integration::ProbeEvent::PendingMdIo { kind: "level", .. }
+            )),
+            "missing level probe: {:?}",
+            evs
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                kdb_integration::ProbeEvent::PendingMdIo { kind: "trade", .. }
+            )),
+            "missing trade probe: {:?}",
+            evs
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                kdb_integration::ProbeEvent::PendingMdIo { kind: "snapshot", .. }
+            )),
+            "missing snapshot probe: {:?}",
+            evs
+        );
+        let w = session.kdb_writer_for_test();
+        assert!(w.level_buffer_len().await >= 1);
+        assert!(w.trade_buffer_len().await >= 1);
+        assert!(w.snapshot_buffer_len().await >= 1);
     }
 
     #[tokio::test]
