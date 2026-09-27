@@ -155,11 +155,58 @@ impl OrderBook {
     #[inline(always)]
     fn adjust_price_base(&mut self, price_cents: u64) {
         let new_base = price_cents.saturating_sub(self.dense_size as u64 / 2);
-        if new_base != self.price_base {
-            self.price_base = new_base;
-            self.bid_index.clear();
-            self.ask_index.clear();
+        if new_base == self.price_base {
+            return;
         }
+        self.price_base = new_base;
+
+        // bid_index / ask_index are keyed by ABSOLUTE price, so re-centering does
+        // not invalidate them. Clearing them here is what made best_bid/best_ask
+        // read 0 while get_depth still reported a full book: the cached bests are
+        // fed from these indexes, the depth is read from the dense/sparse levels,
+        // and wiping only the former tore the two apart on every re-center. On
+        // BTC_USD that was 48% of reads.
+        //
+        // What IS invalidated is the dense storage, whose slots are base-relative.
+        // Rebuild it from the indexes, which are the authority.
+        for slot in self.bids.iter_mut() {
+            *slot = None;
+        }
+        for slot in self.asks.iter_mut() {
+            *slot = None;
+        }
+        self.sparse_bids.clear();
+        self.sparse_asks.clear();
+
+        let seq = self.sequence.load(Ordering::Relaxed);
+        let live_bids: Vec<(u64, u64)> = self.bid_index.iter().map(|(&p, &sz)| (p, sz)).collect();
+        for (p, sz) in live_bids {
+            let level = PriceLevel::new(p, sz, seq);
+            match self.get_dense_index(p) {
+                Some(idx) => self.bids[idx] = Some(level),
+                None => {
+                    self.sparse_bids.insert(p, level);
+                }
+            }
+        }
+        let live_asks: Vec<(u64, u64)> = self.ask_index.iter().map(|(&p, &sz)| (p, sz)).collect();
+        for (p, sz) in live_asks {
+            let level = PriceLevel::new(p, sz, seq);
+            match self.get_dense_index(p) {
+                Some(idx) => self.asks[idx] = Some(level),
+                None => {
+                    self.sparse_asks.insert(p, level);
+                }
+            }
+        }
+
+        // Keep the cached bests in step with the rebuilt book.
+        let (bp, bs) = self.update_best_bid();
+        self.best_bid.store(bp, Ordering::Relaxed);
+        self.best_bid_size.store(bs, Ordering::Relaxed);
+        let (ap, asz) = self.update_best_ask();
+        self.best_ask.store(ap, Ordering::Relaxed);
+        self.best_ask_size.store(asz, Ordering::Relaxed);
     }
 
     /// Update a price level (bid or ask)
@@ -189,13 +236,19 @@ impl OrderBook {
                 if let Some(idx) = dense_idx {
                     self.bids[idx] = level;
                 } else {
-                    // Price has drifted outside the dense range — re-center and clear
-                    // stale sparse entries to prevent unbounded HashMap growth.
+                    // Price drifted outside the dense range. adjust_price_base
+                    // re-centers AND rebuilds the dense/sparse storage from the
+                    // indexes; it must not be followed by a sparse clear, which
+                    // would throw that rebuild away.
                     self.adjust_price_base(price_cents);
-                    self.sparse_bids.clear();
-                    self.sparse_asks.clear();
                     if let Some(idx) = self.get_dense_index(price_cents) {
                         self.bids[idx] = level;
+                    } else {
+                        // Still outside the dense window (a far-away outlier):
+                        // keep it in the sparse map so it is not silently lost.
+                        if let Some(l) = level {
+                            self.sparse_bids.insert(price_cents, l);
+                        }
                     }
                 }
                 // Maintain BTreeMap index
@@ -211,13 +264,19 @@ impl OrderBook {
                 if let Some(idx) = dense_idx {
                     self.asks[idx] = level;
                 } else {
-                    // Price has drifted outside the dense range — re-center and clear
-                    // stale sparse entries to prevent unbounded HashMap growth.
+                    // Price drifted outside the dense range. adjust_price_base
+                    // re-centers AND rebuilds the dense/sparse storage from the
+                    // indexes; it must not be followed by a sparse clear, which
+                    // would throw that rebuild away.
                     self.adjust_price_base(price_cents);
-                    self.sparse_bids.clear();
-                    self.sparse_asks.clear();
                     if let Some(idx) = self.get_dense_index(price_cents) {
                         self.asks[idx] = level;
+                    } else {
+                        // Still outside the dense window (a far-away outlier):
+                        // keep it in the sparse map so it is not silently lost.
+                        if let Some(l) = level {
+                            self.sparse_asks.insert(price_cents, l);
+                        }
                     }
                 }
                 // Maintain BTreeMap index
@@ -614,3 +673,65 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod best_price_consistency {
+    use super::*;
+
+    /// A read of the book must never show levels on a side while that side's
+    /// cached best price is zero. Before this fix, adjust_price_base() cleared
+    /// bid_index/ask_index — which feed the cached bests — but left the dense
+    /// and sparse levels in place, so get_depth() reported a full book while
+    /// best_bid()/best_ask() read 0. On BTC_USD that was 48% of reads.
+    #[test]
+    fn best_prices_never_disagree_with_depth_across_recentres() {
+        let mut book = OrderBook::new("BTC_USD".to_string(), 10_000);
+
+        // A real bid ladder.
+        for i in 0..20u64 {
+            book.update_level(Side::Bid, 80_000.0 - (i as f64), 0.5, UpdateAction::New);
+        }
+        assert!(!book.get_depth(Side::Bid, 20).is_empty(), "seed failed");
+
+        // Drive the ask side far away: this re-centres, which (unfixed) wipes
+        // bid_index while leaving every bid level in the dense array. The cached
+        // best_bid is not touched here, so it merely goes stale.
+        book.update_level(Side::Ask, 95_000.0, 0.5, UpdateAction::New);
+
+        // Now a single bid DELETE. The bid branch recomputes the cached best from
+        // the (emptied) index and stores 0 — while get_depth still reports the
+        // ladder. That is the torn read seen live: levels present, best 0.
+        book.update_level(Side::Bid, 79_995.0, 0.0, UpdateAction::Delete);
+
+        let bids = book.get_depth(Side::Bid, 20);
+        assert!(
+            !(!bids.is_empty() && book.best_bid() == 0.0),
+            "torn read: {} bid levels present but best_bid == 0",
+            bids.len()
+        );
+    }
+
+    /// Re-centring must not silently drop levels that are still live.
+    #[test]
+    fn recentre_preserves_live_levels() {
+        let mut book = OrderBook::new("BTC_USD".to_string(), 10_000);
+        book.update_level(Side::Bid, 80_000.0, 1.0, UpdateAction::New);
+        book.update_level(Side::Bid, 80_010.0, 2.0, UpdateAction::New);
+        // Force a re-centre far away.
+        book.update_level(Side::Bid, 95_000.0, 3.0, UpdateAction::New);
+
+        let bids = book.get_depth(Side::Bid, 50);
+        let prices: Vec<f64> = bids.iter().map(|(p, _)| *p).collect();
+        for want in [80_000.0, 80_010.0, 95_000.0] {
+            assert!(
+                prices.iter().any(|p| (p - want).abs() < 0.005),
+                "level {want} lost across re-centre; got {prices:?}"
+            );
+        }
+        assert!(
+            (book.best_bid() - 95_000.0).abs() < 0.005,
+            "best_bid should be the highest live bid, got {}",
+            book.best_bid()
+        );
+    }
+}
