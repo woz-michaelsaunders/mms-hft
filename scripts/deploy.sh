@@ -48,6 +48,24 @@ _require_dual_env() {
   fi
 }
 
+# Git over HTTPS needs the same Forgejo credential the API calls use. Without
+# it `git ls-remote` and `git clone` fail on a private repo with "could not read
+# Username", and the poller can never see a tag. FORGEJO_TOKEN_FILE keeps the
+# secret off the process list and out of the URL.
+: "${FORGEJO_USER:=michael}"
+: "${FORGEJO_TOKEN_FILE:=/home/ubuntu/.tokens/forgejo.txt}"
+git_net() {
+  local token=${FORGEJO_TOKEN:-}
+  if [[ -z "$token" && -r "$FORGEJO_TOKEN_FILE" ]]; then
+    token=$(tr -d ' \n\r' <"$FORGEJO_TOKEN_FILE")
+  fi
+  if [[ -z "$token" ]]; then
+    git "$@"
+    return
+  fi
+  git -c credential.helper="!f(){ echo username=${FORGEJO_USER}; echo password=${token}; };f" "$@"
+}
+
 _http_get() {
   local url=$1
   local token=${FORGEJO_TOKEN:-${GITEA_TOKEN:-${GITHUB_TOKEN:-}}}
@@ -104,7 +122,7 @@ _semver_gt() {
 
 _list_version_tags() {
   local raw
-  raw=$(git ls-remote --tags --refs "$DEPLOY_GIT_URL") || return 1
+  raw=$(git_net ls-remote --tags --refs "$DEPLOY_GIT_URL") || return 1
   printf '%s\n' "$raw" \
     | awk '{print $2}' \
     | sed 's#refs/tags/##' \
@@ -115,7 +133,7 @@ _list_version_tags() {
 
 _sha_for_tag() {
   local tag=$1
-  git ls-remote --tags --refs "$DEPLOY_GIT_URL" "refs/tags/${tag}" \
+  git_net ls-remote --tags --refs "$DEPLOY_GIT_URL" "refs/tags/${tag}" \
     | awk '{print $1}' \
     | head -n1
 }
@@ -156,7 +174,7 @@ _build_and_test() {
   # Delete the clone on return; leave $stage for swap_reload.
   # shellcheck disable=SC2064
   trap 'rm -rf "$work"' RETURN
-  if ! git clone --quiet "$DEPLOY_GIT_URL" "$work/repo" 2>/dev/null; then
+  if ! git_net clone --quiet "$DEPLOY_GIT_URL" "$work/repo" 2>/dev/null; then
     echo "ERROR: deploy.sh: git clone failed" >&2
     rm -rf "$stage"
     return 1
