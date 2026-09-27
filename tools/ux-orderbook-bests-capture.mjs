@@ -11,7 +11,6 @@
  *   NODE_PATH=/tmp/pw/node_modules node tools/ux-orderbook-bests-capture.mjs
  *
  * Output: docs/ux-orderbook-bests/
- * Does not edit src/dashboard.html.
  */
 import http from 'node:http';
 import fs from 'node:fs';
@@ -54,6 +53,7 @@ const REQUIRED_STATE_CLASSES = [
     'table-msg-empty',
     'table-msg-error',
     'table-msg-success',
+    'table-msg-disabled',
     'house-state-loading',
     'house-state-empty',
     'house-state-error',
@@ -306,6 +306,14 @@ function assertSource() {
     if (leftoverHex.length) {
         throw new Error('dashboard.html raw hex outside token blocks: ' + leftoverHex.slice(0, 12).join(', '));
     }
+    const offScale = [];
+    if (/min-height:\s*40px/.test(withoutTokenBlocks)) offScale.push('min-height: 40px');
+    if (/min-width:\s*480px/.test(withoutTokenBlocks)) offScale.push('min-width: 480px');
+    const minmaxPx = withoutTokenBlocks.match(/minmax\(\s*\d+px/g) || [];
+    offScale.push(...minmaxPx);
+    if (offScale.length) {
+        throw new Error('dashboard.html off-scale spacing not routed through tokens: ' + offScale.join(', '));
+    }
 }
 
 function keyOf(screen, state) {
@@ -522,17 +530,12 @@ async function openScreen(page, base, screen, state) {
     if (key === 'orders:disabled') {
         await page.waitForFunction(() => document.querySelector('#ordersBanner .house-banner-title')?.textContent === 'Orders loaded');
         await page.evaluate(() => {
-            setDisabled('ordersRefreshBtn', true);
-            setBanner(
-                document.getElementById('ordersBanner'),
-                'disabled',
-                'Refresh orders is unavailable',
-                'Refresh stays off while a request is in flight. The last loaded orders remain on screen.',
-            );
+            setListScreensHalted(true);
         });
         await page.waitForFunction(() => {
             return document.getElementById('ordersRefreshBtn')?.disabled === true
-                && document.querySelector('#ordersBanner .house-banner-title')?.textContent === 'Refresh orders is unavailable';
+                && document.querySelector('#ordersBanner .house-banner-title')?.textContent === 'Orders frozen'
+                && document.querySelector('#tab-orders .data-section')?.classList.contains('house-state-disabled');
         });
         return;
     }
@@ -557,17 +560,12 @@ async function openScreen(page, base, screen, state) {
     if (key === 'positions:disabled') {
         await page.waitForFunction(() => document.querySelector('#positionsBanner .house-banner-title')?.textContent === 'Positions loaded');
         await page.evaluate(() => {
-            setDisabled('positionsRefreshBtn', true);
-            setBanner(
-                document.getElementById('positionsBanner'),
-                'disabled',
-                'Refresh positions is unavailable',
-                'Refresh stays off while a request is in flight. The last loaded positions remain on screen.',
-            );
+            setListScreensHalted(true);
         });
         await page.waitForFunction(() => {
             return document.getElementById('positionsRefreshBtn')?.disabled === true
-                && document.querySelector('#positionsBanner .house-banner-title')?.textContent === 'Refresh positions is unavailable';
+                && document.querySelector('#positionsBanner .house-banner-title')?.textContent === 'Positions frozen'
+                && document.querySelector('#tab-positions .data-section')?.classList.contains('house-state-disabled');
         });
         return;
     }
@@ -650,18 +648,12 @@ async function openScreen(page, base, screen, state) {
     if (key === 'securities:disabled') {
         await page.waitForFunction(() => document.querySelector('#secBanner .house-banner-title')?.textContent === 'Securities loaded');
         await page.evaluate(() => {
-            setDisabled('secRefreshBtn', true);
-            setDisabled('secSearch', true);
-            setBanner(
-                document.getElementById('secBanner'),
-                'disabled',
-                'Refresh securities is unavailable',
-                'Refresh and search stay off while a request is in flight. The last loaded list remains on screen.',
-            );
+            setListScreensHalted(true);
         });
         await page.waitForFunction(() => {
             return document.getElementById('secRefreshBtn')?.disabled === true
-                && document.querySelector('#secBanner .house-banner-title')?.textContent === 'Refresh securities is unavailable';
+                && document.querySelector('#secBanner .house-banner-title')?.textContent === 'Securities frozen'
+                && document.querySelector('#tab-securities .data-section')?.classList.contains('house-state-disabled');
         });
         return;
     }
@@ -910,6 +902,10 @@ function scoreSamples(raw) {
         ['--accent-contrast', '--accent', 'primary button'],
         ['--text', '--surface-2', 'input text on field surface'],
         ['--text-faint', '--bg', 'faint hint'],
+        ['--text-faint', '--surface-2', 'table header on surface-2'],
+        ['--success', '--bg', 'best-bid / buy on page'],
+        ['--danger', '--bg', 'best-ask / sell on page'],
+        ['--accent', '--bg', 'spread / accent on page'],
     ];
     for (const [fgName, bgName, use] of pairDefs) {
         const fg = parseCssColor(t[fgName]);
@@ -968,14 +964,14 @@ function stateLabel(screen, state) {
             empty: 'No orders',
             error: 'Cannot load orders',
             success: 'Orders loaded',
-            disabled: 'Orders loaded; Refresh orders unavailable (warning banner, dimmed control)',
+            disabled: 'Orders frozen — Kill Switch halt, warning banner, dimmed table, Refresh disabled',
         },
         positions: {
             loading: 'Loading positions; Refresh positions disabled',
             empty: 'No positions',
             error: 'Cannot load positions',
             success: 'Positions loaded',
-            disabled: 'Positions loaded; Refresh positions unavailable (warning banner, dimmed control)',
+            disabled: 'Positions frozen — Kill Switch halt, warning banner, dimmed table, Refresh disabled',
         },
         algo: {
             loading: 'Loading algorithm status; Enable disabled',
@@ -996,7 +992,7 @@ function stateLabel(screen, state) {
             empty: 'Empty list',
             error: 'Cannot load securities',
             success: 'Securities loaded',
-            disabled: 'Securities loaded; Refresh and search unavailable (warning banner, dimmed controls)',
+            disabled: 'Securities frozen — Kill Switch halt, warning banner, dimmed table, Refresh and search disabled',
         },
         kill: {
             loading: 'Checking halt; both halt buttons disabled',
@@ -1250,10 +1246,15 @@ ${rows}`;
 
 Generated by \`tools/ux-orderbook-bests-capture.mjs\` against \`src/dashboard.html\`.
 
-**No \`src/dashboard.html\` edits.** Chrome, copy, poll interval (500 ms), and
-House tokens stay as shipped. This pack re-renders every tab so the polish
-stage is not shipped blind, and it adds two extras the generic dashboard
-capture does not cover:
+House polish of \`src/dashboard.html\`: off-scale spacing routed through composed
+tokens (\`--control-min\`, \`--table-min\`, \`--col-stat\` / \`--col-chip\` /
+\`--col-field\` / \`--col-card\`); Orders / Positions / Securities have a distinct
+disabled **screen** (Kill Switch halt: warning banner, dimmed table, primary
+control off) rather than an in-flight button toggle. Poll interval (500 ms)
+is unchanged.
+
+This pack re-renders every tab so the polish is not shipped blind, and it adds
+two extras the generic dashboard capture does not cover:
 
 1. **Live one-sided** — bids populated, asks empty, \`#bestAsk\` = \`0.00\` (legal S4).
 2. **History contaminated** — kdb zeros from the torn cache (AC5). Existing
@@ -1272,6 +1273,7 @@ and is not captured. Healing is \`src/order_book.rs\`.
 
 Dedicated CSS state classes (grep targets):
 \`table-msg-loading\`, \`table-msg-empty\`, \`table-msg-error\`, \`table-msg-success\`,
+\`table-msg-disabled\`,
 \`house-state-loading\`, \`house-state-empty\`, \`house-state-error\`,
 \`house-state-success\`, \`house-state-disabled\`,
 \`house-banner-success\`, \`house-banner-error\`, \`house-banner-disabled\`.
@@ -1282,13 +1284,14 @@ Dedicated CSS state classes (grep targets):
 |---|---|---|
 | Live | In-memory order book; this bug's trader-facing surface | No |
 | History | kdb \`best_bid\` / \`best_ask\` chart (AC5 data) | No |
-| Orders / Positions / Algo / Backtest / Securities / Kill Switch | Existing House shell | No — re-rendered only |
+| Orders / Positions / Securities | List tabs | Distinct disabled screen (halt freeze) |
+| Algo / Backtest / Kill Switch | Existing House shell | State-class polish only |
 
 ## Definition of Done
 
 | Line | Verdict |
 |---|---|
-| Design tokens, no raw hex, no off-scale spacing | **Pass** — \`:root\` tokens; component rules use \`var(--*)\`. Dashboard CSS was not edited. |
+| Design tokens, no raw hex, no off-scale spacing | **Pass** — \`:root\` tokens; component rules use \`var(--*)\`. Off-scale \`40px\` / \`480px\` / \`minmax(Npx)\` routed through composed space tokens. |
 | Loading, empty, error, success, disabled | **Pass** on every tab (tables below). One-sided is a legal success variant, not a sixth banner. |
 | Responsive 375 / 768 / 1280, no horizontal page scroll | **Pass** (measured). |
 | Keyboard-navigable, visible focus ring | **Pass** — \`:focus-visible\` uses \`--focus-ring\`; captured on Live tab. |

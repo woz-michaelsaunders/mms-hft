@@ -209,6 +209,42 @@
         "use": "faint hint",
         "ratio": 5.82,
         "pass_aa": true
+      },
+      {
+        "fg_token": "--text-faint",
+        "bg_token": "--surface-2",
+        "fg": "#8b98a4",
+        "bg": "#232d37",
+        "use": "table header on surface-2",
+        "ratio": 4.74,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--success",
+        "bg_token": "--bg",
+        "fg": "#3fbf60",
+        "bg": "#161c22",
+        "use": "best-bid / buy on page",
+        "ratio": 7.22,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--danger",
+        "bg_token": "--bg",
+        "fg": "#ff6b6b",
+        "bg": "#161c22",
+        "use": "best-ask / sell on page",
+        "ratio": 6.19,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--accent",
+        "bg_token": "--bg",
+        "fg": "#4c8dff",
+        "bg": "#161c22",
+        "use": "spread / accent on page",
+        "ratio": 5.36,
+        "pass_aa": true
       }
     ],
     "tokens": {
@@ -441,6 +477,42 @@
         "bg": "#f5f7fa",
         "use": "faint hint",
         "ratio": 4.95,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--text-faint",
+        "bg_token": "--surface-2",
+        "fg": "#5f6d7a",
+        "bg": "#eef1f5",
+        "use": "table header on surface-2",
+        "ratio": 4.69,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--success",
+        "bg_token": "--bg",
+        "fg": "#1a7f37",
+        "bg": "#f5f7fa",
+        "use": "best-bid / buy on page",
+        "ratio": 4.73,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--danger",
+        "bg_token": "--bg",
+        "fg": "#b4232a",
+        "bg": "#f5f7fa",
+        "use": "best-ask / sell on page",
+        "ratio": 6.09,
+        "pass_aa": true
+      },
+      {
+        "fg_token": "--accent",
+        "bg_token": "--bg",
+        "fg": "#1f5fd6",
+        "bg": "#f5f7fa",
+        "use": "spread / accent on page",
+        "ratio": 5.34,
         "pass_aa": true
       }
     ],
