@@ -17,6 +17,9 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 fi
 
 : "${CWD:=/home/ubuntu/fix_server}"
+# The deployed binary is cargo's output, not $CWD/fix_server.
+: "${BIN:=$CWD/target/release/fix_server}"
+: "${ECOSYSTEM:=/home/ubuntu/ecosystem.config.js}"
 : "${PM2_APP:=fix_server}"
 : "${ROLLBACK_LOUD_EXIT:=3}"
 : "${CRASH_SAMPLE_GAP_S:=10}"
@@ -171,7 +174,7 @@ _lib_upgrade_binary_only() {
   tmp=$(mktemp -d "${parent}/.fix_server.prev.upgrade.XXXXXX")
   chmod 0700 "$tmp"
   mv "$path" "$tmp/legacy.bin"
-  cp "${CWD}/fix_server" "$tmp/fix_server"
+  cp "${BIN}" "$tmp/fix_server"
   chmod o-w "$tmp/fix_server" || chmod 0755 "$tmp/fix_server"
   cp "${CWD}/config.toml" "$tmp/config.toml"
   chmod 0600 "$tmp/config.toml"
@@ -196,12 +199,12 @@ snapshot_prev() {
       local tmp
       tmp=$(mktemp -d /tmp/rollback-prev-new-XXXXXX)
       chmod 0700 "$tmp"
-      if [[ ! -f "${CWD}/fix_server" || ! -f "${CWD}/config.toml" ]]; then
-        echo "ERROR: snapshot_prev missing cwd member: ${CWD}/fix_server or config.toml" >&2
+      if [[ ! -f "${BIN}" || ! -f "${CWD}/config.toml" ]]; then
+        echo "ERROR: snapshot_prev missing cwd member: ${BIN} or config.toml" >&2
         rm -rf "$tmp"
         return 1
       fi
-      cp "${CWD}/fix_server" "$tmp/fix_server"
+      cp "${BIN}" "$tmp/fix_server"
       chmod o-w "$tmp/fix_server" || chmod 0755 "$tmp/fix_server"
       cp "${CWD}/config.toml" "$tmp/config.toml"
       chmod 0600 "$tmp/config.toml"
@@ -210,11 +213,11 @@ snapshot_prev() {
       return 0
       ;;
     siblings)
-      if [[ ! -f "${CWD}/fix_server" || ! -f "${CWD}/config.toml" ]]; then
-        echo "ERROR: snapshot_prev missing cwd member: ${CWD}/fix_server" >&2
+      if [[ ! -f "${BIN}" || ! -f "${CWD}/config.toml" ]]; then
+        echo "ERROR: snapshot_prev missing cwd member: ${BIN}" >&2
         return 1
       fi
-      cp "${CWD}/fix_server" "${HOME}/.fix_server.prev"
+      cp "${BIN}" "${HOME}/.fix_server.prev"
       chmod o-w "${HOME}/.fix_server.prev" || true
       cp "${CWD}/config.toml" "${HOME}/.fix_server.prev.config"
       chmod 0600 "${HOME}/.fix_server.prev.config"
@@ -235,7 +238,7 @@ snapshot_prev() {
         packflags=-cf
         tar -xf "$archive" -C "$workdir"
       fi
-      cp "${CWD}/fix_server" "$workdir/fix_server"
+      cp "${BIN}" "$workdir/fix_server"
       chmod o-w "$workdir/fix_server" || true
       cp "${CWD}/config.toml" "$workdir/config.toml"
       chmod 0600 "$workdir/config.toml"
@@ -257,8 +260,8 @@ snapshot_prev() {
     echo "ERROR: snapshot_prev: ${HOME}/.fix_server.prev is not a directory" >&2
     return 1
   fi
-  if [[ ! -f "${CWD}/fix_server" ]]; then
-    echo "ERROR: snapshot_prev missing cwd member: ${CWD}/fix_server" >&2
+  if [[ ! -f "${BIN}" ]]; then
+    echo "ERROR: snapshot_prev missing cwd member: ${BIN}" >&2
     return 1
   fi
   if [[ ! -f "${CWD}/config.toml" ]]; then
@@ -266,7 +269,7 @@ snapshot_prev() {
     return 1
   fi
   chmod 0700 "${HOME}/.fix_server.prev" || true
-  cp "${CWD}/fix_server" "${HOME}/.fix_server.prev/fix_server"
+  cp "${BIN}" "${HOME}/.fix_server.prev/fix_server"
   chmod o-w "${HOME}/.fix_server.prev/fix_server" || chmod 0755 "${HOME}/.fix_server.prev/fix_server"
   cp "${CWD}/config.toml" "${HOME}/.fix_server.prev/config.toml"
   chmod 0600 "${HOME}/.fix_server.prev/config.toml"
@@ -315,21 +318,31 @@ swap_reload() {
   shopt -u nullglob
 
   local tmpb tmpc
-  tmpb="${CWD}/fix_server.drill-new"
+  tmpb="${BIN}.drill-new"
   tmpc="${CWD}/config.toml.drill-new"
   cp "${real}/fix_server" "$tmpb"
   chmod o-w "$tmpb" || chmod 0755 "$tmpb"
   cp "${real}/config.toml" "$tmpc"
   chmod 0600 "$tmpc"
-  mv -f "$tmpb" "${CWD}/fix_server"
+  mv -f "$tmpb" "${BIN}"
   mv -f "$tmpc" "${CWD}/config.toml"
 
   # Cursor BEFORE pm2 reload returns.
   _lib_write_cursor
-  if ! pm2 reload "$PM2_APP"; then
-    echo "ERROR: swap_reload: pm2 reload $PM2_APP failed" >&2
-    return 1
+  # Reload from the ecosystem file with --update-env, NOT `pm2 reload <app>`.
+  # A bare reload reuses pm2's stored environment. On 2026-09-23 an
+  # apt-triggered `pm2 resurrect` rebuilt fix-server from a dump that predated
+  # the credentials moving into the environment; the binary treats a missing
+  # credential as fatal and crash-looped for six hours. Re-reading the
+  # ecosystem file is what keeps the deploy honest about env changes.
+  if ! pm2 reload "$ECOSYSTEM" --only "$PM2_APP" --update-env; then
+    if ! pm2 reload "$PM2_APP" --update-env; then
+      echo "ERROR: swap_reload: pm2 reload $PM2_APP failed" >&2
+      return 1
+    fi
   fi
+  # Persist, so the next resurrect does not lose the environment again.
+  pm2 save >/dev/null 2>&1 || echo "WARN: swap_reload: pm2 save failed" >&2
   return 0
 }
 
@@ -463,11 +476,11 @@ rollback() {
         echo "FATAL: rollback cannot restore previous pair; missing path: ${first_missing}" >&2
         return "$ROLLBACK_LOUD_EXIT"
       fi
-      cp "${HOME}/.fix_server.prev" "${CWD}/fix_server.drill-new"
-      chmod o-w "${CWD}/fix_server.drill-new" || true
+      cp "${HOME}/.fix_server.prev" "${BIN}.drill-new"
+      chmod o-w "${BIN}.drill-new" || true
       cp "${HOME}/.fix_server.prev.config" "${CWD}/config.toml.drill-new"
       chmod 0600 "${CWD}/config.toml.drill-new"
-      mv -f "${CWD}/fix_server.drill-new" "${CWD}/fix_server"
+      mv -f "${BIN}.drill-new" "${BIN}"
       mv -f "${CWD}/config.toml.drill-new" "${CWD}/config.toml"
       if ! pm2 reload "$PM2_APP"; then
         echo "ERROR: rollback: pm2 reload failed" >&2
@@ -496,11 +509,11 @@ rollback() {
         echo "FATAL: rollback cannot restore previous pair; missing path: ${first_missing}" >&2
         return "$ROLLBACK_LOUD_EXIT"
       fi
-      cp "$PREV_BIN_MEMBER" "${CWD}/fix_server.drill-new"
-      chmod o-w "${CWD}/fix_server.drill-new" || true
+      cp "$PREV_BIN_MEMBER" "${BIN}.drill-new"
+      chmod o-w "${BIN}.drill-new" || true
       cp "$PREV_CFG_MEMBER" "${CWD}/config.toml.drill-new"
       chmod 0600 "${CWD}/config.toml.drill-new"
-      mv -f "${CWD}/fix_server.drill-new" "${CWD}/fix_server"
+      mv -f "${BIN}.drill-new" "${BIN}"
       mv -f "${CWD}/config.toml.drill-new" "${CWD}/config.toml"
       if ! pm2 reload "$PM2_APP"; then
         echo "ERROR: rollback: pm2 reload failed" >&2
