@@ -1,0 +1,2162 @@
+[
+  {
+    "width": "375",
+    "state": "live-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "live-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "live-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "live-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "live-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "live-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "live-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "live-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "live-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "live-disabled-375.png"
+  },
+  {
+    "width": "375",
+    "state": "history-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "history-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "history-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "history-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "history-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "history-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "history-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "history-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "history-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "history-disabled-375.png"
+  },
+  {
+    "width": "375",
+    "state": "orders-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "orders-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "orders-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "orders-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "orders-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "orders-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "orders-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "orders-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "orders-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "orders-disabled-375.png"
+  },
+  {
+    "width": "375",
+    "state": "positions-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "positions-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "positions-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "positions-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "positions-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "positions-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "positions-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "positions-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "positions-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "positions-disabled-375.png"
+  },
+  {
+    "width": "375",
+    "state": "algo-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "algo-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "algo-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "algo-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "algo-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "algo-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "algo-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "algo-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "algo-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "algo-disabled-375.png"
+  },
+  {
+    "width": "375",
+    "state": "backtest-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "backtest-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "backtest-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "backtest-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "backtest-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "backtest-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "backtest-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "backtest-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "backtest-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "backtest-disabled-375.png"
+  },
+  {
+    "width": "375",
+    "state": "securities-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "securities-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "securities-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "securities-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "securities-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "securities-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "securities-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "securities-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "securities-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "securities-disabled-375.png"
+  },
+  {
+    "width": "375",
+    "state": "kill-loading",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "kill-loading-375.png"
+  },
+  {
+    "width": "375",
+    "state": "kill-empty",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "kill-empty-375.png"
+  },
+  {
+    "width": "375",
+    "state": "kill-error",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "kill-error-375.png"
+  },
+  {
+    "width": "375",
+    "state": "kill-success",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "kill-success-375.png"
+  },
+  {
+    "width": "375",
+    "state": "kill-disabled",
+    "viewport": {
+      "w": 375,
+      "h": 812
+    },
+    "documentElement": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "body": {
+      "clientWidth": 375,
+      "scrollWidth": 375
+    },
+    "overflowing": false,
+    "file": "kill-disabled-375.png"
+  },
+  {
+    "width": "768",
+    "state": "live-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "live-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "live-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "live-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "live-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "live-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "live-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "live-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "live-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "live-disabled-768.png"
+  },
+  {
+    "width": "768",
+    "state": "history-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "history-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "history-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "history-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "history-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "history-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "history-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "history-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "history-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "history-disabled-768.png"
+  },
+  {
+    "width": "768",
+    "state": "orders-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "orders-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "orders-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "orders-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "orders-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "orders-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "orders-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "orders-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "orders-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "orders-disabled-768.png"
+  },
+  {
+    "width": "768",
+    "state": "positions-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "positions-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "positions-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "positions-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "positions-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "positions-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "positions-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "positions-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "positions-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "positions-disabled-768.png"
+  },
+  {
+    "width": "768",
+    "state": "algo-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "algo-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "algo-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "algo-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "algo-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "algo-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "algo-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "algo-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "algo-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "algo-disabled-768.png"
+  },
+  {
+    "width": "768",
+    "state": "backtest-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "backtest-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "backtest-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "backtest-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "backtest-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "backtest-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "backtest-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "backtest-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "backtest-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "backtest-disabled-768.png"
+  },
+  {
+    "width": "768",
+    "state": "securities-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "securities-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "securities-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "securities-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "securities-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "securities-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "securities-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "securities-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "securities-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "securities-disabled-768.png"
+  },
+  {
+    "width": "768",
+    "state": "kill-loading",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "kill-loading-768.png"
+  },
+  {
+    "width": "768",
+    "state": "kill-empty",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "kill-empty-768.png"
+  },
+  {
+    "width": "768",
+    "state": "kill-error",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "kill-error-768.png"
+  },
+  {
+    "width": "768",
+    "state": "kill-success",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "kill-success-768.png"
+  },
+  {
+    "width": "768",
+    "state": "kill-disabled",
+    "viewport": {
+      "w": 768,
+      "h": 1024
+    },
+    "documentElement": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "body": {
+      "clientWidth": 768,
+      "scrollWidth": 768
+    },
+    "overflowing": false,
+    "file": "kill-disabled-768.png"
+  },
+  {
+    "width": "1280",
+    "state": "live-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "live-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "live-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "live-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "live-error",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "live-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "live-success",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "live-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "live-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "live-disabled-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "history-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "history-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "history-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "history-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "history-error",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "history-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "history-success",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "history-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "history-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "history-disabled-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "orders-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "orders-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "orders-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "orders-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "orders-error",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "orders-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "orders-success",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "orders-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "orders-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "orders-disabled-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "positions-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "positions-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "positions-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "positions-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "positions-error",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "positions-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "positions-success",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "positions-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "positions-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "positions-disabled-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "algo-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "algo-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "algo-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "algo-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "algo-error",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "algo-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "algo-success",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "algo-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "algo-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "algo-disabled-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "backtest-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "backtest-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "backtest-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "backtest-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "backtest-error",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "backtest-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "backtest-success",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "backtest-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "backtest-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "backtest-disabled-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "securities-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "securities-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "securities-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "securities-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "securities-error",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "securities-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "securities-success",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "securities-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "securities-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "securities-disabled-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "kill-loading",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "kill-loading-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "kill-empty",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "kill-empty-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "kill-error",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "kill-error-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "kill-success",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "kill-success-1280.png"
+  },
+  {
+    "width": "1280",
+    "state": "kill-disabled",
+    "viewport": {
+      "w": 1280,
+      "h": 900
+    },
+    "documentElement": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "body": {
+      "clientWidth": 1280,
+      "scrollWidth": 1280
+    },
+    "overflowing": false,
+    "file": "kill-disabled-1280.png"
+  }
+]
