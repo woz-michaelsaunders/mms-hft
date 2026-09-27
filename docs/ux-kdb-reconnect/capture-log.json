@@ -1,0 +1,182 @@
+[
+  {
+    "file": "loading-375.png",
+    "label": "Loading — Checking kdb+ liveness; Grep process log disabled",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "empty-375.png",
+    "label": "Empty — Connected and idle; Grep process log is the primary action",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "error-375.png",
+    "label": "Error — kdb+ connection lost; exact production warn line",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "success-375.png",
+    "label": "Success — kdb reconnect success; exact production info lines",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-375.png",
+    "label": "Disabled — Reconnect backoff; Restart fix_server stays off",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "hist-loading-375.png",
+    "label": "History loading — Loading snapshots",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "hist-empty-375.png",
+    "label": "History empty — No snapshot data",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "hist-error-375.png",
+    "label": "History error — Cannot load history (check kdb)",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "hist-success-375.png",
+    "label": "History success — History loaded (snapshots only)",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "hist-disabled-375.png",
+    "label": "History disabled — Load history off until symbols load",
+    "width": "375",
+    "overflowing": false
+  },
+  {
+    "file": "loading-768.png",
+    "label": "Loading — Checking kdb+ liveness; Grep process log disabled",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "empty-768.png",
+    "label": "Empty — Connected and idle; Grep process log is the primary action",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "error-768.png",
+    "label": "Error — kdb+ connection lost; exact production warn line",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "success-768.png",
+    "label": "Success — kdb reconnect success; exact production info lines",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-768.png",
+    "label": "Disabled — Reconnect backoff; Restart fix_server stays off",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "hist-loading-768.png",
+    "label": "History loading — Loading snapshots",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "hist-empty-768.png",
+    "label": "History empty — No snapshot data",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "hist-error-768.png",
+    "label": "History error — Cannot load history (check kdb)",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "hist-success-768.png",
+    "label": "History success — History loaded (snapshots only)",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "hist-disabled-768.png",
+    "label": "History disabled — Load history off until symbols load",
+    "width": "768",
+    "overflowing": false
+  },
+  {
+    "file": "loading-1280.png",
+    "label": "Loading — Checking kdb+ liveness; Grep process log disabled",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "empty-1280.png",
+    "label": "Empty — Connected and idle; Grep process log is the primary action",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "error-1280.png",
+    "label": "Error — kdb+ connection lost; exact production warn line",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "success-1280.png",
+    "label": "Success — kdb reconnect success; exact production info lines",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "disabled-1280.png",
+    "label": "Disabled — Reconnect backoff; Restart fix_server stays off",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "hist-loading-1280.png",
+    "label": "History loading — Loading snapshots",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "hist-empty-1280.png",
+    "label": "History empty — No snapshot data",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "hist-error-1280.png",
+    "label": "History error — Cannot load history (check kdb)",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "hist-success-1280.png",
+    "label": "History success — History loaded (snapshots only)",
+    "width": "1280",
+    "overflowing": false
+  },
+  {
+    "file": "hist-disabled-1280.png",
+    "label": "History disabled — Load history off until symbols load",
+    "width": "1280",
+    "overflowing": false
+  }
+]
