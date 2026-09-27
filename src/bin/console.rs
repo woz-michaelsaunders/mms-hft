@@ -25,11 +25,9 @@ async fn qquery(stream: &Arc<Mutex<QStream>>, query: &str) -> Result<String> {
 }
 
 /// Same as `qquery` but returns a scalar integer/long (e.g., for `count` queries).
-async fn qcount(stream: &Arc<Mutex<QStream>>, query: &str) -> u64 {
-    match qquery(stream, query).await {
-        Ok(s) => s.trim().parse().unwrap_or(0),
-        Err(_) => 0,
-    }
+async fn qcount(stream: &Arc<Mutex<QStream>>, query: &str) -> Result<u64> {
+    let s = qquery(stream, query).await?;
+    Ok(s.trim().parse().unwrap_or(0))
 }
 
 #[tokio::main]
@@ -46,11 +44,11 @@ async fn main() -> Result<()> {
         QStream::connect(ConnectionMethod::TCP, &kdb_host, kdb_port, ""),
     )
     .await
-    .map_err(|_| anyhow!("Connection timed out after 5 seconds"))?
-    .map_err(|e| anyhow!("Failed to connect to kdb+ at {}:{}: {}\n💡 Make sure kdb+ is running: q kdb/start_kdb_server.q", kdb_host, kdb_port, e))?;
+    .map_err(|_| anyhow!("Connection timed out after 5 seconds. Start kdb+ first: q kdb/start_kdb_server.q"))?
+    .map_err(|e| anyhow!("Cannot connect to kdb+ at {}:{}: {}.\nStart kdb+ first: q kdb/start_kdb_server.q", kdb_host, kdb_port, e))?;
 
     let stream = Arc::new(Mutex::new(raw_stream));
-    println!("✅ Connected to kdb+ at {}:{}", kdb_host, kdb_port);
+    println!("Connected to kdb+ at {}:{}", kdb_host, kdb_port);
 
     let stdin = tokio::io::stdin();
     let reader = BufReader::new(stdin);
@@ -59,19 +57,20 @@ async fn main() -> Result<()> {
     loop {
         print!("\x1B[2J\x1B[1;1H");
         println!("╔════════════════════════════════════════════════════════════╗");
-        println!("║     FIX Server Management Console (kdb+ Direct IPC)       ║");
+        println!("║     Fix server management console (kdb+ direct IPC)       ║");
         println!("╚════════════════════════════════════════════════════════════╝");
         println!();
         println!("Connected to kdb+ at {}:{}", kdb_host, kdb_port);
+        println!("Option 1 is the operator oracle for orderbook_levels, trades, and snapshots.");
         println!();
-        println!("Menu Options:");
-        println!("  1 -> Data Summary");
-        println!("  2 -> Query Trades (last 20)");
-        println!("  3 -> Query Order Book Levels (last 50)");
-        println!("  4 -> Query Snapshots (last 10)");
-        println!("  5 -> Query Securities");
-        println!("  6 -> Custom Q Query");
-        println!("  7 -> Query Individual Security");
+        println!("Menu:");
+        println!("  1 -> Data summary");
+        println!("  2 -> Trades (last 20)");
+        println!("  3 -> Order book levels (last 50)");
+        println!("  4 -> Snapshots (last 10)");
+        println!("  5 -> Securities");
+        println!("  6 -> Custom q query");
+        println!("  7 -> Individual security");
         println!("  99 -> Exit");
         println!();
         print!("Select option: ");
@@ -80,7 +79,7 @@ async fn main() -> Result<()> {
         let line = match lines.next_line().await {
             Ok(Some(l)) => l,
             Ok(None) => break,
-            Err(e) => { eprintln!("Error reading input: {}", e); continue; }
+            Err(e) => { eprintln!("Cannot read input: {}", e); continue; }
         };
 
         match line.trim() {
@@ -91,8 +90,8 @@ async fn main() -> Result<()> {
             "5"  => { query_table(&stream, "securities", "-20#securities", 20).await?;   pause(&mut lines).await; }
             "6"  => { custom_query(&stream, &mut lines).await?;       pause(&mut lines).await; }
             "7"  => { query_individual_security(&stream, &mut lines).await?; pause(&mut lines).await; }
-            "99" => { println!("\nExiting console..."); break; }
-            _    => { println!("\nInvalid option. Please select 1-7 or 99."); pause(&mut lines).await; }
+            "99" => { println!("\nExiting console."); break; }
+            _    => { println!("\nUnknown option. Choose 1-7 or 99."); pause(&mut lines).await; }
         }
     }
 
@@ -107,23 +106,69 @@ async fn pause(lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>) {
 async fn display_summary(stream: &Arc<Mutex<QStream>>) -> Result<()> {
     println!();
     println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║                    KDB+ DATA SUMMARY                       ║");
+    println!("║                    kdb+ data summary                       ║");
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
-    println!("  Querying kdb+...");
+    println!("  Checking table counts. Counts come from kdb+, not the dashboard Live tab.");
 
-    let levels    = qcount(stream, "count orderbook_levels").await;
-    let trades    = qcount(stream, "count trades").await;
-    let snapshots = qcount(stream, "count orderbook_snapshots").await;
-    let secs      = qcount(stream, "count securities").await;
-    let syms      = qcount(stream, "exec count distinct symbol from orderbook_snapshots").await;
+    let levels = match qcount(stream, "count orderbook_levels").await {
+        Ok(n) => n,
+        Err(e) => {
+            println!();
+            println!("  Cannot read kdb counts: {}", e);
+            println!("  Confirm kdb+ is running, then choose 1 again.");
+            return Ok(());
+        }
+    };
+    let trades = match qcount(stream, "count trades").await {
+        Ok(n) => n,
+        Err(e) => {
+            println!();
+            println!("  Cannot read kdb counts: {}", e);
+            println!("  Confirm kdb+ is running, then choose 1 again.");
+            return Ok(());
+        }
+    };
+    let snapshots = match qcount(stream, "count orderbook_snapshots").await {
+        Ok(n) => n,
+        Err(e) => {
+            println!();
+            println!("  Cannot read kdb counts: {}", e);
+            println!("  Confirm kdb+ is running, then choose 1 again.");
+            return Ok(());
+        }
+    };
+    let secs = match qcount(stream, "count securities").await {
+        Ok(n) => n,
+        Err(e) => {
+            println!();
+            println!("  Cannot read kdb counts: {}", e);
+            println!("  Confirm kdb+ is running, then choose 1 again.");
+            return Ok(());
+        }
+    };
+    let syms = match qcount(stream, "exec count distinct symbol from orderbook_snapshots").await {
+        Ok(n) => n,
+        Err(e) => {
+            println!();
+            println!("  Cannot read kdb counts: {}", e);
+            println!("  Confirm kdb+ is running, then choose 1 again.");
+            return Ok(());
+        }
+    };
 
     println!();
-    println!("  Orderbook Levels : {}", levels);
-    println!("  Trades           : {}", trades);
-    println!("  Snapshots        : {}", snapshots);
-    println!("  Securities       : {}", secs);
-    println!("  Unique Symbols   : {}", syms);
+    println!("  Order book levels : {}", levels);
+    println!("  Trades            : {}", trades);
+    println!("  Snapshots         : {}", snapshots);
+    println!("  Securities        : {}", secs);
+    println!("  Distinct symbols  : {}", syms);
+    println!();
+    if levels == 0 && trades == 0 && snapshots == 0 {
+        println!("  No market-data rows yet. Wait for live 35=W/35=X, then choose 1 again.");
+    } else if trades == 0 {
+        println!("  Trades stay at 0 unless MDEntryType=2 (269=2) is on the wire.");
+    }
     println!();
     Ok(())
 }
@@ -138,9 +183,16 @@ async fn query_table(
     println!("Table: {}  (last {})", table, limit);
     println!();
 
-    let count = qcount(stream, &format!("count {}", table)).await;
+    let count = match qcount(stream, &format!("count {}", table)).await {
+        Ok(n) => n,
+        Err(e) => {
+            println!("  Cannot query {}: {}", table, e);
+            println!("  Confirm kdb+ is running, then choose this option again.");
+            return Ok(());
+        }
+    };
     if count == 0 {
-        println!("  No data in {}", table);
+        println!("  No rows in {} yet. Wait for writes, then choose this option again.", table);
         return Ok(());
     }
     println!("  Total rows: {}", count);
@@ -154,7 +206,10 @@ async fn query_table(
                 }
             }
         }
-        Err(e) => println!("  ❌ Query failed: {}", e),
+        Err(e) => {
+            println!("  Cannot query {}: {}", table, e);
+            println!("  Confirm kdb+ is running, then choose this option again.");
+        }
     }
     Ok(())
 }
@@ -165,10 +220,10 @@ async fn query_individual_security(
 ) -> Result<()> {
     println!();
     println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║              QUERY INDIVIDUAL SECURITY                     ║");
+    println!("║              Query individual security                     ║");
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
-    println!("Enter symbol (e.g., BTC_USDT) or wildcard (e.g., BTC*, *USD):");
+    println!("Enter a symbol (for example BTC_USDT) or a wildcard (BTC*, *USD):");
     print!("Symbol: ");
     std::io::stdout().flush()?;
 
@@ -184,7 +239,11 @@ async fn query_individual_security(
     // Fetch recent securities from kdb+
     let raw = match qquery(stream, "-1000#securities").await {
         Ok(r) => r,
-        Err(e) => { println!("  ❌ Query failed: {}", e); return Ok(()); }
+        Err(e) => {
+            println!("  Cannot query securities: {}", e);
+            println!("  Confirm kdb+ is running, then choose 7 again.");
+            return Ok(());
+        }
     };
 
     // Build regex from wildcard pattern
@@ -227,8 +286,8 @@ async fn query_individual_security(
     }
 
     if !found {
-        println!("  ❌ No match for: {} (searched last 1000 securities)", symbol);
-        println!("  💡 Use option 5 to list available symbols.");
+        println!("  No match for {} in the last 1000 securities.", symbol);
+        println!("  Choose 5 to list available symbols, then try again.");
     }
     Ok(())
 }
@@ -239,10 +298,10 @@ async fn custom_query(
 ) -> Result<()> {
     println!();
     println!("╔════════════════════════════════════════════════════════════╗");
-    println!("║                  CUSTOM Q QUERY                            ║");
+    println!("║                  Custom q query                            ║");
     println!("╚════════════════════════════════════════════════════════════╝");
     println!();
-    println!("Enter a q query (or press Enter to cancel):");
+    println!("Enter a q query, or press Enter to cancel:");
     print!("q> ");
     std::io::stdout().flush()?;
 
@@ -265,7 +324,7 @@ async fn custom_query(
                 }
             }
         }
-        Err(e) => println!("❌ Query failed: {}", e),
+        Err(e) => println!("Cannot run query: {}", e),
     }
     Ok(())
 }

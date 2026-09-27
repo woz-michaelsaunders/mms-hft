@@ -1,0 +1,317 @@
+[
+  {
+    "file": "loading-375.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-375.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-375.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-375.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-375.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "hist-loading-375.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-empty-375.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-error-375.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-success-375.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-disabled-375.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "loading-768.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-768.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-768.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-768.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-768.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "hist-loading-768.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-empty-768.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-error-768.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-success-768.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-disabled-768.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "loading-1280.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "empty-1280.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "error-1280.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "success-1280.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": false,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "disabled-1280.png",
+    "surface": "cli",
+    "labelledHost": true,
+    "labelledPort": true,
+    "hostLabel": "Host",
+    "portLabel": "Port",
+    "primaryAction": "Refresh summary",
+    "primaryDisabled": true,
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true
+  },
+  {
+    "file": "hist-loading-1280.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-empty-1280.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-error-1280.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-success-1280.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  },
+  {
+    "file": "hist-disabled-1280.png",
+    "surface": "history",
+    "labelledSymbol": true,
+    "symbolLabel": "Symbol",
+    "forbiddenInDom": [],
+    "hasFocusVisibleRule": true,
+    "hasKdbChrome": false
+  }
+]
