@@ -23,6 +23,9 @@ const FLUSH_INTERVAL_MS: u64 = 100;
 const RECONNECT_POLL_MS: u64 = 250;
 const RECONNECT_BACKOFF_CAP_MS: u64 = 30_000;
 const DEFAULT_RECONNECT_BACKOFF_MS: u64 = 1_000;
+const LIVENESS_PROBE_INTERVAL_MS: u64 = 1000;
+const LIVENESS_PROBE_TIMEOUT_MS: u64 = 2000;
+const LIVENESS_PROBE_Q: &str = "1";  // file-local literal; never format!
 
 /// Typed-scalar ensureCol — byte-identical with `kdb/start_kdb_server.q`.
 /// Must use `` `long$0N `` (never `` `long$() ``) so `meta` stays `j` on a non-empty HDB.
@@ -117,6 +120,15 @@ pub enum ProbeEvent {
     PendingMdIo { kind: &'static str, symbol: String, seq_num: Option<u32> },
     CaptureGap { symbol: String, expected: u32, received: u32, gap_size: u32 },
     OverflowGap { symbol: String, drop_count: u32 },
+    KdbDisconnected,
+    KdbReconnected,
+}
+
+#[derive(Debug, Clone)]
+enum ProbeOutcome {
+    Alive,
+    QError { message: String },
+    Transport,
 }
 
 /// kdb+ IPC connection manager using kxkdb library with batched writes for maximum performance
@@ -166,7 +178,7 @@ impl KdbWriter {
     }
 
     async fn connect_ipc(&self) -> Result<()> {
-        Self::connect_ipc_with(&self.host, self.port, &self.stream, &self.connected).await
+        Self::connect_ipc_with(&self.host, self.port, &self.stream, &self.connected, &self.probe).await
     }
 
     async fn connect_ipc_with(
@@ -174,7 +186,10 @@ impl KdbWriter {
         port: u16,
         stream: &Arc<Mutex<Option<QStream>>>,
         connected: &Arc<tokio::sync::Mutex<bool>>,
+        probe: &Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
     ) -> Result<()> {
+        #[cfg(not(test))]
+        let _ = probe;
         let addr = format!("{}:{}", host, port);
         info!("🔌 Connecting to kdb+ at {}...", addr);
 
@@ -185,6 +200,8 @@ impl KdbWriter {
                     Ok(()) => {
                         *connected.lock().await = true;
                         info!("✅ Connected to kdb+ at {}", addr);
+                        #[cfg(test)]
+                        Self::record_probe_arc(probe, ProbeEvent::KdbReconnected);
                         Ok(())
                     }
                     Err(e) => {
@@ -201,6 +218,50 @@ impl KdbWriter {
         }
     }
 
+    async fn probe_once(
+        stream: &Arc<Mutex<Option<QStream>>>,
+    ) -> ProbeOutcome {
+        let mut stream_guard = stream.lock().await;
+        let qstream = match stream_guard.as_mut() {
+            Some(qstream) => qstream,
+            None => return ProbeOutcome::Transport,
+        };
+        // ADR-072 scoped exception to ADR-060; drop stream on expiry — never reuse this QStream
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(LIVENESS_PROBE_TIMEOUT_MS),
+            qstream.send_sync_message(&LIVENESS_PROBE_Q),
+        )
+        .await;
+        drop(stream_guard);
+        match result {
+            Ok(Ok(k)) if k.get_type() == qtype::ERROR => ProbeOutcome::QError {
+                message: k.get_error_string().unwrap_or("unknown error").to_string(),
+            },
+            Ok(Ok(_)) => ProbeOutcome::Alive,
+            Ok(Err(_)) => ProbeOutcome::Transport,
+            Err(_elapsed) => ProbeOutcome::Transport,
+        }
+    }
+
+    async fn mark_disconnected(
+        connected: &Arc<tokio::sync::Mutex<bool>>,
+        stream: &Arc<Mutex<Option<QStream>>>,
+        probe: &Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
+    ) {
+        let mut connected_guard = connected.lock().await;
+        if !*connected_guard {
+            return;
+        }
+        let _ = stream.lock().await.take();
+        *connected_guard = false;
+        drop(connected_guard);
+        warn!("⚠️ kdb+ connection lost (peer closed or probe timeout) — entering reconnect backoff");
+        #[cfg(test)]
+        Self::record_probe_arc(probe, ProbeEvent::KdbDisconnected);
+        #[cfg(not(test))]
+        let _ = probe;
+    }
+
     /// Start background task to periodically flush buffers
     fn start_flush_task(&self) {
         let level_buf = Arc::clone(&self.level_buffer);
@@ -210,20 +271,25 @@ impl KdbWriter {
         let gap_buf = Arc::clone(&self.capture_gap_buffer);
         let stream = Arc::clone(&self.stream);
         let connected = Arc::clone(&self.connected);
+        let probe = Arc::clone(&self.probe);
         let batch_size = self.batch_size;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(FLUSH_INTERVAL_MS));
+            let mut last_probe = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap_or_else(std::time::Instant::now);
             loop {
                 interval.tick().await;
 
-                if *connected.lock().await {
+                let up = *connected.lock().await;
+                if up {
                     let mut levels = level_buf.lock().await;
                     if !levels.is_empty() {
                         let batch: Vec<_> = levels.drain(..).collect();
                         drop(levels);
                         if let Err(e) = Self::flush_levels_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &level_buf, batch, "level", e).await;
+                            Self::requeue_on_flush_err(&connected, &stream, &level_buf, batch, "level", e, &probe).await;
                         }
                     }
 
@@ -232,7 +298,7 @@ impl KdbWriter {
                         let batch: Vec<_> = trades.drain(..).collect();
                         drop(trades);
                         if let Err(e) = Self::flush_trades_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &trade_buf, batch, "trade", e).await;
+                            Self::requeue_on_flush_err(&connected, &stream, &trade_buf, batch, "trade", e, &probe).await;
                         }
                     }
 
@@ -241,7 +307,7 @@ impl KdbWriter {
                         let batch: Vec<_> = snapshots.drain(..).collect();
                         drop(snapshots);
                         if let Err(e) = Self::flush_snapshots_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &snapshot_buf, batch, "snapshot", e).await;
+                            Self::requeue_on_flush_err(&connected, &stream, &snapshot_buf, batch, "snapshot", e, &probe).await;
                         }
                     }
 
@@ -250,7 +316,7 @@ impl KdbWriter {
                         let batch: Vec<_> = own_trades.drain(..).collect();
                         drop(own_trades);
                         if let Err(e) = Self::flush_own_trades_batch(&stream, &batch).await {
-                            warn!("Failed to flush own_trades batch: {}", e);
+                            Self::requeue_on_flush_err(&connected, &stream, &own_trade_buf, batch, "own_trade", e, &probe).await;
                         }
                     }
 
@@ -259,7 +325,23 @@ impl KdbWriter {
                         let batch: Vec<_> = gaps.drain(..).collect();
                         drop(gaps);
                         if let Err(e) = Self::flush_capture_gaps_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &gap_buf, batch, "capture_gap", e).await;
+                            Self::requeue_on_flush_err(&connected, &stream, &gap_buf, batch, "capture_gap", e, &probe).await;
+                        }
+                    }
+                }
+
+                let up = *connected.lock().await;
+                if up && last_probe.elapsed() >= std::time::Duration::from_millis(LIVENESS_PROBE_INTERVAL_MS) {
+                    match Self::probe_once(&stream).await {
+                        ProbeOutcome::Alive => {
+                            last_probe = std::time::Instant::now();
+                        }
+                        ProbeOutcome::QError { message } => {
+                            warn!("kdb+ liveness probe q-error (latch stays up): {}", message);
+                            last_probe = std::time::Instant::now();
+                        }
+                        ProbeOutcome::Transport => {
+                            Self::mark_disconnected(&connected, &stream, &probe).await;
                         }
                     }
                 }
@@ -273,6 +355,7 @@ impl KdbWriter {
         let port = self.port;
         let stream = Arc::clone(&self.stream);
         let connected = Arc::clone(&self.connected);
+        let probe = Arc::clone(&self.probe);
         let initial = std::env::var("KDB_RECONNECT_BACKOFF_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -282,13 +365,14 @@ impl KdbWriter {
         tokio::spawn(async move {
             let mut backoff = initial;
             loop {
-                if *connected.lock().await {
+                let up = *connected.lock().await;
+                if up {
                     backoff = initial;
                     tokio::time::sleep(tokio::time::Duration::from_millis(RECONNECT_POLL_MS)).await;
                     continue;
                 }
                 warn!("kdb reconnect attempt (backoff {}ms) to {}:{}", backoff, host, port);
-                match KdbWriter::connect_ipc_with(&host, port, &stream, &connected).await {
+                match KdbWriter::connect_ipc_with(&host, port, &stream, &connected, &probe).await {
                     Ok(()) => {
                         info!("kdb reconnect success at {}:{}", host, port);
                         backoff = initial;
@@ -366,10 +450,10 @@ impl KdbWriter {
         batch: Vec<T>,
         what: &str,
         err: anyhow::Error,
+        probe: &Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
     ) {
         warn!("Failed to flush {} batch: {} — dropping kdb latch and re-queuing", what, err);
-        *connected.lock().await = false;
-        let _ = stream.lock().await.take();
+        Self::mark_disconnected(connected, stream, probe).await;
         let mut buf = buf.lock().await;
         for item in batch.into_iter().rev() {
             buf.push_front(item);
@@ -422,6 +506,7 @@ impl KdbWriter {
                     batch,
                     "capture_gap",
                     e,
+                    &self.probe,
                 ).await;
             }
         }
@@ -615,7 +700,7 @@ impl KdbWriter {
             drop(buffer);
 
             if let Err(e) = Self::flush_levels_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.level_buffer, batch, "level", e).await;
+                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.level_buffer, batch, "level", e, &self.probe).await;
             }
         }
 
@@ -663,7 +748,7 @@ impl KdbWriter {
             drop(buffer);
 
             if let Err(e) = Self::flush_trades_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.trade_buffer, batch, "trade", e).await;
+                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.trade_buffer, batch, "trade", e, &self.probe).await;
             }
         }
 
@@ -718,7 +803,7 @@ impl KdbWriter {
             drop(buffer);
 
             if let Err(e) = Self::flush_snapshots_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.snapshot_buffer, batch, "snapshot", e).await;
+                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.snapshot_buffer, batch, "snapshot", e, &self.probe).await;
             }
         }
 
@@ -770,10 +855,15 @@ impl KdbWriter {
         );
 
         match Self::execute_single_insert(stream, &q_code).await {
-            Ok(()) => debug!("✅ Flushed {} own trades", batch.len()),
-            Err(e) => warn!("❌ Failed to bulk-insert own trades: {}", e),
+            Ok(()) => {
+                debug!("✅ Flushed {} own trades", batch.len());
+                Ok(())
+            }
+            Err(e) => {
+                warn!("❌ Failed to bulk-insert own trades: {}", e);
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     /// Write an own execution fill to kdb+ (buffered)
@@ -789,10 +879,6 @@ impl KdbWriter {
         order_id: &str,
         exec_type: char,
     ) -> Result<()> {
-        if !*self.connected.lock().await {
-            return Ok(());
-        }
-
         let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) - KDB_TIMESTAMP_OFFSET_NS;
 
         let own_trade = OwnTrade {
@@ -807,21 +893,34 @@ impl KdbWriter {
             exec_type,
         };
 
-        let mut buffer = self.own_trade_buffer.lock().await;
+        let buffer_len = {
+            let mut buffer = self.own_trade_buffer.lock().await;
 
-        if buffer.len() >= MAX_KDB_BUFFER {
-            let drop_count = buffer.len() / 2;
-            buffer.drain(..drop_count);
-            warn!("⚠️  kdb own_trade buffer overflow — dropped {} oldest entries", drop_count);
-        }
+            if buffer.len() >= MAX_KDB_BUFFER {
+                let drop_count = buffer.len() / 2;
+                buffer.drain(..drop_count);
+                warn!("⚠️  kdb own_trade buffer overflow — dropped {} oldest entries", drop_count);
+            }
 
-        buffer.push_back(own_trade);
+            buffer.push_back(own_trade);
+            buffer.len()
+        };
 
-        if buffer.len() >= self.batch_size {
+        let up = *self.connected.lock().await;
+        if buffer_len >= self.batch_size && up {
+            let mut buffer = self.own_trade_buffer.lock().await;
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
             if let Err(e) = Self::flush_own_trades_batch(&self.stream, &batch).await {
-                warn!("Failed to flush own_trades batch: {}", e);
+                Self::requeue_on_flush_err(
+                    &self.connected,
+                    &self.stream,
+                    &self.own_trade_buffer,
+                    batch,
+                    "own_trade",
+                    e,
+                    &self.probe,
+                ).await;
             }
         }
 
@@ -941,9 +1040,13 @@ impl KdbWriter {
         Self::k_table_to_json(&k)
     }
 
-    pub fn record_probe(&self, ev: ProbeEvent) {
-        self.probe.lock().unwrap().push(ev.clone());
+    fn record_probe_arc(probe: &Arc<std::sync::Mutex<Vec<ProbeEvent>>>, ev: ProbeEvent) {
+        probe.lock().unwrap().push(ev.clone());
         log::info!("PROBE {:?}", ev);
+    }
+
+    pub fn record_probe(&self, ev: ProbeEvent) {
+        Self::record_probe_arc(&self.probe, ev);
     }
 
     pub fn drain_probe(&self) -> Vec<ProbeEvent> {
@@ -1121,6 +1224,14 @@ impl KdbWriter {
         self.level_buffer.lock().await.len()
     }
 
+    pub(crate) async fn own_trade_buffer_len(&self) -> usize {
+        self.own_trade_buffer.lock().await.len()
+    }
+
+    pub(crate) async fn is_connected(&self) -> bool {
+        *self.connected.lock().await
+    }
+
     pub(crate) async fn capture_gap_buffer_len(&self) -> usize {
         self.capture_gap_buffer.lock().await.len()
     }
@@ -1138,6 +1249,9 @@ impl KdbWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kxkdb::ipc::{qmsg_type, Auth, ConnectionMethod, K, QStream};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     #[test]
     fn escape_kdb_string_quotes_and_backslashes() {
@@ -1211,5 +1325,222 @@ mod tests {
             "gap-buffer overflow must not emit OverflowGap, got {:?}",
             evs
         );
+    }
+
+    struct PermissiveAuth;
+
+    impl Auth for PermissiveAuth {
+        fn authorize<'life0, 'life1, 'async_trait>(
+            &'life0 mut self,
+            _credential: &'life1 str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = kxkdb::ipc::Result<()>> + Send + 'async_trait>,
+        >
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn sample_own_trade() -> OwnTrade {
+        OwnTrade {
+            timestamp: 1,
+            symbol: "BTC_USDT".into(),
+            side: 'B',
+            last_px: 1.0,
+            last_qty: 1.0,
+            avg_px: 1.0,
+            cl_ord_id: "c1".into(),
+            order_id: "o1".into(),
+            exec_type: 'F',
+        }
+    }
+
+    async fn ack_until_err_or_drop(
+        qs: &mut QStream,
+        mut drop_rx: Option<&mut tokio::sync::oneshot::Receiver<()>>,
+    ) {
+        loop {
+            let recv = qs.receive_message();
+            let msg = if let Some(rx) = drop_rx.as_mut() {
+                tokio::select! {
+                    _ = &mut **rx => return,
+                    msg = recv => msg,
+                }
+            } else {
+                recv.await
+            };
+            match msg {
+                Ok((typ, _)) if typ == qmsg_type::synchronous => {
+                    let _ = qs.send_message(&K::new_long(1), qmsg_type::response).await;
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_own_trade_enqueues_when_disconnected() {
+        let w = KdbWriter::new("127.0.0.1".into(), 1);
+        w.write_own_trade("BTC_USDT", 'B', 1.0, 1.0, 1.0, "c1", "o1", 'F').await.unwrap();
+        assert_eq!(w.own_trade_buffer_len().await, 1);
+        assert!(
+            !w.drain_probe().iter().any(|e| matches!(e, ProbeEvent::OverflowGap { .. })),
+            "own_trade overflow must not emit OverflowGap"
+        );
+    }
+
+    #[tokio::test]
+    async fn flush_own_trades_batch_err_requeues_and_drops_latch() {
+        let w = KdbWriter::new("127.0.0.1".into(), 1);
+        *w.connected.lock().await = true;
+        w.own_trade_buffer.lock().await.push_back(sample_own_trade());
+        let batch: Vec<_> = w.own_trade_buffer.lock().await.drain(..).collect();
+        let err = KdbWriter::flush_own_trades_batch(&w.stream, &batch).await.unwrap_err();
+        KdbWriter::requeue_on_flush_err(
+            &w.connected,
+            &w.stream,
+            &w.own_trade_buffer,
+            batch,
+            "own_trade",
+            err,
+            &w.probe,
+        )
+        .await;
+        assert_eq!(w.own_trade_buffer_len().await, 1);
+        assert!(!w.is_connected().await);
+        let disc = w
+            .drain_probe()
+            .into_iter()
+            .filter(|e| matches!(e, ProbeEvent::KdbDisconnected))
+            .count();
+        assert_eq!(disc, 1);
+    }
+
+    #[tokio::test]
+    async fn write_own_trade_flush_err_requeues_and_drops_latch() {
+        let w = KdbWriter::new("127.0.0.1".into(), 1);
+        *w.connected.lock().await = true;
+        for _ in 0..100 {
+            w.write_own_trade("BTC_USDT", 'B', 1.0, 1.0, 1.0, "c1", "o1", 'F')
+                .await
+                .unwrap();
+        }
+        assert_eq!(w.own_trade_buffer_len().await, 100);
+        assert!(!w.is_connected().await);
+        let disc = w
+            .drain_probe()
+            .into_iter()
+            .filter(|e| matches!(e, ProbeEvent::KdbDisconnected))
+            .count();
+        assert_eq!(disc, 1);
+    }
+
+    #[tokio::test]
+    async fn probe_once_stream_none_is_transport() {
+        let stream: Arc<Mutex<Option<QStream>>> = Arc::new(Mutex::new(None));
+        let outcome = KdbWriter::probe_once(&stream).await;
+        assert!(matches!(outcome, ProbeOutcome::Transport));
+    }
+
+    #[tokio::test]
+    async fn peer_close_reconnects_without_restart() {
+        // kxkdb `accept_auth` takes `&mut dyn Auth` which is !Send; keep the stub
+        // on a LocalSet so we do not add async-trait / Send bounds.
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let port = {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    drop(listener);
+                    port
+                };
+
+                let (drop_tx, drop_rx) = tokio::sync::oneshot::channel::<()>();
+                tokio::task::spawn_local(async move {
+                    let mut drop_rx = Some(drop_rx);
+                    let mut first = true;
+                    loop {
+                        let mut auth = PermissiveAuth;
+                        match QStream::accept_auth(
+                            ConnectionMethod::TCP,
+                            "127.0.0.1",
+                            port,
+                            &mut auth,
+                        )
+                        .await
+                        {
+                            Ok(mut qs) => {
+                                if first {
+                                    first = false;
+                                    let mut rx = drop_rx.take();
+                                    ack_until_err_or_drop(&mut qs, rx.as_mut()).await;
+                                    drop(qs);
+                                } else {
+                                    ack_until_err_or_drop(&mut qs, None).await;
+                                }
+                            }
+                            Err(_) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                            }
+                        }
+                    }
+                });
+
+                let w = KdbWriter::new("127.0.0.1".into(), port);
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    loop {
+                        if w.initialize().await.is_ok() {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                })
+                .await
+                .expect("initialize should succeed within 10s");
+
+                assert!(w.is_connected().await);
+                let first_events = w.drain_probe();
+                assert!(
+                    first_events
+                        .iter()
+                        .any(|e| matches!(e, ProbeEvent::KdbReconnected)),
+                    "first connect must record KdbReconnected, got {:?}",
+                    first_events
+                );
+                assert!(
+                    !first_events
+                        .iter()
+                        .any(|e| matches!(e, ProbeEvent::KdbDisconnected)),
+                    "first connect must not record KdbDisconnected, got {:?}",
+                    first_events
+                );
+
+                let _ = drop_tx.send(());
+
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let mut saw_disc = false;
+                    loop {
+                        for ev in w.drain_probe() {
+                            match ev {
+                                ProbeEvent::KdbDisconnected => saw_disc = true,
+                                ProbeEvent::KdbReconnected if saw_disc => return,
+                                _ => {}
+                            }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                })
+                .await
+                .expect("idle peer-close must reconnect within 10s without reconstructing KdbWriter");
+
+                assert!(w.is_connected().await);
+            })
+            .await;
     }
 }
