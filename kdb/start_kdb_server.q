@@ -23,7 +23,7 @@ loadTables: {
     system "mkdir -p kdb/hdb";
     tableNames: `orderbook_levels`trades`orderbook_snapshots`securities`own_trades`capture_gaps;
     {[n]
-        p: hdbPath,n;
+        p: .Q.dd[hdbPath;n];
         // key on a non-existent path returns a null in some kdb+ versions — test carefully
         if[not @[{count key x; 1b}; p; {0b}]; :[]];
         @[{[nm;pth] value (string nm), ": load `", (1_string pth)}; (n;p); {[e] show "Could not load table: ", e}]
@@ -42,12 +42,12 @@ ensureCol[`orderbook_snapshots;`seq_num];
 // Save all tables to HDB path
 saveTables: {
     show "Saving tables to disk...";
-    @[save; hdbPath,`orderbook_levels;     {[e] show "Error saving orderbook_levels: ",     e}];
-    @[save; hdbPath,`trades;               {[e] show "Error saving trades: ",               e}];
-    @[save; hdbPath,`orderbook_snapshots;  {[e] show "Error saving orderbook_snapshots: ",  e}];
-    @[save; hdbPath,`securities;           {[e] show "Error saving securities: ",           e}];
-    @[save; hdbPath,`own_trades;           {[e] show "Error saving own_trades: ",           e}];
-    @[save; hdbPath,`capture_gaps;         {[e] show "Error saving capture_gaps: ",         e}];
+    @[save; .Q.dd[hdbPath;`orderbook_levels];     {[e] show "Error saving orderbook_levels: ",     e}];
+    @[save; .Q.dd[hdbPath;`trades];               {[e] show "Error saving trades: ",               e}];
+    @[save; .Q.dd[hdbPath;`orderbook_snapshots];  {[e] show "Error saving orderbook_snapshots: ",  e}];
+    @[save; .Q.dd[hdbPath;`securities];           {[e] show "Error saving securities: ",           e}];
+    @[save; .Q.dd[hdbPath;`own_trades];           {[e] show "Error saving own_trades: ",           e}];
+    @[save; .Q.dd[hdbPath;`capture_gaps];         {[e] show "Error saving capture_gaps: ",         e}];
     show "Tables saved to disk.";
     };
 
