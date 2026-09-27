@@ -150,8 +150,12 @@ impl OrderBook {
         }
     }
 
-    /// Adjust price base to center dense array around current price.
-    /// Clears BTreeMap indexes because the dense array mapping becomes stale.
+    /// Move the dense window. MUST NOT wipe dense arrays, MUST NOT clear sparse
+    /// maps, MUST NOT rebuild storage from indexes, MUST NOT store caches.
+    /// Indexes are price-keyed but are cleared because the following helper
+    /// rebuilds them from remaining storage after the sparse wipe and the new
+    /// dense write; clearing here without that rebuild is the original T1 bug
+    /// (levels present, best_bid/best_ask == 0).
     #[inline(always)]
     fn adjust_price_base(&mut self, price_cents: u64) {
         let new_base = price_cents.saturating_sub(self.dense_size as u64 / 2);
@@ -159,48 +163,70 @@ impl OrderBook {
             return;
         }
         self.price_base = new_base;
+        self.bid_index.clear();
+        self.ask_index.clear();
+    }
 
-        // bid_index / ask_index are keyed by ABSOLUTE price, so re-centering does
-        // not invalidate them. Clearing them here is what made best_bid/best_ask
-        // read 0 while get_depth still reported a full book: the cached bests are
-        // fed from these indexes, the depth is read from the dense/sparse levels,
-        // and wiping only the former tore the two apart on every re-center. On
-        // BTC_USD that was 48% of reads.
-        //
-        // What IS invalidated is the dense storage, whose slots are base-relative.
-        // Rebuild it from the indexes, which are the authority.
-        for slot in self.bids.iter_mut() {
-            *slot = None;
+    /// Clear both BTreeMaps, then insert every dense+sparse PriceLevel with
+    /// size > 0 keyed by `level.price` (absolute cents) → `level.size`.
+    #[inline(always)]
+    fn rebuild_indexes_from_storage(&mut self) {
+        self.bid_index.clear();
+        self.ask_index.clear();
+        for slot in &self.bids {
+            if let Some(level) = slot {
+                if level.size > 0 {
+                    self.bid_index.insert(level.price, level.size);
+                }
+            }
         }
-        for slot in self.asks.iter_mut() {
-            *slot = None;
+        for level in self.sparse_bids.values() {
+            if level.size > 0 {
+                self.bid_index.insert(level.price, level.size);
+            }
         }
+        for slot in &self.asks {
+            if let Some(level) = slot {
+                if level.size > 0 {
+                    self.ask_index.insert(level.price, level.size);
+                }
+            }
+        }
+        for level in self.sparse_asks.values() {
+            if level.size > 0 {
+                self.ask_index.insert(level.price, level.size);
+            }
+        }
+    }
+
+    /// Out-of-range owner: recenter, wipe sparse, write this level, rebuild
+    /// both indexes from remaining size>0 storage, refresh BOTH caches.
+    /// Terminal — caller must return and must not incremental-index or store
+    /// one-side caches again.
+    #[inline(always)]
+    fn apply_out_of_range_level(&mut self, side: Side, price_cents: u64, level: Option<PriceLevel>) {
+        self.adjust_price_base(price_cents);
         self.sparse_bids.clear();
         self.sparse_asks.clear();
-
-        let seq = self.sequence.load(Ordering::Relaxed);
-        let live_bids: Vec<(u64, u64)> = self.bid_index.iter().map(|(&p, &sz)| (p, sz)).collect();
-        for (p, sz) in live_bids {
-            let level = PriceLevel::new(p, sz, seq);
-            match self.get_dense_index(p) {
-                Some(idx) => self.bids[idx] = Some(level),
-                None => {
-                    self.sparse_bids.insert(p, level);
+        match self.get_dense_index(price_cents) {
+            Some(idx) => match side {
+                Side::Bid => self.bids[idx] = level,
+                Side::Ask => self.asks[idx] = level,
+            },
+            None => {
+                if let Some(l) = level {
+                    match side {
+                        Side::Bid => {
+                            self.sparse_bids.insert(price_cents, l);
+                        }
+                        Side::Ask => {
+                            self.sparse_asks.insert(price_cents, l);
+                        }
+                    }
                 }
             }
         }
-        let live_asks: Vec<(u64, u64)> = self.ask_index.iter().map(|(&p, &sz)| (p, sz)).collect();
-        for (p, sz) in live_asks {
-            let level = PriceLevel::new(p, sz, seq);
-            match self.get_dense_index(p) {
-                Some(idx) => self.asks[idx] = Some(level),
-                None => {
-                    self.sparse_asks.insert(p, level);
-                }
-            }
-        }
-
-        // Keep the cached bests in step with the rebuilt book.
+        self.rebuild_indexes_from_storage();
         let (bp, bs) = self.update_best_bid();
         self.best_bid.store(bp, Ordering::Relaxed);
         self.best_bid_size.store(bs, Ordering::Relaxed);
@@ -230,75 +256,54 @@ impl OrderBook {
             }
         };
 
-        let (best_price, best_size) = match side {
-            Side::Bid => {
-                let dense_idx = self.get_dense_index(price_cents);
-                if let Some(idx) = dense_idx {
-                    self.bids[idx] = level;
-                } else {
-                    // Price drifted outside the dense range. adjust_price_base
-                    // re-centers AND rebuilds the dense/sparse storage from the
-                    // indexes; it must not be followed by a sparse clear, which
-                    // would throw that rebuild away.
-                    self.adjust_price_base(price_cents);
-                    if let Some(idx) = self.get_dense_index(price_cents) {
-                        self.bids[idx] = level;
-                    } else {
-                        // Still outside the dense window (a far-away outlier):
-                        // keep it in the sparse map so it is not silently lost.
-                        if let Some(l) = level {
-                            self.sparse_bids.insert(price_cents, l);
-                        }
-                    }
-                }
-                // Maintain BTreeMap index
-                if size_scaled > 0 {
-                    self.bid_index.insert(price_cents, size_scaled);
-                } else {
-                    self.bid_index.remove(&price_cents);
-                }
-                self.update_best_bid()
-            }
-            Side::Ask => {
-                let dense_idx = self.get_dense_index(price_cents);
-                if let Some(idx) = dense_idx {
-                    self.asks[idx] = level;
-                } else {
-                    // Price drifted outside the dense range. adjust_price_base
-                    // re-centers AND rebuilds the dense/sparse storage from the
-                    // indexes; it must not be followed by a sparse clear, which
-                    // would throw that rebuild away.
-                    self.adjust_price_base(price_cents);
-                    if let Some(idx) = self.get_dense_index(price_cents) {
-                        self.asks[idx] = level;
-                    } else {
-                        // Still outside the dense window (a far-away outlier):
-                        // keep it in the sparse map so it is not silently lost.
-                        if let Some(l) = level {
-                            self.sparse_asks.insert(price_cents, l);
-                        }
-                    }
-                }
-                // Maintain BTreeMap index
-                if size_scaled > 0 {
-                    self.ask_index.insert(price_cents, size_scaled);
-                } else {
-                    self.ask_index.remove(&price_cents);
-                }
-                self.update_best_ask()
-            }
-        };
-
-        // Update cached best prices
         match side {
-            Side::Bid => {
-                self.best_bid.store(best_price, Ordering::Relaxed);
-                self.best_bid_size.store(best_size, Ordering::Relaxed);
-            }
-            Side::Ask => {
-                self.best_ask.store(best_price, Ordering::Relaxed);
-                self.best_ask_size.store(best_size, Ordering::Relaxed);
-            }
+            Side::Bid => match self.get_dense_index(price_cents) {
+                Some(idx) => {
+                    // D8: after a storage-authority recenter an unmapped occupant
+                    // can sit in this slot. Evict its absolute price before overwrite
+                    // or the index keeps a ghost best.
+                    if let Some(old) = self.bids[idx] {
+                        if old.price != price_cents {
+                            self.bid_index.remove(&old.price);
+                        }
+                    }
+                    self.bids[idx] = level;
+                    if size_scaled > 0 {
+                        self.bid_index.insert(price_cents, size_scaled);
+                    } else {
+                        self.bid_index.remove(&price_cents);
+                    }
+                    let (p, s) = self.update_best_bid();
+                    self.best_bid.store(p, Ordering::Relaxed);
+                    self.best_bid_size.store(s, Ordering::Relaxed);
+                }
+                None => {
+                    self.apply_out_of_range_level(side, price_cents, level);
+                    return;
+                }
+            },
+            Side::Ask => match self.get_dense_index(price_cents) {
+                Some(idx) => {
+                    if let Some(old) = self.asks[idx] {
+                        if old.price != price_cents {
+                            self.ask_index.remove(&old.price);
+                        }
+                    }
+                    self.asks[idx] = level;
+                    if size_scaled > 0 {
+                        self.ask_index.insert(price_cents, size_scaled);
+                    } else {
+                        self.ask_index.remove(&price_cents);
+                    }
+                    let (p, s) = self.update_best_ask();
+                    self.best_ask.store(p, Ordering::Relaxed);
+                    self.best_ask_size.store(s, Ordering::Relaxed);
+                }
+                None => {
+                    self.apply_out_of_range_level(side, price_cents, level);
+                    return;
+                }
+            },
         }
     }
 
@@ -711,27 +716,90 @@ mod best_price_consistency {
         );
     }
 
-    /// Re-centring must not silently drop levels that are still live.
+    /// Re-centring keeps unmapped occupants in *other* dense slots plus the
+    /// new price. The landing-slot occupant is overwritten (E11) — we do not
+    /// require PR #50's "all far prices survive via sparse-from-index".
     #[test]
     fn recentre_preserves_live_levels() {
         let mut book = OrderBook::new("BTC_USD".to_string(), 10_000);
         book.update_level(Side::Bid, 80_000.0, 1.0, UpdateAction::New);
         book.update_level(Side::Bid, 80_010.0, 2.0, UpdateAction::New);
-        // Force a re-centre far away.
+        // Force a re-centre far away. 80_000 shares the new centre slot with
+        // 95_000 (both offset dense_size/2 from their respective bases) and
+        // is overwritten; 80_010 sits in another slot and must remain.
         book.update_level(Side::Bid, 95_000.0, 3.0, UpdateAction::New);
 
         let bids = book.get_depth(Side::Bid, 50);
         let prices: Vec<f64> = bids.iter().map(|(p, _)| *p).collect();
-        for want in [80_000.0, 80_010.0, 95_000.0] {
+        for want in [80_010.0, 95_000.0] {
             assert!(
                 prices.iter().any(|p| (p - want).abs() < 0.005),
                 "level {want} lost across re-centre; got {prices:?}"
             );
         }
         assert!(
+            !prices.iter().any(|p| (p - 80_000.0).abs() < 0.005),
+            "landing-slot occupant 80000 should be overwritten; got {prices:?}"
+        );
+        assert!(
             (book.best_bid() - 95_000.0).abs() < 0.005,
             "best_bid should be the highest live bid, got {}",
             book.best_bid()
         );
+        assert_eq!(!bids.is_empty(), book.best_bid() > 0.0);
+    }
+
+    /// `clear()` is the true-empty-book path and must not be entangled with
+    /// the recenter rebuild: after a populated book and at least one recenter,
+    /// clear still yields 0 levels and both public bests == 0.
+    #[test]
+    fn clear_after_recenter_is_true_empty_book() {
+        let mut book = OrderBook::new("BTC_USD".to_string(), 10_000);
+        for i in 0..20u64 {
+            book.update_level(Side::Bid, 80_000.0 - i as f64, 0.5, UpdateAction::New);
+            book.update_level(Side::Ask, 80_010.0 + i as f64, 0.5, UpdateAction::New);
+        }
+        book.update_level(Side::Ask, 95_000.0, 0.5, UpdateAction::New);
+        assert!(!book.get_depth(Side::Bid, 50).is_empty());
+        assert!(!book.get_depth(Side::Ask, 50).is_empty());
+
+        book.clear();
+
+        assert!(book.get_depth(Side::Bid, 50).is_empty());
+        assert!(book.get_depth(Side::Ask, 50).is_empty());
+        assert_eq!(book.best_bid(), 0.0);
+        assert_eq!(book.best_ask(), 0.0);
+        assert_eq!(book.best_bid_size(), 0.0);
+        assert_eq!(book.best_ask_size(), 0.0);
+    }
+
+    /// D8: an in-range write onto a post-recenter occupied slot must evict the
+    /// old absolute price so it cannot remain as a ghost non-zero best.
+    #[test]
+    fn in_range_slot_evict_drops_unmapped_occupant() {
+        let mut book = OrderBook::new("BTC_USD".to_string(), 10_000);
+        // Centre at 95_000 (slot dense_size/2). Neighbour at +10 dollars sits
+        // in another slot and survives the later recenter as an unmapped occupant.
+        book.update_level(Side::Bid, 95_000.0, 1.0, UpdateAction::New);
+        book.update_level(Side::Bid, 95_010.0, 2.0, UpdateAction::New);
+        // Recentre down: landing slot overwrites 95_000; 95_010 remains in its slot.
+        book.update_level(Side::Bid, 80_000.0, 1.0, UpdateAction::New);
+
+        // New window base = 80_000c - 10_000 = 7_990_000. Slot of 95_010 maps to
+        // 80_010. Writing that in-range price must evict 95_010.
+        book.update_level(Side::Bid, 80_010.0, 1.0, UpdateAction::New);
+
+        let bids = book.get_depth(Side::Bid, 50);
+        let prices: Vec<f64> = bids.iter().map(|(p, _)| *p).collect();
+        assert!(
+            !prices.iter().any(|p| (p - 95_010.0).abs() < 0.005),
+            "unmapped occupant 95010 must be gone from depth after slot overwrite; got {prices:?}"
+        );
+        assert!(
+            (book.best_bid() - 80_010.0).abs() < 0.005,
+            "ghost best: expected 80010 after D8 evict, got {}",
+            book.best_bid()
+        );
+        assert_eq!(!bids.is_empty(), book.best_bid() > 0.0);
     }
 }

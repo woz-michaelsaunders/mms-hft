@@ -144,4 +144,110 @@ mod tests {
         // of what is and isn't allocation-free on this path today.
         assert!(p99 < 50_000_000, "p99 tick-to-publish latency of {}ns is pathologically high", p99);
     }
+
+    /// AC1: a published snapshot must never show levels on a side while that
+    /// side's cached best is zero (or a ghost best on an empty side). Writer
+    /// walks prices across recenter boundaries; reader polls get_snapshot in
+    /// a tight loop. A single-shot test does not satisfy this criterion.
+    #[test]
+    fn snapshot_bests_never_disagree_with_levels_across_recentres() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        // Small dense range so ordinary walks cross the recenter boundary
+        // many times (prod uses 100_000). Window = 2 * 1_000 cents = $20.
+        let book = Arc::new(Mutex::new(DoubleBufferedOrderBook::new(
+            "BTC_USD".to_string(),
+            1_000,
+        )));
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicU64::new(0));
+        let samples = Arc::new(AtomicU64::new(0));
+
+        {
+            let mut guard = book.lock().unwrap();
+            let active = guard.get_active_mut();
+            for i in 0..20u64 {
+                active.update_level(
+                    Side::Bid,
+                    80_000.0 - i as f64 * 0.01,
+                    1.0,
+                    UpdateAction::New,
+                );
+                active.update_level(
+                    Side::Ask,
+                    80_001.0 + i as f64 * 0.01,
+                    1.0,
+                    UpdateAction::New,
+                );
+            }
+            guard.swap_snapshot();
+        }
+
+        let book_r = Arc::clone(&book);
+        let stop_r = Arc::clone(&stop);
+        let torn_r = Arc::clone(&torn);
+        let samples_r = Arc::clone(&samples);
+        let reader = thread::spawn(move || {
+            while !stop_r.load(AtomicOrdering::Relaxed) {
+                let snap = match book_r.try_lock() {
+                    Ok(guard) => guard.get_snapshot(),
+                    Err(_) => {
+                        thread::yield_now();
+                        continue;
+                    }
+                };
+                samples_r.fetch_add(1, AtomicOrdering::Relaxed);
+                if (!snap.bids.is_empty()) != (snap.best_bid > 0.0) {
+                    torn_r.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+                if (!snap.asks.is_empty()) != (snap.best_ask > 0.0) {
+                    torn_r.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            }
+        });
+
+        let wait_start = std::time::Instant::now();
+        while samples.load(AtomicOrdering::Relaxed) == 0 {
+            if wait_start.elapsed() > std::time::Duration::from_secs(5) {
+                break;
+            }
+            thread::yield_now();
+        }
+
+        const TICKS: usize = 5_000;
+        for i in 0..TICKS {
+            let bid_px = 80_000.0 + (i as f64) * 0.05;
+            let ask_px = bid_px + 1.0;
+            let mut guard = book.lock().unwrap();
+            let active = guard.get_active_mut();
+            active.update_level(Side::Bid, bid_px, 1.0, UpdateAction::Change);
+            active.update_level(Side::Ask, ask_px, 1.0, UpdateAction::Change);
+            // Opposite-side delete after a recenter is the original torn-read
+            // trigger: recompute best from the (must-be-rebuilt) index.
+            if i % 17 == 0 {
+                active.update_level(Side::Bid, bid_px - 5.0, 0.0, UpdateAction::Delete);
+            }
+            if i % 19 == 0 {
+                active.update_level(Side::Ask, ask_px + 5.0, 0.0, UpdateAction::Delete);
+            }
+            guard.swap_snapshot();
+            drop(guard);
+            if i % 8 == 0 {
+                thread::yield_now();
+            }
+        }
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        reader.join().unwrap();
+
+        let n = samples.load(AtomicOrdering::Relaxed);
+        let torn_n = torn.load(AtomicOrdering::Relaxed);
+        assert!(n > 100, "reader loop too thin: {n} samples");
+        assert_eq!(
+            torn_n, 0,
+            "torn snapshots: populated side with zero best (or ghost best) on {torn_n}/{n} samples"
+        );
+    }
 }
