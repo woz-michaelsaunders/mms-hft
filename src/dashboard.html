@@ -215,7 +215,7 @@
         }
         .search-bar {
             width: 100%;
-            max-width: 420px;
+            max-width: calc(var(--space-8) * 6 + var(--space-5));
             margin-bottom: var(--space-3);
             flex-shrink: 0;
         }
@@ -344,9 +344,11 @@
             left: 0;
             max-width: min(70ch, calc(100vw - var(--space-8)));
         }
-        .table-msg-error { color: var(--danger); }
-        .table-msg { overflow-wrap: anywhere; white-space: normal; }
-        .table-msg-loading { color: var(--info); }
+        /* Dedicated table-row states (House DoD: loading / empty / error / success). */
+        .table-msg-loading { color: var(--info); background: var(--info-bg); }
+        .table-msg-empty { color: var(--text-muted); }
+        .table-msg-error { color: var(--danger); background: var(--danger-bg); }
+        .table-msg-success { color: var(--success); background: var(--success-bg); }
 
         .status {
             display: inline-flex;
@@ -370,11 +372,13 @@
             background: var(--text-faint);
             flex-shrink: 0;
         }
+        .status.success,
         .status.connected {
             background: var(--success-bg);
             border-color: var(--success);
             color: var(--success);
         }
+        .status.success::before,
         .status.connected::before { background: var(--success); }
         .status.error {
             background: var(--danger-bg);
@@ -570,11 +574,32 @@
         .house-banner[hidden] { display: none !important; }
         .house-banner-title { font-weight: 600; margin: 0; overflow-wrap: anywhere; }
         .house-banner-text { margin: 0; overflow-wrap: anywhere; }
-        .house-banner-success { background: var(--success-bg); color: var(--success); border: 1px solid var(--success); }
-        .house-banner-error { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); }
-        .house-banner-info { background: var(--info-bg); color: var(--info); border: 1px solid var(--info); }
+        .house-banner-success,
+        .house-state-success.house-banner { background: var(--success-bg); color: var(--success); border: 1px solid var(--success); }
+        .house-banner-error,
+        .house-state-error.house-banner { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); }
+        .house-banner-info,
+        .house-state-loading.house-banner { background: var(--info-bg); color: var(--info); border: 1px solid var(--info); }
         .house-banner-warning { background: var(--warning-bg); color: var(--warning); border: 1px solid var(--warning); }
-        .house-banner-neutral { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
+        .house-banner-neutral,
+        .house-state-empty.house-banner { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
+        .house-btn:disabled,
+        .house-input:disabled,
+        .house-select:disabled,
+        .header select:disabled,
+        .search-bar:disabled,
+        fieldset:disabled,
+        .house-state-disabled:not(.house-banner):not(.house-form) {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+        .house-banner-disabled,
+        .house-banner.house-state-disabled {
+            background: var(--warning-bg);
+            color: var(--warning);
+            border: 1px solid var(--warning);
+            opacity: 1;
+        }
         .house-empty {
             border: 1px dashed var(--border);
             border-radius: var(--radius-card);
@@ -758,7 +783,7 @@
             grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
             gap: var(--space-3);
         }
-        .chart-fixed { height: 260px; flex: none; margin-bottom: var(--space-4); }
+        .chart-fixed { height: calc(var(--space-8) * 4); flex: none; margin-bottom: var(--space-4); }
 
         @media (max-width: 767px) {
             html, body {
@@ -866,13 +891,13 @@
                     <h2 class="md-strip-title">Market data sessions</h2>
                     <p class="md-strip-lead">Live session health, sampled without waiting on book locks. A skipped sample is not a down session — poll again.</p>
                 </div>
-                <button type="button" class="house-btn house-btn-primary" id="mdStatusRefreshBtn" disabled>Check sessions</button>
+                <button type="button" class="house-btn house-btn-primary house-state-disabled" id="mdStatusRefreshBtn" disabled>Check sessions</button>
             </div>
-            <div id="mdStatusBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+            <div id="mdStatusBanner" class="house-banner house-banner-info house-state-loading" role="status" aria-busy="true">
                 <p class="house-banner-title">Loading market-data sessions</p>
                 <p class="house-banner-text">Checking FIX session health now.</p>
             </div>
-            <div id="mdStatusEmpty" class="house-empty" hidden>
+            <div id="mdStatusEmpty" class="house-empty house-state-empty" hidden>
                 <p>Use Check sessions after the process is up. This strip lists every market-data FIX session from config.</p>
             </div>
             <div id="mdStatusChips" class="md-chips" role="list">
@@ -913,7 +938,7 @@
                     <div class="stat-value" id="tradeCount">0</div>
                 </div>
             </div>
-            <div id="liveBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+            <div id="liveBanner" class="house-banner house-banner-info house-state-loading" role="status" aria-busy="true">
                 <p class="house-banner-title">Loading the order book</p>
                 <p class="house-banner-text">Fetching bids, asks and trades for the selected symbol.</p>
             </div>
@@ -924,7 +949,7 @@
                         <table class="order-book-table">
                             <thead><tr><th>Price</th><th>Size</th></tr></thead>
                             <tbody id="bidsTable">
-                                <tr><td colspan="2" class="table-msg table-msg-loading">Loading bids</td></tr>
+                                <tr><td colspan="2" class="table-msg table-msg-loading house-state-loading">Loading bids</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -935,7 +960,7 @@
                         <table class="order-book-table">
                             <thead><tr><th>Price</th><th>Size</th></tr></thead>
                             <tbody id="asksTable">
-                                <tr><td colspan="2" class="table-msg table-msg-loading">Loading asks</td></tr>
+                                <tr><td colspan="2" class="table-msg table-msg-loading house-state-loading">Loading asks</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -946,7 +971,7 @@
                         <table class="trades-table">
                             <thead><tr><th>Price</th><th>Size</th><th>Time</th></tr></thead>
                             <tbody id="tradesTable">
-                                <tr><td colspan="3" class="table-msg table-msg-loading">Loading trades</td></tr>
+                                <tr><td colspan="3" class="table-msg table-msg-loading house-state-loading">Loading trades</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -966,14 +991,14 @@
                             <label for="histSymbolSelect">Symbol</label>
                             <select id="histSymbolSelect" class="house-select"></select>
                         </div>
-                        <button type="button" class="house-btn house-btn-primary" id="histLoadBtn" disabled>Load history</button>
+                        <button type="button" class="house-btn house-btn-primary house-state-disabled" id="histLoadBtn" disabled>Load history</button>
                     </div>
                 </div>
-                <div id="histBanner" class="house-banner house-banner-neutral" role="status">
+                <div id="histBanner" class="house-banner house-banner-neutral house-state-empty" role="status">
                     <p class="house-banner-title">History not loaded</p>
                     <p class="house-banner-text">Choose a symbol, then load history.</p>
                 </div>
-                <div id="histEmpty" class="house-empty">
+                <div id="histEmpty" class="house-empty house-state-empty">
                     <p>No chart yet. Load history to plot best bid and best ask for the selected symbol.</p>
                 </div>
                 <div class="chart-wrap" id="histChartWrap" hidden>
@@ -991,7 +1016,7 @@
                     </div>
                     <button type="button" class="house-btn house-btn-primary" id="ordersRefreshBtn">Refresh orders</button>
                 </div>
-                <div id="ordersBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+                <div id="ordersBanner" class="house-banner house-banner-info house-state-loading" role="status" aria-busy="true">
                     <p class="house-banner-title">Loading orders</p>
                     <p class="house-banner-text">Fetching the working set and processed history.</p>
                 </div>
@@ -1011,7 +1036,7 @@
                             </tr>
                         </thead>
                         <tbody id="ordersTable">
-                            <tr><td colspan="9" class="table-msg table-msg-loading">Loading orders</td></tr>
+                            <tr><td colspan="9" class="table-msg table-msg-loading house-state-loading">Loading orders</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1027,7 +1052,7 @@
                     </div>
                     <button type="button" class="house-btn house-btn-primary" id="positionsRefreshBtn">Refresh positions</button>
                 </div>
-                <div id="positionsBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+                <div id="positionsBanner" class="house-banner house-banner-info house-state-loading" role="status" aria-busy="true">
                     <p class="house-banner-title">Loading positions</p>
                     <p class="house-banner-text">Fetching live positions and P&amp;L.</p>
                 </div>
@@ -1046,7 +1071,7 @@
                             </tr>
                         </thead>
                         <tbody id="positionsTable">
-                            <tr><td colspan="8" class="table-msg table-msg-loading">Loading positions</td></tr>
+                            <tr><td colspan="8" class="table-msg table-msg-loading house-state-loading">Loading positions</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1061,21 +1086,21 @@
                         <p class="lead">Enable is the primary action when Spread capture is off. Enable and Disable apply to Spread capture only. Both strategies already shadow-trade in paper mode — paper fills are in Shadow mode below. Kill Switch cancels resting orders and blocks all new orders until you Reset. It does not disable the algorithm.</p>
                     </div>
                     <div class="btn-row">
-                        <div class="status pending" id="killSwitchStatus" role="status" aria-busy="true">Checking halt</div>
+                        <div class="status pending house-state-loading" id="killSwitchStatus" role="status" aria-busy="true">Checking halt</div>
                         <button type="button" class="house-btn house-btn-primary" id="algoEnableBtn">Enable algorithm</button>
-                        <button type="button" class="house-btn house-btn-danger" id="algoDisableBtn" disabled>Disable algorithm</button>
+                        <button type="button" class="house-btn house-btn-danger house-state-disabled" id="algoDisableBtn" disabled>Disable algorithm</button>
                         <button type="button" class="house-btn house-btn-secondary" id="algoRefreshBtn">Refresh status</button>
                         <div class="halt-actions" role="group" aria-label="Kill Switch">
-                            <button type="button" class="house-btn house-btn-danger" id="killSwitchBtn" aria-describedby="killSwitchStatus" disabled>Kill Switch</button>
-                            <button type="button" class="house-btn house-btn-secondary" id="killSwitchResetBtn" disabled>Reset</button>
+                            <button type="button" class="house-btn house-btn-danger house-state-disabled" id="killSwitchBtn" aria-describedby="killSwitchStatus" disabled>Kill Switch</button>
+                            <button type="button" class="house-btn house-btn-secondary house-state-disabled" id="killSwitchResetBtn" disabled>Reset</button>
                         </div>
                     </div>
                 </div>
-                <div id="killSwitchBanner" class="house-banner house-banner-neutral" role="status" hidden>
+                <div id="killSwitchBanner" class="house-banner house-banner-neutral house-state-empty" role="status" hidden>
                     <p class="house-banner-title">Kill Switch is off</p>
                     <p class="house-banner-text">Trading is not halted. Kill Switch is the brake; Enable algorithm is a separate control.</p>
                 </div>
-                <div id="algoStatusBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+                <div id="algoStatusBanner" class="house-banner house-banner-info house-state-loading" role="status" aria-busy="true">
                     <p class="house-banner-title">Loading algorithm status</p>
                     <p class="house-banner-text">Fetching whether Spread capture is on and its last live-path signals.</p>
                 </div>
@@ -1084,11 +1109,11 @@
                         <h3 class="chart-caption" id="shadowTitle">Shadow mode</h3>
                         <p class="lead">Live paper fills, position and P&amp;L for both strategies. This is not the daily backtest report. Market imbalance is not bound to Enable or Disable.</p>
                     </div>
-                    <div id="shadowBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+                    <div id="shadowBanner" class="house-banner house-banner-info house-state-loading" role="status" aria-busy="true">
                         <p class="house-banner-title">Loading shadow status</p>
                         <p class="house-banner-text">Fetching paper fills, position and P&amp;L for both strategies.</p>
                     </div>
-                    <div id="shadowEmpty" class="house-empty" hidden>
+                    <div id="shadowEmpty" class="house-empty house-state-empty" hidden>
                         <p>Use Refresh status after the process is up. Both shadow strategies should appear here.</p>
                     </div>
                     <div id="shadowCards" class="shadow-cards" role="list" hidden></div>
@@ -1144,7 +1169,7 @@
                 </fieldset>
                 <div>
                     <h3 class="chart-caption">Recent signals</h3>
-                    <div id="algoSignalsEmpty" class="house-empty" hidden>
+                    <div id="algoSignalsEmpty" class="house-empty house-state-empty" hidden>
                         <p>No live-path signals. Paper fills accrue in Shadow mode above — they are not listed here.</p>
                     </div>
                     <div class="house-table-scroll" id="algoSignalsTable" hidden>
@@ -1160,7 +1185,7 @@
                                 </tr>
                             </thead>
                             <tbody id="algoSignalLog">
-                                <tr><td colspan="6" class="table-msg">No live-path signals. Paper fills accrue in Shadow mode above.</td></tr>
+                                <tr><td colspan="6" class="table-msg table-msg-empty house-state-empty">No live-path signals. Paper fills accrue in Shadow mode above.</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -1174,15 +1199,15 @@
                 <div class="panel-header">
                     <div>
                         <h2 class="section-title">Strategy backtester</h2>
-                        <p class="lead">Replay snapshots for a symbol. Run backtest is the primary action. Fee and adverse-selection thresholds are in-code placeholders until an operator runs GET /api/backtest/calibrate. This tab does not apply calibrated fees to live config.</p>
+                        <p class="lead">Replay snapshots for a symbol. Run backtest is the primary action. Fee and adverse-selection thresholds stay at the compiled defaults until an operator runs GET /api/backtest/calibrate. This tab does not apply calibrated fees to live config.</p>
                     </div>
-                    <button type="button" class="house-btn house-btn-primary" id="btRunBtn" disabled>Run backtest</button>
+                    <button type="button" class="house-btn house-btn-primary house-state-disabled" id="btRunBtn" disabled>Run backtest</button>
                 </div>
-                <div id="btBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+                <div id="btBanner" class="house-banner house-banner-info house-state-loading" role="status" aria-busy="true">
                     <p class="house-banner-title">Loading symbols</p>
                     <p class="house-banner-text">Fetching the symbol list so you can run a backtest.</p>
                 </div>
-                <fieldset id="btForm" class="house-form" disabled>
+                <fieldset id="btForm" class="house-form house-state-disabled" disabled>
                 <legend class="visually-hidden">Backtest parameters</legend>
                 <div class="form-grid">
                     <label class="house-field">
@@ -1227,7 +1252,7 @@
                 </div>
                 </fieldset>
                 <span id="btStatus" class="visually-hidden"></span>
-                <div id="btEmpty" class="house-empty">
+                <div id="btEmpty" class="house-empty house-state-empty">
                     <p>No backtest yet. Wait for symbols to load, then run backtest.</p>
                 </div>
 
@@ -1264,7 +1289,7 @@
                                     </tr>
                                 </thead>
                                 <tbody id="btTradeLog">
-                                    <tr><td colspan="7" class="table-msg">Run a backtest to see trades.</td></tr>
+                                    <tr><td colspan="7" class="table-msg table-msg-empty house-state-empty">Run a backtest to see trades.</td></tr>
                                 </tbody>
                             </table>
                         </div>
@@ -1282,7 +1307,7 @@
                     </div>
                     <button type="button" class="house-btn house-btn-primary" id="secRefreshBtn">Refresh securities</button>
                 </div>
-                <div id="secBanner" class="house-banner house-banner-info" role="status" aria-busy="true">
+                <div id="secBanner" class="house-banner house-banner-info house-state-loading" role="status" aria-busy="true">
                     <p class="house-banner-title">Loading securities</p>
                     <p class="house-banner-text">Fetching the venue security list.</p>
                 </div>
@@ -1301,7 +1326,7 @@
                             </tr>
                         </thead>
                         <tbody id="securitiesTable">
-                            <tr><td colspan="4" class="table-msg table-msg-loading">Loading securities</td></tr>
+                            <tr><td colspan="4" class="table-msg table-msg-loading house-state-loading">Loading securities</td></tr>
                         </tbody>
                     </table>
                 </div>
@@ -1318,21 +1343,33 @@
         function token(name) {
             return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
         }
+        function bannerState(kind) {
+            if (kind === 'info') return 'loading';
+            if (kind === 'neutral') return 'empty';
+            if (kind === 'warning') return 'empty';
+            if (kind === 'success') return 'success';
+            if (kind === 'error') return 'error';
+            if (kind === 'disabled') return 'disabled';
+            return kind;
+        }
         function setBanner(el, kind, title, text) {
             if (!el) return;
             el.hidden = false;
-            el.className = 'house-banner house-banner-' + kind;
+            const state = bannerState(kind);
+            el.className = 'house-banner house-banner-' + kind + ' house-state-' + state;
             el.setAttribute('aria-busy', kind === 'info' ? 'true' : 'false');
             el.innerHTML = '<p class="house-banner-title">' + title + '</p>' +
                 (text ? '<p class="house-banner-text">' + text + '</p>' : '');
         }
         function tableMsg(colspan, text, kind) {
-            const cls = kind ? ' table-msg-' + kind : '';
-            return '<tr><td colspan="' + colspan + '" class="table-msg' + cls + '">' + text + '</td></tr>';
+            const state = kind || 'empty';
+            return '<tr><td colspan="' + colspan + '" class="table-msg table-msg-' + state + ' house-state-' + state + '">' + text + '</td></tr>';
         }
         function setDisabled(id, on) {
             const el = document.getElementById(id);
-            if (el) el.disabled = !!on;
+            if (!el) return;
+            el.disabled = !!on;
+            el.classList.toggle('house-state-disabled', !!on);
         }
 
         function switchTab(name, btn) {
@@ -1453,7 +1490,7 @@
                     setDisabled('symbolSelect', false);
                     orderBookInFlight = false;
                     document.getElementById('status').textContent = 'Connected';
-                    document.getElementById('status').className = 'status connected';
+                    document.getElementById('status').className = 'status connected status success house-state-success';
                     document.getElementById('tradeCount').textContent = data.trade_count || 0;
                     const hasBook = (data.bids && data.bids.length) || (data.asks && data.asks.length);
                     document.getElementById('bestBid').textContent = hasBook ? formatNumber(data.best_bid) : '—';
@@ -1467,21 +1504,21 @@
                     const bids = document.getElementById('bidsTable');
                     bids.innerHTML = data.bids && data.bids.length
                         ? data.bids.map(l => '<tr><td class="price">' + formatNumber(l.price) + '</td><td class="size">' + formatNumber(l.size) + '</td></tr>').join('')
-                        : tableMsg(2, 'No bids yet for this symbol.');
+                        : tableMsg(2, 'No bids yet for this symbol.', 'empty');
                     const asks = document.getElementById('asksTable');
                     asks.innerHTML = data.asks && data.asks.length
                         ? data.asks.map(l => '<tr><td class="price">' + formatNumber(l.price) + '</td><td class="size">' + formatNumber(l.size) + '</td></tr>').join('')
-                        : tableMsg(2, 'No asks yet for this symbol.');
+                        : tableMsg(2, 'No asks yet for this symbol.', 'empty');
                     const trades = document.getElementById('tradesTable');
                     trades.innerHTML = data.trades && data.trades.length
                         ? data.trades.map(t => '<tr><td class="price">' + formatNumber(t.price) + '</td><td class="size">' + formatNumber(t.size) + '</td><td>' + formatTime(t.timestamp) + '</td></tr>').join('')
-                        : tableMsg(3, 'No trades yet. Prints appear here as the book trades.');
+                        : tableMsg(3, 'No trades yet. Prints appear here as the book trades.', 'empty');
                 })
                 .catch(err => {
                     setDisabled('symbolSelect', false);
                     orderBookInFlight = false;
                     document.getElementById('status').textContent = 'Disconnected';
-                    document.getElementById('status').className = 'status error';
+                    document.getElementById('status').className = 'status error house-state-error';
                     setBanner(banner, 'error', 'Cannot load the order book', err.message + '. Check the market-data session.');
                     document.getElementById('bidsTable').innerHTML = tableMsg(2, 'Cannot load bids.', 'error');
                     document.getElementById('asksTable').innerHTML = tableMsg(2, 'Cannot load asks.', 'error');
@@ -1568,7 +1605,7 @@
                     btn.disabled = false;
                     const orders = data.orders || [];
                     if (!orders.length) {
-                        tbody.innerHTML = tableMsg(9, 'No orders to show. Working orders appear here after the venue acknowledges them.');
+                        tbody.innerHTML = tableMsg(9, 'No orders to show. Working orders appear here after the venue acknowledges them.', 'empty');
                         setBanner(banner, 'neutral', 'No orders', 'The working set is empty. After reconnect, only venue-confirmed orders remain.');
                         return;
                     }
@@ -1610,7 +1647,7 @@
                     btn.disabled = false;
                     const positions = data.positions || [];
                     if (!positions.length) {
-                        tbody.innerHTML = tableMsg(8, 'No positions yet. Fills from executed orders appear here.');
+                        tbody.innerHTML = tableMsg(8, 'No positions yet. Fills from executed orders appear here.', 'empty');
                         setBanner(banner, 'neutral', 'No positions', 'Place and fill orders to see net quantity and P&amp;L.');
                         return;
                     }
@@ -1810,7 +1847,7 @@
                     const emptyEl = document.getElementById('algoSignalsEmpty');
                     const tableWrap = document.getElementById('algoSignalsTable');
                     if (!signals.length) {
-                        logBody.innerHTML = tableMsg(6, 'No live-path signals. Paper fills accrue in Shadow mode above.');
+                        logBody.innerHTML = tableMsg(6, 'No live-path signals. Paper fills accrue in Shadow mode above.', 'empty');
                         if (emptyEl) emptyEl.hidden = false;
                         if (tableWrap) tableWrap.hidden = true;
                     } else {
@@ -1875,19 +1912,19 @@
             const el = document.getElementById('killSwitchStatus');
             if (!el) return;
             if (kind === 'pending') {
-                el.className = 'status pending';
+                el.className = 'status pending house-state-loading';
                 el.textContent = 'Checking halt';
                 el.setAttribute('aria-busy', 'true');
             } else if (kind === 'unknown') {
-                el.className = 'status error';
+                el.className = 'status error house-state-error';
                 el.textContent = 'Halt status unknown';
                 el.setAttribute('aria-busy', 'false');
             } else if (kind === 'halted') {
-                el.className = 'status error';
+                el.className = 'status error house-state-error';
                 el.textContent = 'Halted';
                 el.setAttribute('aria-busy', 'false');
             } else {
-                el.className = 'status connected';
+                el.className = 'status connected status success house-state-success';
                 el.textContent = 'Not halted';
                 el.setAttribute('aria-busy', 'false');
             }
@@ -2052,7 +2089,9 @@
 
         function setBtFormDisabled(on) {
             const form = document.getElementById('btForm');
-            if (form) form.disabled = !!on;
+            if (!form) return;
+            form.disabled = !!on;
+            form.classList.toggle('house-state-disabled', !!on);
         }
         function setBtEmpty(show, text) {
             const el = document.getElementById('btEmpty');
@@ -2188,7 +2227,7 @@
                 const hint = isImbalance
                     ? 'No trades fired. Try lowering the imbalance threshold or increasing snapshots.'
                     : 'No trades fired. Try lowering min spread or increasing snapshots.';
-                logBody.innerHTML = tableMsg(7, hint);
+                logBody.innerHTML = tableMsg(7, hint, 'empty');
             } else {
                 const display = trades.slice(-200);
                 logBody.innerHTML = display.map(t => {
@@ -2300,7 +2339,7 @@
             const banner = document.getElementById('secBanner');
             const q = document.getElementById('secSearch').value;
             if (!list.length) {
-                tbody.innerHTML = tableMsg(4, q ? 'No securities match this search. Clear the filter or try another symbol.' : 'No securities listed yet.');
+                tbody.innerHTML = tableMsg(4, q ? 'No securities match this search. Clear the filter or try another symbol.' : 'No securities listed yet.', 'empty');
                 setBanner(banner, 'neutral', q ? 'No matches' : 'Empty list', q ? 'No securities match “' + q + '”.' : 'The venue has not published a security list yet.');
                 return;
             }
