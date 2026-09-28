@@ -110,7 +110,7 @@
         }
         :focus-visible {
             outline: none;
-            box-shadow: 0 0 0 2px var(--bg), var(--focus-ring);
+            box-shadow: var(--focus-ring);
             border-radius: var(--radius-control);
         }
         .visually-hidden {
@@ -287,13 +287,11 @@
             background: var(--accent-hover);
             border-color: var(--accent-hover);
         }
-        .house-btn-primary:focus-visible {
-            box-shadow: 0 0 0 2px var(--surface), 0 0 0 5px var(--accent-hover);
-        }
         .house-btn-primary:disabled {
             background: var(--surface-2);
             color: var(--text-faint);
             border-color: var(--border);
+            opacity: 0.55;
         }
         .house-btn-secondary {
             background: transparent;
@@ -301,9 +299,15 @@
             border-color: var(--border);
         }
         .house-btn-secondary:hover:not(:disabled) { border-color: var(--text-muted); }
+        .house-btn-secondary[aria-pressed="true"]:not(:disabled) {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
         .house-btn-secondary:disabled {
+            background: var(--surface-2);
             color: var(--text-faint);
             border-color: var(--border);
+            opacity: 0.55;
         }
 
         .house-empty {
@@ -427,13 +431,16 @@
             loading: {
                 bannerClass: 'house-banner house-banner-info',
                 title: 'Checking sessions',
-                text: 'Checking 6 sessions. Timeout 5s. Logon check is off. Trading loops are not started.',
+                text: 'Checking 6 sessions. Timeout 5s. Logon check is on. Trading loops are not started.',
                 empty: false,
                 results: false,
                 runDisabled: true,
                 logonDisabled: true,
                 fieldsDisabled: true,
                 busy: true,
+                logonCheck: true,
+                timeout: '5',
+                hint: 'Maps to fix_server --preflight --logon-check --config PATH --timeout-secs 5.',
             },
             empty: {
                 bannerClass: 'house-banner house-banner-neutral',
@@ -446,40 +453,49 @@
                 logonDisabled: false,
                 fieldsDisabled: false,
                 busy: false,
+                logonCheck: false,
+                timeout: '5',
+                hint: 'Maps to fix_server --preflight --config PATH. Logon check is opt-in, always sends 141=Y, and is not the default gate.',
             },
             error: {
                 bannerClass: 'house-banner house-banner-error',
-                title: 'Environment variable is not set',
-                text: 'environment variable CRYPTOCOM_PRD3_API_KEY (credentials.PRD3 api_key_env) is not set. Exit 1 — no FIX was sent.',
+                title: "session 'prd3_om' logon: timed out after 2s",
+                text: 'Exit 1. reachable true, logon fail. The six-column table stays on the fail path.',
                 empty: false,
                 results: true,
                 rows: [
-                    ['prd3_om', 'fail', 'order_management', HOST + ':31302', 'creds fail · reachable true · logon fail'],
-                    ['prd3_md_btc', 'fail', 'market_data', HOST + ':34402', 'creds fail · reachable true · logon fail'],
+                    ['prd3_om', 'fail', 'order_management', HOST + ':31302', 'creds ok · reachable true · logon fail'],
+                    ['prd3_md_btc', 'fail', 'market_data', HOST + ':34402', 'creds ok · reachable true · logon fail'],
                 ],
                 runDisabled: false,
                 logonDisabled: false,
                 fieldsDisabled: false,
                 busy: false,
+                logonCheck: true,
+                timeout: '2',
+                hint: 'Maps to fix_server --preflight --logon-check --timeout-secs 2. A reachable peer that never acks still prints the existing fail line.',
             },
             success: {
                 bannerClass: 'house-banner house-banner-success',
                 title: 'Every requested check passed',
-                text: 'Exit 0. Credentials resolved and every session was reachable. Logon check stayed off, so logon is skipped.',
+                text: 'Exit 0. Credentials resolved, every session was reachable, and logon is ok.',
                 empty: false,
                 results: true,
                 rows: [
-                    ['prd3_om', 'passed', 'order_management', HOST + ':31302', 'creds ok · reachable true · logon skipped'],
-                    ['prd3_md_btc', 'passed', 'market_data', HOST + ':34402', 'creds ok · reachable true · logon skipped'],
-                    ['prd3_md_eth', 'passed', 'market_data', HOST + ':34403', 'creds ok · reachable true · logon skipped'],
-                    ['prd3_md_others_34405', 'passed', 'market_data', HOST + ':34405', 'creds ok · reachable true · logon skipped'],
-                    ['prd3_md_others_34406', 'passed', 'market_data', HOST + ':34406', 'creds ok · reachable true · logon skipped'],
-                    ['prd3_md_others_34407', 'passed', 'market_data', HOST + ':34407', 'creds ok · reachable true · logon skipped'],
+                    ['prd3_om', 'ok', 'order_management', HOST + ':31302', 'creds ok · reachable true · logon ok'],
+                    ['prd3_md_btc', 'ok', 'market_data', HOST + ':34402', 'creds ok · reachable true · logon ok'],
+                    ['prd3_md_eth', 'ok', 'market_data', HOST + ':34403', 'creds ok · reachable true · logon ok'],
+                    ['prd3_md_others_34405', 'ok', 'market_data', HOST + ':34405', 'creds ok · reachable true · logon ok'],
+                    ['prd3_md_others_34406', 'ok', 'market_data', HOST + ':34406', 'creds ok · reachable true · logon ok'],
+                    ['prd3_md_others_34407', 'ok', 'market_data', HOST + ':34407', 'creds ok · reachable true · logon ok'],
                 ],
                 runDisabled: false,
                 logonDisabled: false,
                 fieldsDisabled: false,
                 busy: false,
+                logonCheck: true,
+                timeout: '5',
+                hint: 'Maps to fix_server --preflight --logon-check --config PATH. Each row reports creds ok, reachable true, and logon ok.',
             },
             disabled: {
                 bannerClass: 'house-banner house-banner-warning',
@@ -492,6 +508,9 @@
                 logonDisabled: true,
                 fieldsDisabled: false,
                 busy: false,
+                logonCheck: false,
+                timeout: '5',
+                hint: 'Maps to fix_server --preflight --config PATH. Logon check stays off, so the logon column is skipped.',
             },
         };
 
@@ -511,9 +530,15 @@
             document.getElementById('bannerTitle').textContent = s.title;
             document.getElementById('bannerText').textContent = s.text;
             document.getElementById('runBtn').disabled = s.runDisabled;
-            document.getElementById('logonBtn').disabled = s.logonDisabled;
+            const logonBtn = document.getElementById('logonBtn');
+            logonBtn.disabled = s.logonDisabled;
+            logonBtn.setAttribute('aria-pressed', s.logonCheck ? 'true' : 'false');
             document.getElementById('configInput').disabled = s.fieldsDisabled;
-            document.getElementById('timeoutInput').disabled = s.fieldsDisabled;
+            const timeoutInput = document.getElementById('timeoutInput');
+            timeoutInput.disabled = s.fieldsDisabled;
+            if (s.timeout) timeoutInput.value = s.timeout;
+            const hint = document.getElementById('formHint');
+            if (s.hint) hint.textContent = s.hint;
             const empty = document.getElementById('empty');
             empty.hidden = !s.empty;
             if (s.emptyText) document.getElementById('emptyText').textContent = s.emptyText;

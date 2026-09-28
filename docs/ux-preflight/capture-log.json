@@ -1,7 +1,7 @@
 [
   {
     "file": "loading-375.png",
-    "label": "Loading — Checking sessions; Run preflight disabled",
+    "label": "Loading — Checking sessions; Logon check is on; Run preflight disabled",
     "width": "375",
     "overflowing": false
   },
@@ -13,19 +13,19 @@
   },
   {
     "file": "error-375.png",
-    "label": "Error — Environment variable is not set",
+    "label": "Error — session logon timed out after 2s; reachable true, logon fail",
     "width": "375",
     "overflowing": false
   },
   {
     "file": "success-375.png",
-    "label": "Success — Every requested check passed; logon skipped",
+    "label": "Success — Every requested check passed; logon ok",
     "width": "375",
     "overflowing": false
   },
   {
     "file": "disabled-375.png",
-    "label": "Disabled — Logon check is off; FIX Logon disabled",
+    "label": "Disabled — Logon check is off; Logon check control disabled",
     "width": "375",
     "overflowing": false
   },
@@ -61,7 +61,7 @@
   },
   {
     "file": "loading-768.png",
-    "label": "Loading — Checking sessions; Run preflight disabled",
+    "label": "Loading — Checking sessions; Logon check is on; Run preflight disabled",
     "width": "768",
     "overflowing": false
   },
@@ -73,19 +73,19 @@
   },
   {
     "file": "error-768.png",
-    "label": "Error — Environment variable is not set",
+    "label": "Error — session logon timed out after 2s; reachable true, logon fail",
     "width": "768",
     "overflowing": false
   },
   {
     "file": "success-768.png",
-    "label": "Success — Every requested check passed; logon skipped",
+    "label": "Success — Every requested check passed; logon ok",
     "width": "768",
     "overflowing": false
   },
   {
     "file": "disabled-768.png",
-    "label": "Disabled — Logon check is off; FIX Logon disabled",
+    "label": "Disabled — Logon check is off; Logon check control disabled",
     "width": "768",
     "overflowing": false
   },
@@ -121,7 +121,7 @@
   },
   {
     "file": "loading-1280.png",
-    "label": "Loading — Checking sessions; Run preflight disabled",
+    "label": "Loading — Checking sessions; Logon check is on; Run preflight disabled",
     "width": "1280",
     "overflowing": false
   },
@@ -133,19 +133,19 @@
   },
   {
     "file": "error-1280.png",
-    "label": "Error — Environment variable is not set",
+    "label": "Error — session logon timed out after 2s; reachable true, logon fail",
     "width": "1280",
     "overflowing": false
   },
   {
     "file": "success-1280.png",
-    "label": "Success — Every requested check passed; logon skipped",
+    "label": "Success — Every requested check passed; logon ok",
     "width": "1280",
     "overflowing": false
   },
   {
     "file": "disabled-1280.png",
-    "label": "Disabled — Logon check is off; FIX Logon disabled",
+    "label": "Disabled — Logon check is off; Logon check control disabled",
     "width": "1280",
     "overflowing": false
   },
