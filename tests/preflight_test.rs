@@ -91,6 +91,34 @@ fn table_row_for(stdout: &str, session: &str) -> Vec<String> {
     line.split_whitespace().map(|s| s.to_string()).collect()
 }
 
+fn assert_no_files_under_data(dir: &Path) {
+    let data = dir.join("data");
+    match std::fs::read_dir(&data) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("failed to read {}: {e}", data.display()),
+        Ok(_) => {
+            let mut files = Vec::new();
+            fn collect(dir: &Path, files: &mut Vec<PathBuf>) {
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for ent in rd.flatten() {
+                        let p = ent.path();
+                        if p.is_dir() {
+                            collect(&p, files);
+                        } else {
+                            files.push(p);
+                        }
+                    }
+                }
+            }
+            collect(&data, &mut files);
+            assert!(
+                files.is_empty(),
+                "sandbox data/ must contain no files, found {files:?}"
+            );
+        }
+    }
+}
+
 const USAGE: &str = "USAGE: fix_server [--config PATH] | --preflight [--config PATH] [--logon-check] [--timeout-secs N] | --help";
 
 #[test]
@@ -196,6 +224,7 @@ fn listener_reachable_true_logon_skipped_exit_0() {
     assert_eq!(cols[5], "skipped");
     assert!(stdout.lines().next().unwrap().contains("session"));
     assert!(!stderr.contains(" starting"), "{stderr}");
+    assert_no_files_under_data(&dir);
 }
 
 #[test]
@@ -231,6 +260,7 @@ fn closed_port_reachable_false_exit_1() {
         stderr.contains(&format!("session 's1' 127.0.0.1:{port}:")),
         "{stderr}"
     );
+    assert_no_files_under_data(&dir);
 }
 
 #[test]
@@ -317,6 +347,7 @@ fn unset_env_with_logon_check_still_no_fix_and_exits_1() {
     // creds=fail path never constructs FIXSession, so no seqnum file.
     let seq = dir.join("data/seqnum_PF_TEST_SENDER.txt");
     assert!(!seq.exists(), "unset creds must not send FIX: {seq:?}");
+    assert_no_files_under_data(&dir);
 }
 
 #[test]
@@ -363,6 +394,7 @@ fn logon_check_echo_a_reports_ok() {
     assert_eq!(cols[4], "true", "stdout={stdout}\nstderr={stderr}");
     assert_eq!(cols[5], "ok", "stdout={stdout}\nstderr={stderr}");
     assert_eq!(out.status.code(), Some(0), "stdout={stdout}\nstderr={stderr}");
+    assert_no_files_under_data(&dir);
 }
 
 #[test]
@@ -398,4 +430,53 @@ fn logon_check_closed_port_exit_1() {
         stderr.contains(&format!("session 's1' 127.0.0.1:{port}:")),
         "{stderr}"
     );
+    assert_no_files_under_data(&dir);
+}
+
+#[test]
+fn logon_check_tcp_up_no_ack_no_data_files_exit_1() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(false).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let _ = sock.set_read_timeout(Some(Duration::from_secs(4)));
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            // Reachable TCP, but never a logon ack (the failed-logon persist bug).
+            thread::sleep(Duration::from_secs(4));
+        }
+    });
+
+    let dir = isolated_dir();
+    let key = format!("HFT_PF_KEY_NOACK_{port}");
+    let secret = format!("HFT_PF_SECRET_NOACK_{port}");
+    let cfg = write_config(&dir, "127.0.0.1", port, &key, &secret);
+
+    let out = bin()
+        .current_dir(&dir)
+        .env(&key, "dummy-key")
+        .env(&secret, "dummy-secret")
+        .args([
+            "--preflight",
+            "--logon-check",
+            "--config",
+            cfg.to_str().unwrap(),
+            "--timeout-secs",
+            "2",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "stdout={stdout}\nstderr={stderr}");
+    let cols = table_row_for(&stdout, "s1");
+    assert_eq!(cols[4], "true", "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(cols[5], "fail", "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains("session 's1' logon: timed out after"),
+        "{stderr}"
+    );
+    assert_no_files_under_data(&dir);
 }

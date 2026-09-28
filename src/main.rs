@@ -1358,6 +1358,7 @@ pub struct FIXSession {
     sender_comp_id: String,
     target_comp_id: String,
     seq_num: Arc<Mutex<u32>>,
+    persist_seq_to_disk: bool,
     is_connected: Arc<Mutex<bool>>,
     connection_state: Arc<Mutex<ConnectionState>>,
     api_key: String,
@@ -1609,8 +1610,16 @@ impl FIXSession {
             .unwrap_or(5001);
         Self::new_with_credentials_and_kdb(sender, target, api_key, api_secret, Arc::new(KdbWriter::new(kdb_host, kdb_port)))
     }
-    
-    pub fn new_with_credentials_and_kdb(sender: &str, target: &str, api_key: &str, api_secret: &str, kdb_writer: Arc<KdbWriter>) -> Self {
+
+    fn build_session(
+        sender: &str,
+        target: &str,
+        api_key: &str,
+        api_secret: &str,
+        kdb_writer: Arc<KdbWriter>,
+        persist_seq_to_disk: bool,
+        load_positions_from_csv: bool,
+    ) -> Self {
         // Restore sequence number from disk so restarts don't cause MsgSeqNum gaps.
         let safe_sender = sender.replace('.', "_").replace(' ', "_");
         let seq_path = format!("data/seqnum_{}.txt", safe_sender);
@@ -1624,7 +1633,9 @@ impl FIXSession {
 
         let positions = {
             let ps = Arc::new(PositionsStore::new());
-            ps.load_from_trades_csv();
+            if load_positions_from_csv {
+                ps.load_from_trades_csv();
+            }
             ps
         };
         // EL-009: peak starts at CSV-replayed Σ realized even if the guard is off.
@@ -1644,6 +1655,7 @@ impl FIXSession {
             sender_comp_id: sender.to_string(),
             target_comp_id: target.to_string(),
             seq_num: Arc::new(Mutex::new(initial_seq)),
+            persist_seq_to_disk,
             is_connected: Arc::new(Mutex::new(false)),
             connection_state: Arc::new(Mutex::new(ConnectionState::Disconnected)),
             api_key: api_key.to_string(),
@@ -1674,6 +1686,27 @@ impl FIXSession {
             reconnect_storm: Arc::new(Mutex::new(alerts::ReconnectStormTracker::new())),
             capture_symbols: parse_capture_symbols(std::env::var("CAPTURE_SYMBOLS").ok().as_deref()),
         }
+    }
+    
+    pub fn new_with_credentials_and_kdb(sender: &str, target: &str, api_key: &str, api_secret: &str, kdb_writer: Arc<KdbWriter>) -> Self {
+        Self::build_session(sender, target, api_key, api_secret, kdb_writer, true, true)
+    }
+
+    fn new_for_preflight(sender: &str, target: &str, api_key: &str, api_secret: &str) -> Self {
+        let kdb_host = std::env::var("KDB_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let kdb_port: u16 = std::env::var("KDB_PORT")
+            .unwrap_or_else(|_| "5001".to_string())
+            .parse()
+            .unwrap_or(5001);
+        Self::build_session(
+            sender,
+            target,
+            api_key,
+            api_secret,
+            Arc::new(KdbWriter::new(kdb_host, kdb_port)),
+            false,
+            false,
+        )
     }
 
     fn with_transport(
@@ -4155,8 +4188,10 @@ impl FIXSession {
         // Persist so restarts don't reset to 0 and cause MsgSeqNum-too-low rejections.
         let safe_sender = self.sender_comp_id.replace('.', "_").replace(' ', "_");
         let seq_path = format!("data/seqnum_{}.txt", safe_sender);
-        let _ = std::fs::create_dir_all("data");
-        let _ = std::fs::write(&seq_path, n.to_string());
+        if self.persist_seq_to_disk {
+            let _ = std::fs::create_dir_all("data");
+            let _ = std::fs::write(&seq_path, n.to_string());
+        }
         n
     }
 
@@ -7141,7 +7176,7 @@ async fn run_logon_check_session(
             }
         }
         CredStatus::Ok(resolved) => {
-            let session = FIXSession::new_with_credentials(
+            let session = FIXSession::new_for_preflight(
                 &session_cfg.sender_comp_id,
                 &session_cfg.target_comp_id,
                 &resolved.api_key,
@@ -10782,6 +10817,149 @@ mod connectivity_tests {
             "SequenceGap alert must remain in the session buffer"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod preflight_readonly_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static CSV_LOCK: Mutex<()> = Mutex::new(());
+
+    const PLANT_SYMBOL: &str = "PF_LIVE_POS";
+    const PLANT_QTY: f64 = 7.0;
+    const PLANT_PX: f64 = 1.25;
+
+    fn unique_comp(prefix: &str) -> String {
+        format!(
+            "{}_{}_{}",
+            prefix,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )
+    }
+
+    fn seqnum_path(sender: &str) -> PathBuf {
+        let safe = sender.replace('.', "_").replace(' ', "_");
+        PathBuf::from(format!("data/seqnum_{}.txt", safe))
+    }
+
+    struct Ac6SeqnumFileGuard {
+        path: PathBuf,
+    }
+
+    impl Ac6SeqnumFileGuard {
+        fn new(sender: &str) -> Self {
+            Self {
+                path: seqnum_path(sender),
+            }
+        }
+    }
+
+    impl Drop for Ac6SeqnumFileGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    struct Ac6CsvGuard {
+        path: PathBuf,
+        previous: Option<Vec<u8>>,
+        existed: bool,
+    }
+
+    impl Ac6CsvGuard {
+        fn plant() -> Self {
+            let path = PathBuf::from("data/trades.csv");
+            let existed = path.exists();
+            let previous = std::fs::read(&path).ok();
+            let _ = std::fs::create_dir_all("data");
+            let body = format!(
+                "timestamp_ns,cl_ord_id,order_id,symbol,side,exec_type,last_qty,last_px,avg_px\n\
+                 1,cl,oid,{PLANT_SYMBOL},1,F,{PLANT_QTY},{PLANT_PX},{PLANT_PX}\n"
+            );
+            let _ = std::fs::write(&path, body);
+            Self {
+                path,
+                previous,
+                existed,
+            }
+        }
+    }
+
+    impl Drop for Ac6CsvGuard {
+        fn drop(&mut self) {
+            if self.existed {
+                if let Some(ref bytes) = self.previous {
+                    let _ = std::fs::write(&self.path, bytes);
+                }
+            } else {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    async fn assert_live_loads_and_persists(session: &FIXSession, sender: &str) {
+        assert_eq!(session.positions.net_qty_of(PLANT_SYMBOL), PLANT_QTY);
+        assert!(session.order_books.lock().await.is_empty());
+        let n = session.next_seq_num().await;
+        let path = seqnum_path(sender);
+        let written = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(written, n.to_string());
+    }
+
+    #[tokio::test]
+    async fn ac6_live_new_loads_positions_and_persists_seqnum() {
+        let _csv_lock = CSV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sender = unique_comp("PF_LIVE");
+        let _seq = Ac6SeqnumFileGuard::new(&sender);
+        let _csv = Ac6CsvGuard::plant();
+        let session = FIXSession::new(&sender, "PF_TGT");
+        assert_live_loads_and_persists(&session, &sender).await;
+    }
+
+    #[tokio::test]
+    async fn ac6_live_new_with_credentials_loads_positions_and_persists_seqnum() {
+        let _csv_lock = CSV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sender = unique_comp("PF_LIVE");
+        let _seq = Ac6SeqnumFileGuard::new(&sender);
+        let _csv = Ac6CsvGuard::plant();
+        let session = FIXSession::new_with_credentials(&sender, "PF_TGT", "", "");
+        assert_live_loads_and_persists(&session, &sender).await;
+    }
+
+    #[tokio::test]
+    async fn ac6_live_new_with_credentials_and_kdb_loads_positions_and_persists_seqnum() {
+        let _csv_lock = CSV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let sender = unique_comp("PF_LIVE");
+        let _seq = Ac6SeqnumFileGuard::new(&sender);
+        let _csv = Ac6CsvGuard::plant();
+        let kdb = Arc::new(KdbWriter::new("localhost".to_string(), 5001));
+        let session =
+            FIXSession::new_with_credentials_and_kdb(&sender, "PF_TGT", "", "", kdb);
+        assert_live_loads_and_persists(&session, &sender).await;
+    }
+
+    #[tokio::test]
+    async fn ac6_preflight_ctor_reads_leftover_seqnum_without_writing() {
+        let sender = unique_comp("PF_PRE");
+        let _seq = Ac6SeqnumFileGuard::new(&sender);
+        let path = seqnum_path(&sender);
+        let _ = std::fs::create_dir_all("data");
+        let _ = std::fs::write(&path, "42\n");
+        let session = FIXSession::new_for_preflight(&sender, "PF_TGT", "", "");
+        let n = session.next_seq_num().await;
+        assert_eq!(n, 43);
+        let leftover = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(leftover, "42\n");
+        assert_eq!(session.positions.net_qty_of(PLANT_SYMBOL), 0.0);
+        assert!(session.order_books.lock().await.is_empty());
     }
 }
 
