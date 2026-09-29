@@ -7853,9 +7853,16 @@ async fn main() -> Result<()> {
         let market_data_for_zmq = Arc::clone(md_h);
         let zmq_update_rx = order_book_update_tx.subscribe();
         Some(tokio::spawn(async move {
+            // Bind address is configurable so a second, read-only instance
+            // (e.g. production market data alongside UAT) can run on the same
+            // box. Previously hardcoded: the second process failed to bind,
+            // the publisher task exited, and that took the whole process down
+            // in a restart loop. Default is unchanged.
+            let zmq_bind = std::env::var("ZMQ_BIND")
+                .unwrap_or_else(|_| "tcp://0.0.0.0:5555".to_string());
             if let Err(e) = zmq_order_book_publisher_event_driven(
                 market_data_for_zmq,
-                "tcp://0.0.0.0:5555",
+                &zmq_bind,
                 zmq_update_rx,
             )
             .await
