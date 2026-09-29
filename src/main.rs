@@ -10062,6 +10062,12 @@ mod connectivity_tests {
                 if symbol == "BTC_USDT")),
             "expected snapshot probe with Some(seq) for BTC_USDT, got {:?}", evs
         );
+        assert!(
+            evs.iter().any(|e| matches!(e,
+                kdb_integration::ProbeEvent::PendingMdIo { kind: "level", symbol, seq_num: Some(_) }
+                if symbol == "BTC_USDT")),
+            "expected level probe with Some(seq) for BTC_USDT, got {:?}", evs
+        );
         Ok(())
     }
 
