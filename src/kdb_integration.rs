@@ -4,6 +4,7 @@
 
 use anyhow::{anyhow, Result};
 use log::{debug, info, error, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use chrono::Utc;
@@ -26,6 +27,7 @@ const DEFAULT_RECONNECT_BACKOFF_MS: u64 = 1_000;
 const LIVENESS_PROBE_INTERVAL_MS: u64 = 1000;
 const LIVENESS_PROBE_TIMEOUT_MS: u64 = 2000;
 const LIVENESS_PROBE_Q: &str = "1";  // file-local literal; never format!
+const LEVELS_COUNT_Q: &str = "count orderbook_levels"; // file-local; never format!
 
 /// Typed-scalar ensureCol — byte-identical with `kdb/start_kdb_server.q`.
 /// Must use `` `long$0N `` (never `` `long$() ``) so `meta` stays `j` on a non-empty HDB.
@@ -47,6 +49,62 @@ const Q_INIT_CAPTURE_GAPS: &str = "if[not `capture_gaps in key `; capture_gaps: 
 /// Module-level (not `impl KdbWriter`); same body as the former nested helper in main.rs.
 pub(crate) fn escape_kdb_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Join `chars` into one kdb char-vector literal, including wrapping `"`.
+/// Twin of `escape_kdb_string` per character. Empty iterator → `""`.
+pub(crate) fn fmt_kdb_char_col<I: IntoIterator<Item = char>>(chars: I) -> String {
+    let mut inner = String::new();
+    for ch in chars {
+        inner.push_str(&escape_kdb_string(&ch.to_string()));
+    }
+    format!("\"{}\"", inner)
+}
+
+#[allow(private_interfaces)]
+pub(crate) fn levels_insert_q(batch: &[OrderBookLevel]) -> String {
+    let times: Vec<String> = batch.iter().map(|l| format!("`timestamp${}", l.timestamp)).collect();
+    let symbols: Vec<String> = batch.iter().map(|l| format!("`{}", l.symbol)).collect();
+    let sides = fmt_kdb_char_col(batch.iter().map(|l| l.side));
+    let prices: Vec<String> = batch.iter().map(|l| format!("{}f", l.price)).collect();
+    let sizes: Vec<String> = batch.iter().map(|l| format!("{}f", l.size)).collect();
+    let actions = fmt_kdb_char_col(batch.iter().map(|l| l.action));
+    let seqs: Vec<String> = batch.iter().map(|l| fmt_seq(l.seq_num)).collect();
+    format!(
+        "`orderbook_levels insert (({});({});{};({});({});{};({}))",
+        times.join(";"),
+        symbols.join(";"),
+        sides,
+        prices.join(";"),
+        sizes.join(";"),
+        actions,
+        seqs.join(";")
+    )
+}
+
+#[allow(private_interfaces)]
+pub(crate) fn own_trades_insert_q(batch: &[OwnTrade]) -> String {
+    let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
+    let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
+    let sides = fmt_kdb_char_col(batch.iter().map(|t| t.side));
+    let last_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_px)).collect();
+    let last_qtys: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_qty)).collect();
+    let avg_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.avg_px)).collect();
+    let cl_ord_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.cl_ord_id)).collect();
+    let order_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.order_id)).collect();
+    let exec_types = fmt_kdb_char_col(batch.iter().map(|t| t.exec_type));
+    format!(
+        "`own_trades insert (({});({});{};({});({});({});({});({});{})",
+        times.join(";"),
+        symbols.join(";"),
+        sides,
+        last_pxs.join(";"),
+        last_qtys.join(";"),
+        avg_pxs.join(";"),
+        cl_ord_ids.join(";"),
+        order_ids.join(";"),
+        exec_types
+    )
 }
 
 fn fmt_seq(seq: Option<u32>) -> String {
@@ -129,6 +187,7 @@ enum ProbeOutcome {
     Alive,
     QError { message: String },
     Transport,
+    Skipped,
 }
 
 /// kdb+ IPC connection manager using kxkdb library with batched writes for maximum performance
@@ -149,6 +208,11 @@ pub struct KdbWriter {
     batch_size: usize,
 
     probe: Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
+
+    /// One-shot: first non-empty levels insert Ok schedules a spawned count.
+    levels_count_scheduled: Arc<AtomicBool>,
+    /// True while the spawned count holds the writer QStream (skip-not-tear-down).
+    levels_count_in_flight: Arc<AtomicBool>,
 }
 
 impl KdbWriter {
@@ -165,6 +229,8 @@ impl KdbWriter {
             capture_gap_buffer: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
             batch_size: 100, // Flush when buffer reaches 100 items
             probe: Arc::new(std::sync::Mutex::new(Vec::new())),
+            levels_count_scheduled: Arc::new(AtomicBool::new(false)),
+            levels_count_in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -220,7 +286,11 @@ impl KdbWriter {
 
     async fn probe_once(
         stream: &Arc<Mutex<Option<QStream>>>,
+        in_flight: &AtomicBool,
     ) -> ProbeOutcome {
+        if in_flight.load(Ordering::Acquire) {
+            return ProbeOutcome::Skipped;
+        }
         let mut stream_guard = stream.lock().await;
         let qstream = match stream_guard.as_mut() {
             Some(qstream) => qstream,
@@ -272,6 +342,8 @@ impl KdbWriter {
         let stream = Arc::clone(&self.stream);
         let connected = Arc::clone(&self.connected);
         let probe = Arc::clone(&self.probe);
+        let scheduled = Arc::clone(&self.levels_count_scheduled);
+        let in_flight = Arc::clone(&self.levels_count_in_flight);
         let batch_size = self.batch_size;
 
         tokio::spawn(async move {
@@ -283,13 +355,15 @@ impl KdbWriter {
                 interval.tick().await;
 
                 let up = *connected.lock().await;
-                if up {
+                if up && !in_flight.load(Ordering::Acquire) {
                     let mut levels = level_buf.lock().await;
                     if !levels.is_empty() {
                         let batch: Vec<_> = levels.drain(..).collect();
                         drop(levels);
-                        if let Err(e) = Self::flush_levels_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &level_buf, batch, "level", e, &probe).await;
+                        if let Err(e) = Self::flush_levels_batch(
+                            &stream, &batch, &connected, &probe, &scheduled, &in_flight,
+                        ).await {
+                            Self::handle_flush_err(&connected, &stream, &level_buf, batch, "level", e, &probe).await;
                         }
                     }
 
@@ -297,8 +371,8 @@ impl KdbWriter {
                     if !trades.is_empty() {
                         let batch: Vec<_> = trades.drain(..).collect();
                         drop(trades);
-                        if let Err(e) = Self::flush_trades_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &trade_buf, batch, "trade", e, &probe).await;
+                        if let Err(e) = Self::flush_trades_batch(&stream, &batch, &in_flight).await {
+                            Self::handle_flush_err(&connected, &stream, &trade_buf, batch, "trade", e, &probe).await;
                         }
                     }
 
@@ -306,8 +380,8 @@ impl KdbWriter {
                     if !snapshots.is_empty() {
                         let batch: Vec<_> = snapshots.drain(..).collect();
                         drop(snapshots);
-                        if let Err(e) = Self::flush_snapshots_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &snapshot_buf, batch, "snapshot", e, &probe).await;
+                        if let Err(e) = Self::flush_snapshots_batch(&stream, &batch, &in_flight).await {
+                            Self::handle_flush_err(&connected, &stream, &snapshot_buf, batch, "snapshot", e, &probe).await;
                         }
                     }
 
@@ -315,8 +389,8 @@ impl KdbWriter {
                     if !own_trades.is_empty() {
                         let batch: Vec<_> = own_trades.drain(..).collect();
                         drop(own_trades);
-                        if let Err(e) = Self::flush_own_trades_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &own_trade_buf, batch, "own_trade", e, &probe).await;
+                        if let Err(e) = Self::flush_own_trades_batch(&stream, &batch, &in_flight).await {
+                            Self::handle_flush_err(&connected, &stream, &own_trade_buf, batch, "own_trade", e, &probe).await;
                         }
                     }
 
@@ -324,15 +398,15 @@ impl KdbWriter {
                     if !gaps.is_empty() {
                         let batch: Vec<_> = gaps.drain(..).collect();
                         drop(gaps);
-                        if let Err(e) = Self::flush_capture_gaps_batch(&stream, &batch).await {
-                            Self::requeue_on_flush_err(&connected, &stream, &gap_buf, batch, "capture_gap", e, &probe).await;
+                        if let Err(e) = Self::flush_capture_gaps_batch(&stream, &batch, &in_flight).await {
+                            Self::handle_flush_err(&connected, &stream, &gap_buf, batch, "capture_gap", e, &probe).await;
                         }
                     }
                 }
 
                 let up = *connected.lock().await;
                 if up && last_probe.elapsed() >= std::time::Duration::from_millis(LIVENESS_PROBE_INTERVAL_MS) {
-                    match Self::probe_once(&stream).await {
+                    match Self::probe_once(&stream, &in_flight).await {
                         ProbeOutcome::Alive => {
                             last_probe = std::time::Instant::now();
                         }
@@ -342,6 +416,9 @@ impl KdbWriter {
                         }
                         ProbeOutcome::Transport => {
                             Self::mark_disconnected(&connected, &stream, &probe).await;
+                        }
+                        ProbeOutcome::Skipped => {
+                            // count holds the stream — do not tear down, do not refresh last_probe
                         }
                     }
                 }
@@ -426,12 +503,22 @@ impl KdbWriter {
 
     /// Fire-and-forget bulk insert — sends an async message (no response wait).
     /// Used by all flush_*_batch functions for high-throughput data writes.
-    async fn execute_single_insert(stream: &Arc<Mutex<Option<QStream>>>, q_code: &str) -> Result<()> {
+    async fn execute_single_insert(
+        stream: &Arc<Mutex<Option<QStream>>>,
+        q_code: &str,
+        in_flight: &AtomicBool,
+    ) -> Result<()> {
         let mut stream_guard = stream.lock().await;
-        let qstream = stream_guard.as_mut()
-            .ok_or_else(|| anyhow!("Stream not available"))?;
-        qstream.send_async_message(&q_code).await
-            .map_err(|e| anyhow!("Async insert failed: {}", e))
+        match stream_guard.as_mut() {
+            Some(qstream) => qstream
+                .send_async_message(&q_code)
+                .await
+                .map_err(|e| anyhow!("Async insert failed: {}", e)),
+            None if in_flight.load(Ordering::Acquire) => {
+                Err(anyhow!("kdb levels-count in flight"))
+            }
+            None => Err(anyhow!("Stream not available")),
+        }
     }
 
     /// Execute a q expression via IPC using kxkdb (sync for initialization)
@@ -458,6 +545,131 @@ impl KdbWriter {
         for item in batch.into_iter().rev() {
             buf.push_front(item);
         }
+    }
+
+    async fn requeue_without_disconnect<T>(
+        buf: &Arc<tokio::sync::Mutex<VecDeque<T>>>,
+        batch: Vec<T>,
+        what: &str,
+    ) {
+        warn!(
+            "Failed to flush {} batch: kdb levels-count in flight — re-queuing without dropping latch",
+            what
+        );
+        let mut buf = buf.lock().await;
+        for item in batch.into_iter().rev() {
+            buf.push_front(item);
+        }
+    }
+
+    async fn handle_flush_err<T>(
+        connected: &Arc<tokio::sync::Mutex<bool>>,
+        stream: &Arc<Mutex<Option<QStream>>>,
+        buf: &Arc<tokio::sync::Mutex<VecDeque<T>>>,
+        batch: Vec<T>,
+        what: &str,
+        err: anyhow::Error,
+        probe: &Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
+    ) {
+        if err.to_string() == "kdb levels-count in flight" {
+            Self::requeue_without_disconnect(buf, batch, what).await;
+        } else {
+            Self::requeue_on_flush_err(connected, stream, buf, batch, what, err, probe).await;
+        }
+    }
+
+    fn spawn_levels_count_if_first(
+        stream: Arc<Mutex<Option<QStream>>>,
+        connected: Arc<tokio::sync::Mutex<bool>>,
+        probe: Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
+        scheduled: Arc<AtomicBool>,
+        in_flight: Arc<AtomicBool>,
+        q_code: String,
+    ) {
+        if scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        tokio::spawn(async move {
+            in_flight.store(true, Ordering::Release);
+            let taken = {
+                let mut guard = stream.lock().await;
+                guard.take()
+            };
+            let Some(mut qstream) = taken else {
+                in_flight.store(false, Ordering::Release);
+                return;
+            };
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(LIVENESS_PROBE_TIMEOUT_MS),
+                qstream.send_sync_message(&LEVELS_COUNT_Q),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(k)) => {
+                    Self::restore_count_stream(&stream, &connected, qstream).await;
+                    in_flight.store(false, Ordering::Release);
+                    if k.get_type() == qtype::ERROR {
+                        let msg = k.get_error_string().unwrap_or("unknown error");
+                        let msg_t: String = msg.chars().take(200).collect();
+                        let q_t: String = q_code.chars().take(512).collect();
+                        error!(
+                            "kdb+ orderbook_levels count q-error: {} (truncated insert: {})",
+                            msg_t, q_t
+                        );
+                    } else if k.get_type() == qtype::LONG_ATOM {
+                        match k.get_long() {
+                            Ok(n) if n > 0 => {
+                                info!("orderbook_levels count={} after first flush", n);
+                            }
+                            Ok(n) => {
+                                let q_t: String = q_code.chars().take(512).collect();
+                                error!(
+                                    "orderbook_levels count={} after first flush — kdb likely rejected the insert (type mismatch); truncated q: {}",
+                                    n, q_t
+                                );
+                            }
+                            Err(e) => {
+                                error!("orderbook_levels count: LONG_ATOM get_long failed: {}", e);
+                            }
+                        }
+                    } else {
+                        error!(
+                            "orderbook_levels count: unexpected qtype {}",
+                            k.get_type()
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    drop(qstream);
+                    error!("orderbook_levels count did not complete (transport): {}", e);
+                    Self::mark_disconnected(&connected, &stream, &probe).await;
+                    in_flight.store(false, Ordering::Release);
+                }
+                Err(_elapsed) => {
+                    drop(qstream);
+                    error!("orderbook_levels count did not complete (timeout)");
+                    Self::mark_disconnected(&connected, &stream, &probe).await;
+                    in_flight.store(false, Ordering::Release);
+                }
+            }
+        });
+    }
+
+    async fn restore_count_stream(
+        stream: &Arc<Mutex<Option<QStream>>>,
+        connected: &Arc<tokio::sync::Mutex<bool>>,
+        qstream: QStream,
+    ) {
+        let connected_guard = connected.lock().await;
+        if *connected_guard {
+            *stream.lock().await = Some(qstream);
+        }
+        // else drop qstream — disconnect raced; never mark_disconnected from here
     }
 
     async fn emit_overflow_gap(&self, dropped_symbols: &[String]) {
@@ -494,12 +706,21 @@ impl KdbWriter {
         let buffer_len = buffer.len();
         drop(buffer);
 
-        if buffer_len >= self.batch_size && *self.connected.lock().await {
+        if buffer_len >= self.batch_size
+            && *self.connected.lock().await
+            && !self.levels_count_in_flight.load(Ordering::Acquire)
+        {
             let mut buffer = self.capture_gap_buffer.lock().await;
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
-            if let Err(e) = Self::flush_capture_gaps_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(
+            if let Err(e) = Self::flush_capture_gaps_batch(
+                &self.stream,
+                &batch,
+                &self.levels_count_in_flight,
+            )
+            .await
+            {
+                Self::handle_flush_err(
                     &self.connected,
                     &self.stream,
                     &self.capture_gap_buffer,
@@ -513,31 +734,35 @@ impl KdbWriter {
     }
 
     /// Flush a batch of order book levels using a single bulk insert command
-    async fn flush_levels_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[OrderBookLevel]) -> Result<()> {
+    async fn flush_levels_batch(
+        stream: &Arc<Mutex<Option<QStream>>>,
+        batch: &[OrderBookLevel],
+        connected: &Arc<tokio::sync::Mutex<bool>>,
+        probe: &Arc<std::sync::Mutex<Vec<ProbeEvent>>>,
+        scheduled: &Arc<AtomicBool>,
+        in_flight: &Arc<AtomicBool>,
+    ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
         debug!("🔄 Flushing {} order book levels to kdb+", batch.len());
 
-        let times: Vec<String> = batch.iter().map(|l| format!("`timestamp${}", l.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|l| format!("`{}", l.symbol)).collect();
-        let sides: Vec<String> = batch.iter().map(|l| format!("`{}", l.side)).collect();
-        let prices: Vec<String> = batch.iter().map(|l| format!("{}f", l.price)).collect();
-        let sizes: Vec<String> = batch.iter().map(|l| format!("{}f", l.size)).collect();
-        let actions: Vec<String> = batch.iter().map(|l| format!("`{}", l.action)).collect();
-        let seqs: Vec<String> = batch.iter().map(|l| fmt_seq(l.seq_num)).collect();
+        let q_code = levels_insert_q(batch);
 
-        let q_code = format!(
-            "`orderbook_levels insert (({});({});({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), sides.join(";"),
-            prices.join(";"), sizes.join(";"), actions.join(";"),
-            seqs.join(";")
-        );
-
-        match Self::execute_single_insert(stream, &q_code).await {
+        match Self::execute_single_insert(stream, &q_code, in_flight).await {
             Ok(()) => {
                 debug!("✅ Flushed {} order book levels", batch.len());
+                if *connected.lock().await {
+                    Self::spawn_levels_count_if_first(
+                        Arc::clone(stream),
+                        Arc::clone(connected),
+                        Arc::clone(probe),
+                        Arc::clone(scheduled),
+                        Arc::clone(in_flight),
+                        q_code,
+                    );
+                }
                 Ok(())
             }
             Err(e) => {
@@ -548,7 +773,11 @@ impl KdbWriter {
     }
 
     /// Flush a batch of trades using a single bulk insert command
-    async fn flush_trades_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[Trade]) -> Result<()> {
+    async fn flush_trades_batch(
+        stream: &Arc<Mutex<Option<QStream>>>,
+        batch: &[Trade],
+        in_flight: &AtomicBool,
+    ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -567,7 +796,7 @@ impl KdbWriter {
             seqs.join(";")
         );
 
-        match Self::execute_single_insert(stream, &q_code).await {
+        match Self::execute_single_insert(stream, &q_code, in_flight).await {
             Ok(()) => {
                 debug!("✅ Flushed {} trades", batch.len());
                 Ok(())
@@ -580,7 +809,11 @@ impl KdbWriter {
     }
 
     /// Flush a batch of snapshots using a single bulk insert command
-    async fn flush_snapshots_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[Snapshot]) -> Result<()> {
+    async fn flush_snapshots_batch(
+        stream: &Arc<Mutex<Option<QStream>>>,
+        batch: &[Snapshot],
+        in_flight: &AtomicBool,
+    ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -603,7 +836,7 @@ impl KdbWriter {
             best_ask_sizes.join(";"), spreads.join(";"), seqs.join(";")
         );
 
-        match Self::execute_single_insert(stream, &q_code).await {
+        match Self::execute_single_insert(stream, &q_code, in_flight).await {
             Ok(()) => {
                 debug!("✅ Flushed {} snapshots", batch.len());
                 Ok(())
@@ -618,6 +851,7 @@ impl KdbWriter {
     async fn flush_capture_gaps_batch(
         stream: &Arc<Mutex<Option<QStream>>>,
         batch: &[CaptureGap],
+        in_flight: &AtomicBool,
     ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
@@ -639,7 +873,7 @@ impl KdbWriter {
             received.join(";"), sizes.join(";")
         );
 
-        match Self::execute_single_insert(stream, &q_code).await {
+        match Self::execute_single_insert(stream, &q_code, in_flight).await {
             Ok(()) => {
                 debug!("✅ Flushed {} capture gaps", batch.len());
                 Ok(())
@@ -694,13 +928,34 @@ impl KdbWriter {
 
         debug!("📦 Buffered order book level. Buffer size: {}", buffer_len);
 
-        if buffer_len >= self.batch_size && *self.connected.lock().await {
+        if buffer_len >= self.batch_size
+            && *self.connected.lock().await
+            && !self.levels_count_in_flight.load(Ordering::Acquire)
+        {
             let mut buffer = self.level_buffer.lock().await;
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
 
-            if let Err(e) = Self::flush_levels_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.level_buffer, batch, "level", e, &self.probe).await;
+            if let Err(e) = Self::flush_levels_batch(
+                &self.stream,
+                &batch,
+                &self.connected,
+                &self.probe,
+                &self.levels_count_scheduled,
+                &self.levels_count_in_flight,
+            )
+            .await
+            {
+                Self::handle_flush_err(
+                    &self.connected,
+                    &self.stream,
+                    &self.level_buffer,
+                    batch,
+                    "level",
+                    e,
+                    &self.probe,
+                )
+                .await;
             }
         }
 
@@ -742,13 +997,31 @@ impl KdbWriter {
             }
         };
 
-        if buffer_len >= self.batch_size && *self.connected.lock().await {
+        if buffer_len >= self.batch_size
+            && *self.connected.lock().await
+            && !self.levels_count_in_flight.load(Ordering::Acquire)
+        {
             let mut buffer = self.trade_buffer.lock().await;
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
 
-            if let Err(e) = Self::flush_trades_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.trade_buffer, batch, "trade", e, &self.probe).await;
+            if let Err(e) = Self::flush_trades_batch(
+                &self.stream,
+                &batch,
+                &self.levels_count_in_flight,
+            )
+            .await
+            {
+                Self::handle_flush_err(
+                    &self.connected,
+                    &self.stream,
+                    &self.trade_buffer,
+                    batch,
+                    "trade",
+                    e,
+                    &self.probe,
+                )
+                .await;
             }
         }
 
@@ -797,13 +1070,31 @@ impl KdbWriter {
             }
         };
 
-        if buffer_len >= self.batch_size && *self.connected.lock().await {
+        if buffer_len >= self.batch_size
+            && *self.connected.lock().await
+            && !self.levels_count_in_flight.load(Ordering::Acquire)
+        {
             let mut buffer = self.snapshot_buffer.lock().await;
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
 
-            if let Err(e) = Self::flush_snapshots_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(&self.connected, &self.stream, &self.snapshot_buffer, batch, "snapshot", e, &self.probe).await;
+            if let Err(e) = Self::flush_snapshots_batch(
+                &self.stream,
+                &batch,
+                &self.levels_count_in_flight,
+            )
+            .await
+            {
+                Self::handle_flush_err(
+                    &self.connected,
+                    &self.stream,
+                    &self.snapshot_buffer,
+                    batch,
+                    "snapshot",
+                    e,
+                    &self.probe,
+                )
+                .await;
             }
         }
 
@@ -830,31 +1121,20 @@ impl KdbWriter {
     }
 
     /// Flush a batch of own execution fills using a single bulk insert command
-    async fn flush_own_trades_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[OwnTrade]) -> Result<()> {
+    async fn flush_own_trades_batch(
+        stream: &Arc<Mutex<Option<QStream>>>,
+        batch: &[OwnTrade],
+        in_flight: &AtomicBool,
+    ) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
 
         debug!("🔄 Flushing {} own trades to kdb+", batch.len());
 
-        let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
-        let sides: Vec<String> = batch.iter().map(|t| format!("`{}", t.side)).collect();
-        let last_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_px)).collect();
-        let last_qtys: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_qty)).collect();
-        let avg_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.avg_px)).collect();
-        let cl_ord_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.cl_ord_id)).collect();
-        let order_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.order_id)).collect();
-        let exec_types: Vec<String> = batch.iter().map(|t| format!("`{}", t.exec_type)).collect();
+        let q_code = own_trades_insert_q(batch);
 
-        let q_code = format!(
-            "`own_trades insert (({});({});({});({});({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), sides.join(";"),
-            last_pxs.join(";"), last_qtys.join(";"), avg_pxs.join(";"),
-            cl_ord_ids.join(";"), order_ids.join(";"), exec_types.join(";")
-        );
-
-        match Self::execute_single_insert(stream, &q_code).await {
+        match Self::execute_single_insert(stream, &q_code, in_flight).await {
             Ok(()) => {
                 debug!("✅ Flushed {} own trades", batch.len());
                 Ok(())
@@ -907,12 +1187,21 @@ impl KdbWriter {
         };
 
         let up = *self.connected.lock().await;
-        if buffer_len >= self.batch_size && up {
+        if buffer_len >= self.batch_size
+            && up
+            && !self.levels_count_in_flight.load(Ordering::Acquire)
+        {
             let mut buffer = self.own_trade_buffer.lock().await;
             let batch: Vec<_> = buffer.drain(..).collect();
             drop(buffer);
-            if let Err(e) = Self::flush_own_trades_batch(&self.stream, &batch).await {
-                Self::requeue_on_flush_err(
+            if let Err(e) = Self::flush_own_trades_batch(
+                &self.stream,
+                &batch,
+                &self.levels_count_in_flight,
+            )
+            .await
+            {
+                Self::handle_flush_err(
                     &self.connected,
                     &self.stream,
                     &self.own_trade_buffer,
@@ -962,7 +1251,13 @@ impl KdbWriter {
                 timestamp, symbol, sec_id_str, exch_str, escaped_attrs
             );
 
-            if let Ok(()) = Self::execute_single_insert(&self.stream, q_code.as_str()).await {
+            if let Ok(()) = Self::execute_single_insert(
+                &self.stream,
+                q_code.as_str(),
+                &self.levels_count_in_flight,
+            )
+            .await
+            {
                 success_count += 1;
             } else {
                 warn!("❌ Failed to insert security: {}", symbol);
@@ -988,6 +1283,9 @@ impl KdbWriter {
     pub async fn query_json_full(&self, full_expr: &str) -> Result<String> {
         if !*self.connected.lock().await {
             return Err(anyhow!("Not connected to kdb+"));
+        }
+        if self.levels_count_in_flight.load(Ordering::Acquire) {
+            return Err(anyhow!("Stream not available"));
         }
 
         let mut stream_guard = self.stream.lock().await;
@@ -1016,6 +1314,9 @@ impl KdbWriter {
     pub async fn query_table_to_json(&self, q_query: &str) -> Result<String> {
         if !*self.connected.lock().await {
             return Err(anyhow!("Not connected to kdb+"));
+        }
+        if self.levels_count_in_flight.load(Ordering::Acquire) {
+            return Err(anyhow!("Stream not available"));
         }
 
         let mut stream_guard = self.stream.lock().await;
@@ -1165,19 +1466,47 @@ impl KdbWriter {
         let gaps: Vec<_> = self.capture_gap_buffer.lock().await.drain(..).collect();
 
         if !levels.is_empty() {
-            let _ = Self::flush_levels_batch(&self.stream, &levels).await;
+            let _ = Self::flush_levels_batch(
+                &self.stream,
+                &levels,
+                &self.connected,
+                &self.probe,
+                &self.levels_count_scheduled,
+                &self.levels_count_in_flight,
+            )
+            .await;
         }
         if !trades.is_empty() {
-            let _ = Self::flush_trades_batch(&self.stream, &trades).await;
+            let _ = Self::flush_trades_batch(
+                &self.stream,
+                &trades,
+                &self.levels_count_in_flight,
+            )
+            .await;
         }
         if !snapshots.is_empty() {
-            let _ = Self::flush_snapshots_batch(&self.stream, &snapshots).await;
+            let _ = Self::flush_snapshots_batch(
+                &self.stream,
+                &snapshots,
+                &self.levels_count_in_flight,
+            )
+            .await;
         }
         if !own_trades.is_empty() {
-            let _ = Self::flush_own_trades_batch(&self.stream, &own_trades).await;
+            let _ = Self::flush_own_trades_batch(
+                &self.stream,
+                &own_trades,
+                &self.levels_count_in_flight,
+            )
+            .await;
         }
         if !gaps.is_empty() {
-            let _ = Self::flush_capture_gaps_batch(&self.stream, &gaps).await;
+            let _ = Self::flush_capture_gaps_batch(
+                &self.stream,
+                &gaps,
+                &self.levels_count_in_flight,
+            )
+            .await;
         }
 
         if let Some(mut stream) = self.stream.lock().await.take() {
@@ -1250,12 +1579,119 @@ impl KdbWriter {
 mod tests {
     use super::*;
     use kxkdb::ipc::{qmsg_type, Auth, ConnectionMethod, K, QStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
     #[test]
     fn escape_kdb_string_quotes_and_backslashes() {
         assert_eq!(escape_kdb_string("a\"b\\c"), "a\\\"b\\\\c");
+    }
+
+    #[test]
+    fn fmt_kdb_char_col_ba_nc() {
+        assert_eq!(fmt_kdb_char_col(['B', 'A']), "\"BA\"");
+        assert_eq!(fmt_kdb_char_col(['N', 'C']), "\"NC\"");
+        assert_eq!(fmt_kdb_char_col(std::iter::empty()), "\"\"");
+    }
+
+    #[test]
+    fn fmt_kdb_char_col_escapes_quote_backslash_semicolon() {
+        assert_eq!(fmt_kdb_char_col(['"']), "\"\\\"\"");
+        assert_eq!(fmt_kdb_char_col(['\\']), "\"\\\\\"");
+        assert_eq!(fmt_kdb_char_col([';']), "\";\"");
+    }
+
+    fn sample_level(symbol: &str, side: char, action: char, ts: i64, seq: u32) -> OrderBookLevel {
+        OrderBookLevel {
+            timestamp: ts,
+            symbol: symbol.to_string(),
+            side,
+            price: 1.0,
+            size: 2.0,
+            action,
+            seq_num: Some(seq),
+        }
+    }
+
+    #[test]
+    fn levels_insert_q_two_row_bare_char_vectors() {
+        let batch = vec![
+            sample_level("XYZ", 'B', 'N', 1, 7),
+            sample_level("XYZ", 'A', 'C', 2, 8),
+        ];
+        let q = levels_insert_q(&batch);
+        assert!(q.contains(";\"BA\";"), "expected bare char vector ;\"BA\"; got {}", q);
+        assert!(q.contains(";\"NC\";"), "expected bare char vector ;\"NC\"; got {}", q);
+        assert!(!q.contains("(\"BA\")"), "must not enlist (\"BA\"): {}", q);
+        assert!(!q.contains("(\"NC\")"), "must not enlist (\"NC\"): {}", q);
+        assert!(!q.contains("(\"B\";\"A\")"), "must not emit mixed-list (\"B\";\"A\"): {}", q);
+        assert!(!q.contains("`B"), "leftover symbol atom `B would false-fail on BTC_USDT; fixture is XYZ: {}", q);
+        assert!(q.contains("`XYZ"), "symbol column stays symbol atoms: {}", q);
+        assert!(q.contains("7j"));
+        assert!(q.contains("8j"));
+    }
+
+    #[test]
+    fn levels_insert_q_one_row_char_atom() {
+        let batch = vec![sample_level("XYZ", 'B', 'N', 1, 7)];
+        let q = levels_insert_q(&batch);
+        assert!(q.contains(";\"B\";"), "expected char atom ;\"B\"; got {}", q);
+        assert!(q.contains(";\"N\";"), "expected char atom ;\"N\"; got {}", q);
+        assert!(!q.contains("(\"B\")"), "must not enlist (\"B\"): {}", q);
+        assert!(!q.contains("(\"N\")"), "must not enlist (\"N\"): {}", q);
+        assert!(!q.contains("`B"));
+        assert!(!q.contains("`N"));
+    }
+
+    #[test]
+    fn own_trades_insert_q_char_slots_unparenthesized() {
+        let batch = vec![OwnTrade {
+            timestamp: 1,
+            symbol: "XYZ".into(),
+            side: '1',
+            last_px: 1.0,
+            last_qty: 1.0,
+            avg_px: 1.0,
+            cl_ord_id: "c1".into(),
+            order_id: "o1".into(),
+            exec_type: 'F',
+        }];
+        let q = own_trades_insert_q(&batch);
+        assert!(q.contains(";\"1\";"), "side slot unparenthesized ;\"1\"; got {}", q);
+        assert!(q.contains(";\"F\")"), "exec_type is last column so delimiter is ): {}", q);
+        assert!(!q.contains("(\"1\")"));
+        assert!(!q.contains("(\"F\")"));
+        assert!(q.contains("`c1"), "ids stay symbol atoms: {}", q);
+        assert!(q.contains("`o1"), "ids stay symbol atoms: {}", q);
+    }
+
+    #[test]
+    fn flush_levels_batch_no_symbol_atoms_for_side_action() {
+        let batch = vec![
+            sample_level("XYZ", 'B', 'N', 1, 7),
+            sample_level("XYZ", 'A', 'D', 2, 8),
+        ];
+        let q = levels_insert_q(&batch);
+        assert!(!q.contains("`B"), "{}", q);
+        assert!(!q.contains("`A"), "{}", q);
+        assert!(!q.contains("`N"), "{}", q);
+        assert!(!q.contains("`D"), "{}", q);
+        assert!(q.contains("\"BA\""));
+        assert!(q.contains("\"ND\""));
+        let ot = own_trades_insert_q(&[OwnTrade {
+            timestamp: 1,
+            symbol: "XYZ".into(),
+            side: '1',
+            last_px: 1.0,
+            last_qty: 1.0,
+            avg_px: 1.0,
+            cl_ord_id: "c1".into(),
+            order_id: "o1".into(),
+            exec_type: 'F',
+        }]);
+        assert!(!ot.contains("`1"), "own_trades side must not be a symbol atom: {}", ot);
+        assert!(!ot.contains("`F"), "own_trades exec_type must not be a symbol atom: {}", ot);
     }
 
     #[test]
@@ -1400,7 +1836,9 @@ mod tests {
         *w.connected.lock().await = true;
         w.own_trade_buffer.lock().await.push_back(sample_own_trade());
         let batch: Vec<_> = w.own_trade_buffer.lock().await.drain(..).collect();
-        let err = KdbWriter::flush_own_trades_batch(&w.stream, &batch).await.unwrap_err();
+        let err = KdbWriter::flush_own_trades_batch(&w.stream, &batch, &w.levels_count_in_flight)
+            .await
+            .unwrap_err();
         KdbWriter::requeue_on_flush_err(
             &w.connected,
             &w.stream,
@@ -1443,8 +1881,59 @@ mod tests {
     #[tokio::test]
     async fn probe_once_stream_none_is_transport() {
         let stream: Arc<Mutex<Option<QStream>>> = Arc::new(Mutex::new(None));
-        let outcome = KdbWriter::probe_once(&stream).await;
+        let outcome = KdbWriter::probe_once(&stream, &AtomicBool::new(false)).await;
         assert!(matches!(outcome, ProbeOutcome::Transport));
+    }
+
+    #[tokio::test]
+    async fn levels_count_in_flight_does_not_mark_disconnected() {
+        let w = KdbWriter::new("127.0.0.1".into(), 1);
+        *w.connected.lock().await = true;
+        w.levels_count_in_flight.store(true, Ordering::Release);
+
+        let outcome = KdbWriter::probe_once(&w.stream, &w.levels_count_in_flight).await;
+        assert!(
+            matches!(outcome, ProbeOutcome::Skipped),
+            "in_flight probe must skip, not Transport: {:?}",
+            outcome
+        );
+        assert!(w.is_connected().await, "skip must not tear down connected");
+        assert!(
+            !w.drain_probe()
+                .iter()
+                .any(|e| matches!(e, ProbeEvent::KdbDisconnected)),
+            "in_flight skip must not record KdbDisconnected"
+        );
+
+        let err = KdbWriter::execute_single_insert(&w.stream, "1", &w.levels_count_in_flight)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "kdb levels-count in flight");
+        assert!(w.is_connected().await);
+
+        let batch = vec![sample_own_trade()];
+        let flush_err = KdbWriter::flush_own_trades_batch(
+            &w.stream,
+            &batch,
+            &w.levels_count_in_flight,
+        )
+        .await
+        .unwrap_err();
+        KdbWriter::handle_flush_err(
+            &w.connected,
+            &w.stream,
+            &w.own_trade_buffer,
+            batch,
+            "own_trade",
+            flush_err,
+            &w.probe,
+        )
+        .await;
+        assert!(
+            w.is_connected().await,
+            "in-flight flush defer must requeue without dropping latch"
+        );
+        assert_eq!(w.own_trade_buffer_len().await, 1);
     }
 
     #[tokio::test]
