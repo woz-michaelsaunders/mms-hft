@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use log::{debug, info, error, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use chrono::Utc;
 use kxkdb::ipc::*;
@@ -51,6 +52,21 @@ pub(crate) fn escape_kdb_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// The ONLY quoted-cast constructor for identifier atoms.
+/// Output is q source, e.g. `$"BTCUSD-PERP".
+pub(crate) fn fmt_kdb_sym(s: &str) -> String {
+    format!("`$\"{}\"", escape_kdb_string(s))
+}
+
+/// Securities optional identifier. None → kdb null symbol ` (single backtick).
+/// Some("") → `$"" (quoted empty), NOT the null fallback.
+fn fmt_kdb_sym_opt(s: &Option<String>) -> String {
+    match s {
+        Some(v) => fmt_kdb_sym(v),
+        None => "`".to_string(),
+    }
+}
+
 /// Join `chars` into one kdb char-vector literal, including wrapping `"`.
 /// Twin of `escape_kdb_string` per character. Empty iterator → `""`.
 pub(crate) fn fmt_kdb_char_col<I: IntoIterator<Item = char>>(chars: I) -> String {
@@ -64,7 +80,7 @@ pub(crate) fn fmt_kdb_char_col<I: IntoIterator<Item = char>>(chars: I) -> String
 #[allow(private_interfaces)]
 pub(crate) fn levels_insert_q(batch: &[OrderBookLevel]) -> String {
     let times: Vec<String> = batch.iter().map(|l| format!("`timestamp${}", l.timestamp)).collect();
-    let symbols: Vec<String> = batch.iter().map(|l| format!("`{}", l.symbol)).collect();
+    let symbols: Vec<String> = batch.iter().map(|l| fmt_kdb_sym(&l.symbol)).collect();
     let sides = fmt_kdb_char_col(batch.iter().map(|l| l.side));
     let prices: Vec<String> = batch.iter().map(|l| format!("{}f", l.price)).collect();
     let sizes: Vec<String> = batch.iter().map(|l| format!("{}f", l.size)).collect();
@@ -83,15 +99,55 @@ pub(crate) fn levels_insert_q(batch: &[OrderBookLevel]) -> String {
 }
 
 #[allow(private_interfaces)]
+pub(crate) fn trades_insert_q(batch: &[Trade]) -> String {
+    let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
+    let symbols: Vec<String> = batch.iter().map(|t| fmt_kdb_sym(&t.symbol)).collect();
+    let prices: Vec<String> = batch.iter().map(|t| format!("{}f", t.price)).collect();
+    let sizes: Vec<String> = batch.iter().map(|t| format!("{}f", t.size)).collect();
+    let seqs: Vec<String> = batch.iter().map(|t| fmt_seq(t.seq_num)).collect();
+    format!(
+        "`trades insert (({});({});({});({});({}))",
+        times.join(";"),
+        symbols.join(";"),
+        prices.join(";"),
+        sizes.join(";"),
+        seqs.join(";")
+    )
+}
+
+#[allow(private_interfaces)]
+pub(crate) fn snapshots_insert_q(batch: &[Snapshot]) -> String {
+    let times: Vec<String> = batch.iter().map(|s| format!("`timestamp${}", s.timestamp)).collect();
+    let symbols: Vec<String> = batch.iter().map(|s| fmt_kdb_sym(&s.symbol)).collect();
+    let best_bids: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid)).collect();
+    let best_asks: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_ask)).collect();
+    let best_bid_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid_size)).collect();
+    let best_ask_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_ask_size)).collect();
+    let spreads: Vec<String> = batch.iter().map(|s| format!("{}f", s.spread)).collect();
+    let seqs: Vec<String> = batch.iter().map(|s| fmt_seq(s.seq_num)).collect();
+    format!(
+        "`orderbook_snapshots insert (({});({});({});({});({});({});({});({}))",
+        times.join(";"),
+        symbols.join(";"),
+        best_bids.join(";"),
+        best_asks.join(";"),
+        best_bid_sizes.join(";"),
+        best_ask_sizes.join(";"),
+        spreads.join(";"),
+        seqs.join(";")
+    )
+}
+
+#[allow(private_interfaces)]
 pub(crate) fn own_trades_insert_q(batch: &[OwnTrade]) -> String {
     let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
-    let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
+    let symbols: Vec<String> = batch.iter().map(|t| fmt_kdb_sym(&t.symbol)).collect();
     let sides = fmt_kdb_char_col(batch.iter().map(|t| t.side));
     let last_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_px)).collect();
     let last_qtys: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_qty)).collect();
     let avg_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.avg_px)).collect();
-    let cl_ord_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.cl_ord_id)).collect();
-    let order_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.order_id)).collect();
+    let cl_ord_ids: Vec<String> = batch.iter().map(|t| fmt_kdb_sym(&t.cl_ord_id)).collect();
+    let order_ids: Vec<String> = batch.iter().map(|t| fmt_kdb_sym(&t.order_id)).collect();
     let exec_types = fmt_kdb_char_col(batch.iter().map(|t| t.exec_type));
     format!(
         "`own_trades insert (({});({});{};({});({});({});({});({});{})",
@@ -104,6 +160,26 @@ pub(crate) fn own_trades_insert_q(batch: &[OwnTrade]) -> String {
         cl_ord_ids.join(";"),
         order_ids.join(";"),
         exec_types
+    )
+}
+
+pub(crate) fn securities_insert_q(
+    timestamp: i64,
+    symbol: &str,
+    security_id: &Option<String>,
+    exchange: &Option<String>,
+    attributes_json: &str,
+) -> String {
+    // `table, enlist (tuple)` demotes a 98h table to a 0h list of rows, so
+    // `select from securities` / `meta securities` fail with `'type` (the 141
+    // residual errors). `insert` keeps type 98h with the same identifier atoms.
+    format!(
+        "`securities insert (`timestamp${}; {}; {}; {}; \"{}\")",
+        timestamp,
+        fmt_kdb_sym(symbol),
+        fmt_kdb_sym_opt(security_id),
+        fmt_kdb_sym_opt(exchange),
+        escape_kdb_string(attributes_json),
     )
 }
 
@@ -501,6 +577,31 @@ impl KdbWriter {
         }
     }
 
+    async fn execute_sync_q_checked(
+        stream: &Arc<Mutex<Option<QStream>>>,
+        q_code: &str,
+        in_flight: &AtomicBool,
+    ) -> Result<()> {
+        let mut stream_guard = stream.lock().await;
+        match stream_guard.as_mut() {
+            Some(qstream) => {
+                let k = qstream
+                    .send_sync_message(&q_code)
+                    .await
+                    .map_err(|e| anyhow!("Sync insert failed: {}", e))?;
+                if k.get_type() == qtype::ERROR {
+                    let err_msg = k.get_error_string().unwrap_or("unknown error");
+                    return Err(anyhow!("kdb+ error: '{}", err_msg));
+                }
+                Ok(())
+            }
+            None if in_flight.load(Ordering::Acquire) => {
+                Err(anyhow!("kdb levels-count in flight"))
+            }
+            None => Err(anyhow!("Stream not available")),
+        }
+    }
+
     /// Fire-and-forget bulk insert — sends an async message (no response wait).
     /// Used by all flush_*_batch functions for high-throughput data writes.
     async fn execute_single_insert(
@@ -784,17 +885,7 @@ impl KdbWriter {
 
         debug!("🔄 Flushing {} trades to kdb+", batch.len());
 
-        let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
-        let prices: Vec<String> = batch.iter().map(|t| format!("{}f", t.price)).collect();
-        let sizes: Vec<String> = batch.iter().map(|t| format!("{}f", t.size)).collect();
-        let seqs: Vec<String> = batch.iter().map(|t| fmt_seq(t.seq_num)).collect();
-
-        let q_code = format!(
-            "`trades insert (({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), prices.join(";"), sizes.join(";"),
-            seqs.join(";")
-        );
+        let q_code = trades_insert_q(batch);
 
         match Self::execute_single_insert(stream, &q_code, in_flight).await {
             Ok(()) => {
@@ -820,21 +911,7 @@ impl KdbWriter {
 
         debug!("🔄 Flushing {} snapshots to kdb+", batch.len());
 
-        let times: Vec<String> = batch.iter().map(|s| format!("`timestamp${}", s.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|s| format!("`{}", s.symbol)).collect();
-        let best_bids: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid)).collect();
-        let best_asks: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_ask)).collect();
-        let best_bid_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid_size)).collect();
-        let best_ask_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_ask_size)).collect();
-        let spreads: Vec<String> = batch.iter().map(|s| format!("{}f", s.spread)).collect();
-        let seqs: Vec<String> = batch.iter().map(|s| fmt_seq(s.seq_num)).collect();
-
-        let q_code = format!(
-            "`orderbook_snapshots insert (({});({});({});({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), best_bids.join(";"),
-            best_asks.join(";"), best_bid_sizes.join(";"),
-            best_ask_sizes.join(";"), spreads.join(";"), seqs.join(";")
-        );
+        let q_code = snapshots_insert_q(batch);
 
         match Self::execute_single_insert(stream, &q_code, in_flight).await {
             Ok(()) => {
@@ -861,9 +938,7 @@ impl KdbWriter {
 
         let times: Vec<String> = batch.iter()
             .map(|g| format!("`timestamp${}", g.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|g| {
-            format!("`$\"{}\"", escape_kdb_string(&g.symbol))
-        }).collect();
+        let symbols: Vec<String> = batch.iter().map(|g| fmt_kdb_sym(&g.symbol)).collect();
         let expected: Vec<String> = batch.iter().map(|g| format!("{}j", g.expected_seq)).collect();
         let received: Vec<String> = batch.iter().map(|g| format!("{}j", g.received_seq)).collect();
         let sizes: Vec<String> = batch.iter().map(|g| format!("{}j", g.gap_size)).collect();
@@ -1216,11 +1291,11 @@ impl KdbWriter {
         Ok(())
     }
 
-    /// Write securities to kdb+ (bulk insert, no batching needed as this is infrequent)
+    /// Write securities to kdb+ (infrequent; synchronous round-trip so kdb+ errors surface).
     pub async fn write_securities(&self, securities: &[(String, Option<String>, Option<String>, String)]) -> Result<()> {
         if !*self.connected.lock().await {
             warn!("⚠️  Not connected to kdb+, skipping securities write");
-            return Ok(()); // Silently skip if not connected
+            return Ok(());
         }
 
         if securities.is_empty() {
@@ -1231,43 +1306,69 @@ impl KdbWriter {
 
         let timestamp = Utc::now().timestamp_nanos_opt().unwrap_or(0) - KDB_TIMESTAMP_OFFSET_NS;
 
-        // Insert securities one at a time using proper table append syntax
-        let mut success_count = 0;
+        let mut success_count: usize = 0;
+        let mut last_error: Option<anyhow::Error> = None;
         for (symbol, security_id, exchange, attributes_json) in securities {
-            // Escape JSON string for kdb+
-            let escaped_attrs = attributes_json.replace('\\', "\\\\").replace('"', "\\\"");
-
-            // Format optional fields
-            let sec_id_str = security_id.as_ref()
-                .map(|s| format!("`{}", s))
-                .unwrap_or_else(|| "`".to_string());
-            let exch_str = exchange.as_ref()
-                .map(|s| format!("`{}", s))
-                .unwrap_or_else(|| "`".to_string());
-
-            // Use direct table append (same pattern as orderbook_levels)
-            let q_code = format!(
-                "securities: securities, enlist (`timestamp${}; `{}; {}; {}; \"{}\")",
-                timestamp, symbol, sec_id_str, exch_str, escaped_attrs
+            let q_code = securities_insert_q(
+                timestamp,
+                symbol,
+                security_id,
+                exchange,
+                attributes_json,
             );
-
-            if let Ok(()) = Self::execute_single_insert(
-                &self.stream,
-                q_code.as_str(),
-                &self.levels_count_in_flight,
-            )
-            .await
-            {
-                success_count += 1;
-            } else {
-                warn!("❌ Failed to insert security: {}", symbol);
+            let deadline = Instant::now()
+                + Duration::from_millis(LIVENESS_PROBE_TIMEOUT_MS + 500);
+            loop {
+                match Self::execute_sync_q_checked(
+                    &self.stream,
+                    &q_code,
+                    &self.levels_count_in_flight,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        success_count += 1;
+                        break;
+                    }
+                    Err(e) if e.to_string() == "kdb levels-count in flight" => {
+                        if Instant::now() >= deadline {
+                            warn!(
+                                "⚠️  Securities insert skipped (kdb levels-count in flight) for {}",
+                                symbol
+                            );
+                            last_error = Some(e);
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(e) => {
+                        let truncated: String = e.to_string().chars().take(200).collect();
+                        warn!("❌ Failed to insert security {}: {}", symbol, truncated);
+                        last_error = Some(e);
+                        break;
+                    }
+                }
             }
         }
 
         if success_count > 0 {
             info!("✅ Successfully wrote {} securities to kdb+", success_count);
         }
-
+        if success_count < securities.len() {
+            warn!(
+                "⚠️  Securities insert incomplete: {}/{} succeeded",
+                success_count,
+                securities.len()
+            );
+        }
+        if last_error.is_some() {
+            return Err(anyhow!(
+                "securities insert partial failure: {}/{} succeeded; last error: {}",
+                success_count,
+                securities.len(),
+                last_error.as_ref().unwrap()
+            ));
+        }
         Ok(())
     }
 
@@ -1579,6 +1680,8 @@ impl KdbWriter {
 mod tests {
     use super::*;
     use kxkdb::ipc::{qmsg_type, Auth, ConnectionMethod, K, QStream};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -1614,6 +1717,153 @@ mod tests {
         }
     }
 
+    fn sample_trade(symbol: &str) -> Trade {
+        Trade {
+            timestamp: 1,
+            symbol: symbol.to_string(),
+            price: 1.0,
+            size: 1.0,
+            seq_num: Some(1),
+        }
+    }
+
+    fn sample_snapshot(symbol: &str) -> Snapshot {
+        Snapshot {
+            timestamp: 1,
+            symbol: symbol.to_string(),
+            best_bid: 1.0,
+            best_ask: 1.0,
+            best_bid_size: 1.0,
+            best_ask_size: 1.0,
+            spread: 0.0,
+            seq_num: Some(1),
+        }
+    }
+
+    #[test]
+    fn fmt_kdb_sym_hyphen_and_control() {
+        assert_eq!(fmt_kdb_sym("BTCUSD-PERP"), "`$\"BTCUSD-PERP\"");
+        assert_eq!(fmt_kdb_sym("BTCUSD-261030"), "`$\"BTCUSD-261030\"");
+        assert_eq!(fmt_kdb_sym("BTC_USDT"), "`$\"BTC_USDT\"");
+    }
+
+    #[test]
+    fn fmt_kdb_sym_delegates_escape() {
+        assert_eq!(
+            fmt_kdb_sym("a\"b\\c"),
+            format!("`$\"{}\"", escape_kdb_string("a\"b\\c"))
+        );
+    }
+
+    #[test]
+    fn fmt_kdb_sym_escapes_injection_payloads() {
+        for payload in [
+            "\"",
+            "\\",
+            ";",
+            r#"BTCUSD";system "rm -rf kdb/hdb";"#,
+        ] {
+            let out = fmt_kdb_sym(payload);
+            assert!(out.starts_with("`$\""), "quoted-cast prefix: {out}");
+            assert!(out.ends_with('"'), "quoted-cast suffix: {out}");
+            assert_eq!(out, format!("`$\"{}\"", escape_kdb_string(payload)));
+            // Interior only: an unescaped `" then `;` would terminate the q string.
+            let inner = &out[3..out.len() - 1];
+            let bytes = inner.as_bytes();
+            for i in 0..bytes.len().saturating_sub(1) {
+                if bytes[i] == b'"' && bytes[i + 1] == b';' {
+                    assert!(
+                        i > 0 && bytes[i - 1] == b'\\',
+                        "unescaped quote-breakout in {out}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fmt_kdb_sym_opt_none_is_null_symbol() {
+        assert_eq!(fmt_kdb_sym_opt(&None), "`");
+        assert_eq!(
+            fmt_kdb_sym_opt(&Some("EXCH-1".into())),
+            fmt_kdb_sym("EXCH-1")
+        );
+        assert_eq!(fmt_kdb_sym_opt(&Some("".into())), "`$\"\"");
+    }
+
+    #[test]
+    fn levels_insert_q_quotes_hyphenated_symbol() {
+        let batch = vec![sample_level("BTCUSD-PERP", 'B', 'N', 1, 7)];
+        let q = levels_insert_q(&batch);
+        assert!(q.contains(&fmt_kdb_sym("BTCUSD-PERP")), "{q}");
+        assert!(!q.contains("`BTCUSD-PERP"), "unquoted leftover: {q}");
+        assert!(q.contains(";\"B\";"), "char col side: {q}");
+        assert!(q.contains(";\"N\";"), "char col action: {q}");
+    }
+
+    #[test]
+    fn trades_insert_q_quotes_hyphenated_symbol() {
+        let q = trades_insert_q(&[sample_trade("BTCUSD-PERP")]);
+        assert!(q.contains(&fmt_kdb_sym("BTCUSD-PERP")), "{q}");
+        assert!(!q.contains("`BTCUSD-PERP"), "unquoted leftover: {q}");
+    }
+
+    #[test]
+    fn snapshots_insert_q_quotes_hyphenated_symbol() {
+        let q = snapshots_insert_q(&[sample_snapshot("BTCUSD-PERP")]);
+        assert!(q.contains(&fmt_kdb_sym("BTCUSD-PERP")), "{q}");
+        assert!(!q.contains("`BTCUSD-PERP"), "unquoted leftover: {q}");
+    }
+
+    #[test]
+    fn own_trades_insert_q_quotes_hyphenated_ids() {
+        let q = own_trades_insert_q(&[OwnTrade {
+            timestamp: 1,
+            symbol: "BTCUSD-PERP".into(),
+            side: '1',
+            last_px: 1.0,
+            last_qty: 1.0,
+            avg_px: 1.0,
+            cl_ord_id: "cl-ord-1".into(),
+            order_id: "ord-uuid-1".into(),
+            exec_type: 'F',
+        }]);
+        assert!(q.contains(&fmt_kdb_sym("BTCUSD-PERP")), "{q}");
+        assert!(q.contains(&fmt_kdb_sym("cl-ord-1")), "{q}");
+        assert!(q.contains(&fmt_kdb_sym("ord-uuid-1")), "{q}");
+        assert!(!q.contains("`BTCUSD-PERP"), "unquoted leftover: {q}");
+        assert!(!q.contains("`cl-ord-1"), "unquoted leftover: {q}");
+        assert!(!q.contains("`ord-uuid-1"), "unquoted leftover: {q}");
+        assert!(q.contains(";\"1\";"), "side slot: {q}");
+        assert!(q.contains(";\"F\")"), "exec_type slot: {q}");
+    }
+
+    #[test]
+    fn securities_insert_q_quotes_hyphenated_identifiers() {
+        let q = securities_insert_q(
+            1,
+            "BTCUSD-PERP",
+            &Some("SEC-1".into()),
+            &Some("EXCH-1".into()),
+            r#"{"x":"y"}"#,
+        );
+        assert!(q.starts_with("`securities insert"), "{q}");
+        assert!(q.contains(&fmt_kdb_sym("BTCUSD-PERP")), "{q}");
+        assert!(q.contains(&fmt_kdb_sym("SEC-1")), "{q}");
+        assert!(q.contains(&fmt_kdb_sym("EXCH-1")), "{q}");
+        assert!(q.contains(&escape_kdb_string(r#"{"x":"y"}"#)), "{q}");
+        assert!(!q.contains("` `$"), "double backtick: {q}");
+        assert!(!q.contains("`BTCUSD-PERP"), "unquoted leftover: {q}");
+    }
+
+    #[test]
+    fn securities_insert_q_none_stays_null_symbol() {
+        let q = securities_insert_q(1, "BTC_USDT", &None, &None, "{}");
+        assert!(q.contains(&fmt_kdb_sym("BTC_USDT")), "{q}");
+        assert!(q.contains("`; `;"), "null symbol pair: {q}");
+        assert!(!q.contains("`$\"\""), "empty quoted must not replace None: {q}");
+    }
+
     #[test]
     fn levels_insert_q_two_row_bare_char_vectors() {
         let batch = vec![
@@ -1627,7 +1877,8 @@ mod tests {
         assert!(!q.contains("(\"NC\")"), "must not enlist (\"NC\"): {}", q);
         assert!(!q.contains("(\"B\";\"A\")"), "must not emit mixed-list (\"B\";\"A\"): {}", q);
         assert!(!q.contains("`B"), "leftover symbol atom `B would false-fail on BTC_USDT; fixture is XYZ: {}", q);
-        assert!(q.contains("`XYZ"), "symbol column stays symbol atoms: {}", q);
+        assert!(q.contains(&fmt_kdb_sym("XYZ")), "symbol column uses quoted-cast: {}", q);
+        assert!(!q.contains("`XYZ"), "unquoted leftover: {q}");
         assert!(q.contains("7j"));
         assert!(q.contains("8j"));
     }
@@ -1662,8 +1913,10 @@ mod tests {
         assert!(q.contains(";\"F\")"), "exec_type is last column so delimiter is ): {}", q);
         assert!(!q.contains("(\"1\")"));
         assert!(!q.contains("(\"F\")"));
-        assert!(q.contains("`c1"), "ids stay symbol atoms: {}", q);
-        assert!(q.contains("`o1"), "ids stay symbol atoms: {}", q);
+        assert!(q.contains(&fmt_kdb_sym("c1")), "ids use quoted-cast: {}", q);
+        assert!(q.contains(&fmt_kdb_sym("o1")), "ids use quoted-cast: {}", q);
+        assert!(!q.contains("`c1"), "unquoted leftover cl_ord_id: {q}");
+        assert!(!q.contains("`o1"), "unquoted leftover order_id: {q}");
     }
 
     #[test]
@@ -2031,5 +2284,266 @@ mod tests {
                 assert!(w.is_connected().await);
             })
             .await;
+    }
+
+    // AC2 real-q harness: CARGO_MANIFEST_DIR; unzip argv; exec bit; child-only QHOME;
+    // kc.lic copy; q -p 127.0.0.1:{port}; local connected=false on flush_levels_batch;
+    // same-stream "1" barrier; disconnect then kill; no repo kdb/hdb.
+    struct VendoredQ {
+        child: Option<Child>,
+        port: u16,
+        qhome: PathBuf,
+        workdir: PathBuf,
+    }
+
+    impl Drop for VendoredQ {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.qhome);
+            let _ = std::fs::remove_dir_all(&self.workdir);
+        }
+    }
+
+    fn spawn_vendored_q() -> VendoredQ {
+        let pid = std::process::id();
+        let qhome = std::env::temp_dir().join(format!(
+            "hft-kdb-ac2-{}-{}",
+            pid,
+            uuid::Uuid::new_v4()
+        ));
+        let workdir = std::env::temp_dir().join(format!(
+            "hft-kdb-ac2-wd-{}-{}",
+            pid,
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&qhome)
+            .unwrap_or_else(|e| panic!("create qhome {}: {e}", qhome.display()));
+        std::fs::create_dir_all(&workdir)
+            .unwrap_or_else(|e| panic!("create workdir {}: {e}", workdir.display()));
+
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let zip = manifest.join("kdb/l64.zip");
+        let lic = manifest.join("kdb/kc.lic");
+        if !zip.is_file() {
+            panic!("missing vendored zip {}", zip.display());
+        }
+        if !lic.is_file() {
+            panic!("missing kdb license file (kc.lic) under CARGO_MANIFEST_DIR/kdb");
+        }
+
+        let unzip = Command::new("unzip")
+            .args(["-o", "-q", zip.to_str().unwrap(), "-d", qhome.to_str().unwrap()])
+            .output()
+            .unwrap_or_else(|e| panic!("unzip exec failed: {e}"));
+        if !unzip.status.success() {
+            panic!(
+                "unzip l64.zip failed: {}",
+                String::from_utf8_lossy(&unzip.stderr)
+            );
+        }
+
+        let q_bin = qhome.join("l64/q");
+        let qk = qhome.join("q.k");
+        if !q_bin.is_file() {
+            panic!("unzip missing member l64/q under {}", qhome.display());
+        }
+        if !qk.is_file() {
+            panic!("unzip missing member q.k under {}", qhome.display());
+        }
+        let q_bin_canon = q_bin
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("canonicalize l64/q: {e}"));
+        let qhome_canon = qhome
+            .canonicalize()
+            .unwrap_or_else(|e| panic!("canonicalize qhome: {e}"));
+        assert!(
+            q_bin_canon.starts_with(&qhome_canon),
+            "zip-slip: {} not under {}",
+            q_bin_canon.display(),
+            qhome_canon.display()
+        );
+
+        std::fs::copy(&lic, qhome.join("kc.lic"))
+            .unwrap_or_else(|e| panic!("copy kc.lic failed: {e}"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&q_bin, std::fs::Permissions::from_mode(0o755))
+                .unwrap_or_else(|e| panic!("chmod l64/q failed: {e}"));
+        }
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap_or_else(|e| panic!("bind ephemeral port failed: {e}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("local_addr: {e}"))
+            .port();
+        drop(listener);
+
+        let child = Command::new(&q_bin)
+            .args(["-p", &format!("127.0.0.1:{port}"), "-q"])
+            .env("QHOME", &qhome)
+            .current_dir(&workdir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|e| panic!("exec l64/q failed: {e}"));
+
+        VendoredQ {
+            child: Some(child),
+            port,
+            qhome,
+            workdir,
+        }
+    }
+
+    async fn wait_stream_ready(w: &KdbWriter) {
+        let deadline = Instant::now() + Duration::from_millis(2500);
+        loop {
+            let inflight = w.levels_count_in_flight.load(Ordering::Acquire);
+            let some = w.stream.lock().await.is_some();
+            if !inflight && some {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "stream not ready after async flush (in_flight={inflight}, stream_some={some})"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn barrier_and_assert_symbol(w: &KdbWriter, port: u16, table: &str, symbol: &str) {
+        wait_stream_ready(w).await;
+        KdbWriter::execute_q_on_stream(&w.stream, LIVENESS_PROBE_Q)
+            .await
+            .unwrap_or_else(|e| panic!("same-stream {LIVENESS_PROBE_Q} barrier failed: {e}"));
+        let json = query_table_once("127.0.0.1", port, &format!("select from {table}"))
+            .await
+            .unwrap_or_else(|e| panic!("query_table_once {table}: {e}"));
+        let needle = format!("\"symbol\":\"{symbol}\"");
+        assert!(
+            json.contains(&needle),
+            "{table} missing {needle}: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hyphenated_symbols_round_trip_on_real_q() {
+        let mut qproc = spawn_vendored_q();
+        let port = qproc.port;
+
+        let w = KdbWriter::new("127.0.0.1".into(), port);
+        let init_deadline = Instant::now() + Duration::from_millis(2000);
+        let mut last_err = None;
+        loop {
+            match w.initialize().await {
+                Ok(()) => break,
+                Err(e) => {
+                    if Instant::now() >= init_deadline {
+                        last_err = Some(e);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            panic!("vendored l64 q failed to accept IPC on 127.0.0.1:{port}: {e}");
+        }
+        w.levels_count_scheduled.store(true, Ordering::Release);
+
+        let cases: [&str; 3] = ["BTCUSD-PERP", "BTCUSD-261030", "BTC_USDT"];
+        let local_connected_false = Arc::new(tokio::sync::Mutex::new(false));
+
+        let levels: Vec<OrderBookLevel> = cases
+            .iter()
+            .map(|s| sample_level(s, 'B', 'N', 1, 1))
+            .collect();
+        KdbWriter::flush_levels_batch(
+            &w.stream,
+            &levels,
+            &local_connected_false,
+            &w.probe,
+            &w.levels_count_scheduled,
+            &w.levels_count_in_flight,
+        )
+        .await
+        .expect("flush_levels_batch");
+        for s in cases {
+            barrier_and_assert_symbol(&w, port, "orderbook_levels", s).await;
+        }
+
+        let trades: Vec<Trade> = cases.iter().map(|s| sample_trade(s)).collect();
+        KdbWriter::flush_trades_batch(&w.stream, &trades, &w.levels_count_in_flight)
+            .await
+            .expect("flush_trades_batch");
+        for s in cases {
+            barrier_and_assert_symbol(&w, port, "trades", s).await;
+        }
+
+        let snaps: Vec<Snapshot> = cases.iter().map(|s| sample_snapshot(s)).collect();
+        KdbWriter::flush_snapshots_batch(&w.stream, &snaps, &w.levels_count_in_flight)
+            .await
+            .expect("flush_snapshots_batch");
+        for s in cases {
+            barrier_and_assert_symbol(&w, port, "orderbook_snapshots", s).await;
+        }
+
+        let owns: Vec<OwnTrade> = cases
+            .iter()
+            .map(|s| OwnTrade {
+                timestamp: 1,
+                symbol: (*s).into(),
+                side: '1',
+                last_px: 1.0,
+                last_qty: 1.0,
+                avg_px: 1.0,
+                cl_ord_id: format!("CL-{s}"),
+                order_id: format!("ORD-{s}"),
+                exec_type: 'F',
+            })
+            .collect();
+        KdbWriter::flush_own_trades_batch(&w.stream, &owns, &w.levels_count_in_flight)
+            .await
+            .expect("flush_own_trades_batch");
+        for s in cases {
+            barrier_and_assert_symbol(&w, port, "own_trades", s).await;
+        }
+
+        let rows = vec![
+            (
+                "BTCUSD-PERP".into(),
+                Some("SID-BTCUSD-PERP".into()),
+                Some("EXCH-1".into()),
+                "{}".into(),
+            ),
+            (
+                "BTCUSD-261030".into(),
+                Some("SID-BTCUSD-261030".into()),
+                Some("EXCH-1".into()),
+                "{}".into(),
+            ),
+            ("BTC_USDT".into(), None, None, "{}".into()),
+        ];
+        w.write_securities(&rows)
+            .await
+            .unwrap_or_else(|e| panic!("write_securities must Ok after quoting: {e}"));
+        for s in cases {
+            barrier_and_assert_symbol(&w, port, "securities", s).await;
+        }
+
+        w.disconnect().await;
+        if let Some(mut child) = qproc.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let _ = std::fs::remove_dir_all(&qproc.qhome);
+        let _ = std::fs::remove_dir_all(&qproc.workdir);
     }
 }
