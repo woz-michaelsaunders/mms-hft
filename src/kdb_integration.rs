@@ -512,6 +512,62 @@ impl KdbWriter {
         }
     }
 
+/// Render a batch of single chars as a q char literal for a `char$()` column.
+///
+/// The columns are declared `side:`char$()` and `action:`char$()`, but these
+/// were interpolated as SYMBOLS (`format!("`{}", l.side)` -> `` `B ``), which q
+/// rejects with 'type. Every orderbook_levels insert failed for months —
+/// 43,885 rejections in one 30-minute production window — and the error was
+/// invisible because the async send path cannot surface qtype::ERROR.
+///
+/// q needs a char atom for one row ("B") and a char vector for several ("BA"),
+/// NOT a parenthesised list.
+
+/// Render one venue-supplied symbol as a q symbol.
+///
+/// `format!("`{}", sym)` produces an UNQUOTED literal, and a hyphen TERMINATES
+/// a q symbol: `BTCUSD-PERP parses as `BTCUSD minus the variable PERP, so the
+/// insert dies with 'PERP. BTCUSD-PERP and the dated futures have therefore
+/// never been persistable to ANY table — 12,368 'PERP rejections in one
+/// 30-minute production window. The cast form `$"..." accepts them.
+///
+/// Returns None for anything that could break out of the string literal. A
+/// venue symbol has no business containing a quote or a backslash, and
+/// building a q expression by concatenation makes that an injection risk, not
+/// merely a formatting one.
+fn q_symbol(sym: &str) -> Option<String> {
+    if sym.is_empty() || sym.len() > 64 {
+        return None;
+    }
+    if sym.contains('"') || sym.contains('\\') || sym.contains('\n') || sym.contains('\r') {
+        return None;
+    }
+    Some(format!("`$\"{sym}\""))
+}
+
+fn q_char_column(values: impl IntoIterator<Item = char>) -> Option<String> {
+    let mut out = String::from("\"");
+    let mut n = 0usize;
+    for c in values {
+        // ASCII alphanumeric, NOT a hand-listed alphabet. FIX char enums span
+        // more than the obvious ones: ExecType includes 'F' (Trade) as well as
+        // '0'..'8'. An earlier version of this guard listed A/B/C/D/N and would
+        // have silently dropped every own_trades batch — the existing latch
+        // tests caught it. Non-alphanumeric is refused, not escaped: this
+        // string is concatenated into a q expression.
+        if !c.is_ascii_alphanumeric() {
+            return None;
+        }
+        out.push(c);
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    out.push('"');
+    Some(out)
+}
+
     /// Flush a batch of order book levels using a single bulk insert command
     async fn flush_levels_batch(stream: &Arc<Mutex<Option<QStream>>>, batch: &[OrderBookLevel]) -> Result<()> {
         if batch.is_empty() {
@@ -521,17 +577,39 @@ impl KdbWriter {
         debug!("🔄 Flushing {} order book levels to kdb+", batch.len());
 
         let times: Vec<String> = batch.iter().map(|l| format!("`timestamp${}", l.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|l| format!("`{}", l.symbol)).collect();
-        let sides: Vec<String> = batch.iter().map(|l| format!("`{}", l.side)).collect();
+        let symbols: Vec<String> = match batch.iter()
+            .map(|l| Self::q_symbol(&l.symbol.to_string()))
+            .collect::<Option<Vec<String>>>() {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping levels batch: a symbol is unsafe to render for q");
+                return Ok(());
+            }
+        };
         let prices: Vec<String> = batch.iter().map(|l| format!("{}f", l.price)).collect();
         let sizes: Vec<String> = batch.iter().map(|l| format!("{}f", l.size)).collect();
-        let actions: Vec<String> = batch.iter().map(|l| format!("`{}", l.action)).collect();
         let seqs: Vec<String> = batch.iter().map(|l| fmt_seq(l.seq_num)).collect();
 
+        // char$() columns, NOT symbols -- see q_char_column.
+        let sides = match Self::q_char_column(batch.iter().map(|l| l.side)) {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping level batch: unexpected side char outside A/B");
+                return Ok(());
+            }
+        };
+        let actions = match Self::q_char_column(batch.iter().map(|l| l.action)) {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping level batch: unexpected action char outside N/C/D");
+                return Ok(());
+            }
+        };
+
         let q_code = format!(
-            "`orderbook_levels insert (({});({});({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), sides.join(";"),
-            prices.join(";"), sizes.join(";"), actions.join(";"),
+            "`orderbook_levels insert (({});({});{};({});({});{};({}))",
+            times.join(";"), symbols.join(";"), sides,
+            prices.join(";"), sizes.join(";"), actions,
             seqs.join(";")
         );
 
@@ -556,7 +634,15 @@ impl KdbWriter {
         debug!("🔄 Flushing {} trades to kdb+", batch.len());
 
         let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
+        let symbols: Vec<String> = match batch.iter()
+            .map(|t| Self::q_symbol(&t.symbol.to_string()))
+            .collect::<Option<Vec<String>>>() {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping trades batch: a symbol is unsafe to render for q");
+                return Ok(());
+            }
+        };
         let prices: Vec<String> = batch.iter().map(|t| format!("{}f", t.price)).collect();
         let sizes: Vec<String> = batch.iter().map(|t| format!("{}f", t.size)).collect();
         let seqs: Vec<String> = batch.iter().map(|t| fmt_seq(t.seq_num)).collect();
@@ -588,7 +674,15 @@ impl KdbWriter {
         debug!("🔄 Flushing {} snapshots to kdb+", batch.len());
 
         let times: Vec<String> = batch.iter().map(|s| format!("`timestamp${}", s.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|s| format!("`{}", s.symbol)).collect();
+        let symbols: Vec<String> = match batch.iter()
+            .map(|s| Self::q_symbol(&s.symbol.to_string()))
+            .collect::<Option<Vec<String>>>() {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping snapshots batch: a symbol is unsafe to render for q");
+                return Ok(());
+            }
+        };
         let best_bids: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid)).collect();
         let best_asks: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_ask)).collect();
         let best_bid_sizes: Vec<String> = batch.iter().map(|s| format!("{}f", s.best_bid_size)).collect();
@@ -838,20 +932,56 @@ impl KdbWriter {
         debug!("🔄 Flushing {} own trades to kdb+", batch.len());
 
         let times: Vec<String> = batch.iter().map(|t| format!("`timestamp${}", t.timestamp)).collect();
-        let symbols: Vec<String> = batch.iter().map(|t| format!("`{}", t.symbol)).collect();
-        let sides: Vec<String> = batch.iter().map(|t| format!("`{}", t.side)).collect();
+        let symbols: Vec<String> = match batch.iter()
+            .map(|t| Self::q_symbol(&t.symbol.to_string()))
+            .collect::<Option<Vec<String>>>() {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping own_trades batch: a symbol is unsafe to render for q");
+                return Ok(());
+            }
+        };
+        let sides = match Self::q_char_column(batch.iter().map(|t| t.side)) {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping own_trades batch: unexpected side char");
+                return Ok(());
+            }
+        };
         let last_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_px)).collect();
         let last_qtys: Vec<String> = batch.iter().map(|t| format!("{}f", t.last_qty)).collect();
         let avg_pxs: Vec<String> = batch.iter().map(|t| format!("{}f", t.avg_px)).collect();
-        let cl_ord_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.cl_ord_id)).collect();
-        let order_ids: Vec<String> = batch.iter().map(|t| format!("`{}", t.order_id)).collect();
-        let exec_types: Vec<String> = batch.iter().map(|t| format!("`{}", t.exec_type)).collect();
+        let cl_ord_ids: Vec<String> = match batch.iter()
+            .map(|t| Self::q_symbol(&t.cl_ord_id.to_string()))
+            .collect::<Option<Vec<String>>>() {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping own_trades batch: a symbol is unsafe to render for q");
+                return Ok(());
+            }
+        };
+        let order_ids: Vec<String> = match batch.iter()
+            .map(|t| Self::q_symbol(&t.order_id.to_string()))
+            .collect::<Option<Vec<String>>>() {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping own_trades batch: a symbol is unsafe to render for q");
+                return Ok(());
+            }
+        };
+        let exec_types = match Self::q_char_column(batch.iter().map(|t| t.exec_type)) {
+            Some(v) => v,
+            None => {
+                warn!("❌ Dropping own_trades batch: unexpected exec_type char");
+                return Ok(());
+            }
+        };
 
         let q_code = format!(
-            "`own_trades insert (({});({});({});({});({});({});({});({});({}))",
-            times.join(";"), symbols.join(";"), sides.join(";"),
+            "`own_trades insert (({});({});{};({});({});({});({});({});{})",
+            times.join(";"), symbols.join(";"), sides,
             last_pxs.join(";"), last_qtys.join(";"), avg_pxs.join(";"),
-            cl_ord_ids.join(";"), order_ids.join(";"), exec_types.join(";")
+            cl_ord_ids.join(";"), order_ids.join(";"), exec_types
         );
 
         match Self::execute_single_insert(stream, &q_code).await {
@@ -956,10 +1086,20 @@ impl KdbWriter {
                 .map(|s| format!("`{}", s))
                 .unwrap_or_else(|| "`".to_string());
 
+            // Hyphenated symbols (BTCUSD-PERP, BTCUSD-261030) need the cast form:
+            // an unquoted `BTCUSD-PERP parses as `BTCUSD minus PERP and dies 'PERP.
+            let sym_q = match Self::q_symbol(symbol) {
+                Some(v) => v,
+                None => {
+                    warn!("❌ Skipping security with unsafe symbol for q");
+                    continue;
+                }
+            };
+
             // Use direct table append (same pattern as orderbook_levels)
             let q_code = format!(
-                "securities: securities, enlist (`timestamp${}; `{}; {}; {}; \"{}\")",
-                timestamp, symbol, sec_id_str, exch_str, escaped_attrs
+                "securities: securities, enlist (`timestamp${}; {}; {}; {}; \"{}\")",
+                timestamp, sym_q, sec_id_str, exch_str, escaped_attrs
             );
 
             if let Ok(()) = Self::execute_single_insert(&self.stream, q_code.as_str()).await {
@@ -1542,5 +1682,61 @@ mod tests {
                 assert!(w.is_connected().await);
             })
             .await;
+    }
+}
+
+#[cfg(test)]
+mod char_column_rendering {
+    use super::*;
+
+    /// side and action are `char$()` columns. They were interpolated as
+    /// SYMBOLS (`B, `N), which q rejects with 'type — 43,885 rejected inserts
+    /// in one 30-minute production window, invisible because the async send
+    /// path cannot surface qtype::ERROR.
+    #[test]
+    fn renders_a_char_vector_for_a_batch() {
+        let v = KdbWriter::q_char_column(['B', 'A', 'A'].into_iter()).unwrap();
+        assert_eq!(v, "\"BAA\"", "must be a q char vector, not a symbol list");
+        assert!(!v.contains('`'), "a backtick means it is a symbol again: {v}");
+    }
+
+    /// One row must be a char atom, not a one-element list.
+    #[test]
+    fn renders_a_char_atom_for_a_single_row() {
+        assert_eq!(KdbWriter::q_char_column(['B'].into_iter()).unwrap(), "\"B\"");
+    }
+
+    /// A hyphen terminates a q symbol literal, so `BTCUSD-PERP parses as
+    /// `BTCUSD minus the variable PERP and the insert dies with 'PERP. Proven
+    /// in q: value "`BTCUSD-PERP" -> 'PERP. BTCUSD-PERP is one of the three
+    /// configured instruments and had never been persistable to ANY table.
+    #[test]
+    fn hyphenated_symbols_use_the_cast_form() {
+        assert_eq!(KdbWriter::q_symbol("BTCUSD-PERP").unwrap(), "`$\"BTCUSD-PERP\"");
+        assert_eq!(KdbWriter::q_symbol("BTC_USDT").unwrap(), "`$\"BTC_USDT\"");
+        // The dated futures that were also failing.
+        assert!(KdbWriter::q_symbol("BTCUSD-261030").unwrap().contains("BTCUSD-261030"));
+    }
+
+    /// Concatenating a venue string into a q expression is an injection risk,
+    /// not just a formatting one. Anything that could escape the literal is
+    /// refused rather than escaped.
+    #[test]
+    fn refuses_symbols_that_could_break_out_of_the_literal() {
+        assert!(KdbWriter::q_symbol("BTC\"; delete securities from `; `A").is_none());
+        assert!(KdbWriter::q_symbol("BTC\\").is_none());
+        assert!(KdbWriter::q_symbol("BTC\nUSD").is_none());
+        assert!(KdbWriter::q_symbol("").is_none());
+        assert!(KdbWriter::q_symbol(&"X".repeat(65)).is_none(), "absurd length refused");
+    }
+
+    /// The alphabet is closed. Anything else is an upstream bug and must not
+    /// be smuggled into a q expression — dropping the batch is the safe answer.
+    #[test]
+    fn refuses_values_outside_the_known_alphabet() {
+        assert!(KdbWriter::q_char_column(['B', '"'].into_iter()).is_none(), "quote must be refused");
+        assert!(KdbWriter::q_char_column(['B', '`'].into_iter()).is_none(), "backtick must be refused");
+        assert!(KdbWriter::q_char_column(['B', ';'].into_iter()).is_none(), "semicolon must be refused");
+        assert!(KdbWriter::q_char_column([].into_iter()).is_none(), "empty must be refused");
     }
 }
