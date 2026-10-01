@@ -2960,9 +2960,12 @@ impl FIXSession {
                             .get_field(tags::SYMBOL)
                             .unwrap_or(self.sender_comp_id.as_str());
                         let gap_size = received.saturating_sub(expected);
-                        let _ = self.kdb_writer
+                        if let Err(e) = self.kdb_writer
                             .write_capture_gap(symbol, expected, received)
-                            .await;
+                            .await
+                        {
+                            warn!("kdb write failed (capture_gap {symbol}): {e}");
+                        }
                         #[cfg(test)]
                         self.kdb_writer.record_probe(kdb_integration::ProbeEvent::CaptureGap {
                             symbol: symbol.to_string(),
@@ -3163,7 +3166,7 @@ impl FIXSession {
                         let side_char = fill_side.chars().next().unwrap_or('?');
 
                         // Write fill to kdb+ own_trades table
-                        let _ = self.kdb_writer.write_own_trade(
+                        if let Err(e) = self.kdb_writer.write_own_trade(
                             fill_symbol,
                             side_char,
                             last_px,
@@ -3172,7 +3175,10 @@ impl FIXSession {
                             &cl_ord_id_owned,
                             fill_order_id,
                             exec_type_char,
-                        ).await;
+                        ).await
+                        {
+                            warn!("kdb write failed (own_trade {fill_symbol}): {e}");
+                        }
 
                         // Durably persist this fill to data/trades.csv immediately.
                         // This file survives KDB+ and server restarts.
@@ -4093,27 +4099,36 @@ impl FIXSession {
                     self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
                         kind: "level", symbol: symbol.to_string(), seq_num,
                     });
-                    let _ = self.kdb_writer
+                    if let Err(e) = self.kdb_writer
                         .write_order_book_level(symbol, side, price, size, action, seq_num)
-                        .await;
+                        .await
+                    {
+                        warn!("kdb write failed (level {symbol}): {e}");
+                    }
                 }
                 PendingMdIo::Trade { price, size, timestamp, seq_num } => {
                     #[cfg(test)]
                     self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
                         kind: "trade", symbol: symbol.to_string(), seq_num,
                     });
-                    let _ = self.kdb_writer
+                    if let Err(e) = self.kdb_writer
                         .write_trade(symbol, price, size, timestamp, seq_num)
-                        .await;
+                        .await
+                    {
+                        warn!("kdb write failed (trade {symbol}): {e}");
+                    }
                 }
                 PendingMdIo::Snapshot { best_bid, best_ask, best_bid_size, best_ask_size, spread, seq_num } => {
                     #[cfg(test)]
                     self.kdb_writer.record_probe(kdb_integration::ProbeEvent::PendingMdIo {
                         kind: "snapshot", symbol: symbol.to_string(), seq_num,
                     });
-                    let _ = self.kdb_writer
+                    if let Err(e) = self.kdb_writer
                         .write_snapshot(symbol, best_bid, best_ask, best_bid_size, best_ask_size, spread, seq_num)
-                        .await;
+                        .await
+                    {
+                        warn!("kdb write failed (snapshot {symbol}): {e}");
+                    }
                 }
             }
         }
