@@ -1574,7 +1574,17 @@ fn append_command_log_entry(path: &Path, entry: String, max_bytes: u64) {
 }
 
 /// Parse CAPTURE_SYMBOLS. Unset → {BTC_USDT}. Empty/whitespace → kill switch (no persist).
-/// Invalid tokens (non ASCII alnum/underscore) are dropped with a warning.
+///
+/// Accepts the characters venue symbols actually use: ASCII alphanumeric plus
+/// `_`, `-` and `.`. The hyphen matters — BTCUSD-PERP and the dated futures
+/// (BTCUSD-261030) are real instruments, and rejecting them here silently
+/// excluded BTCUSD-PERP from kdb capture for as long as it was configured: the
+/// book filled, the wire showed 543 bids and 709 asks, and orderbook_levels
+/// held zero rows for it while BTC_USD and BTC_USDT persisted normally.
+///
+/// Anything else is still dropped with a warning. These names reach a q
+/// expression, so the guard is a safety boundary, not a formatting preference —
+/// see fmt_kdb_sym, which quotes them for q.
 fn parse_capture_symbols(raw: Option<&str>) -> HashSet<String> {
     match raw {
         None => {
@@ -1592,7 +1602,7 @@ fn parse_capture_symbols(raw: Option<&str>) -> HashSet<String> {
                 if t.is_empty() {
                     continue;
                 }
-                if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                if t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
                     set.insert(t.to_string());
                 } else {
                     warn!("CAPTURE_SYMBOLS: dropping invalid token {:?}", t);
@@ -10054,9 +10064,28 @@ mod connectivity_tests {
         assert_eq!(set.len(), 2);
     }
 
+    /// Hyphens were rejected here deliberately (b36cc60, HFT-034): symbols were
+    /// interpolated into q UNQUOTED as `{}, and a hyphen terminates a q symbol
+    /// literal, so `BTCUSD-PERP parsed as `BTCUSD minus PERP and the insert died
+    /// with 'PERP. Dropping them at the config boundary avoided that.
+    ///
+    /// #64 fixed the actual problem — fmt_kdb_sym now emits the cast form
+    /// `$"BTCUSD-PERP" — so the guard is obsolete and was doing harm: BTCUSD-PERP
+    /// is a configured instrument whose book filled (543 bids / 709 asks on the
+    /// production wire) while orderbook_levels held zero rows for it.
+    ///
+    /// The charset guard still matters for anything that could escape a q
+    /// expression; it just no longer excludes real venue names.
     #[test]
     fn capture_symbols_invalid_charset_dropped() {
-        assert!(parse_capture_symbols(Some("BTC-USDT")).is_empty());
+        // Venue naming: hyphens and dots are legitimate and must be kept.
+        let ok = parse_capture_symbols(Some("BTCUSD-PERP,BTCUSD-261030,BTC.USD"));
+        assert_eq!(ok.len(), 3, "real venue symbols must survive; got {ok:?}");
+        // Still a safety boundary — these reach a q expression.
+        assert!(parse_capture_symbols(Some("BAD\"TOKEN")).is_empty());
+        assert!(parse_capture_symbols(Some("BAD;TOKEN")).is_empty());
+        assert!(parse_capture_symbols(Some("BAD`TOKEN")).is_empty());
+        assert!(parse_capture_symbols(Some("BAD TOKEN")).is_empty());
     }
 
     #[tokio::test]
@@ -11305,5 +11334,37 @@ mod credential_redaction {
         assert_eq!(redact_tag(554, "571932fca5e75171"), "<redacted 16 chars>");
         assert_eq!(redact_tag(49, "PRD3.CDC.MD"), "PRD3.CDC.MD");
         assert_eq!(redact_tag(96, "1790530180008"), "1790530180008");
+    }
+}
+
+#[cfg(test)]
+mod capture_symbols_hyphen {
+    use super::*;
+
+    /// BTCUSD-PERP and the dated futures are real instruments. The validator
+    /// accepted only alphanumerics and `_`, so a configured BTCUSD-PERP was
+    /// silently dropped from capture: its book filled and the wire carried 543
+    /// bids / 709 asks, while orderbook_levels held zero rows for it.
+    #[test]
+    fn accepts_hyphenated_and_dotted_venue_symbols() {
+        let got = parse_capture_symbols(Some("BTC_USDT,BTC_USD,BTCUSD-PERP,BTCUSD-261030,BTC.USD"));
+        for want in ["BTC_USDT", "BTC_USD", "BTCUSD-PERP", "BTCUSD-261030", "BTC.USD"] {
+            assert!(got.contains(want), "{want} was dropped; got {got:?}");
+        }
+    }
+
+    /// Still a safety boundary: these names reach a q expression.
+    #[test]
+    fn still_rejects_anything_that_could_reach_q() {
+        let got = parse_capture_symbols(Some("BTC_USD,BAD\"TOKEN,BAD;TOKEN,BAD`TOKEN,BAD TOKEN"));
+        assert!(got.contains("BTC_USD"), "the good one must survive");
+        assert_eq!(got.len(), 1, "only the safe token should remain; got {got:?}");
+    }
+
+    /// Unchanged behaviour at the edges.
+    #[test]
+    fn unset_defaults_and_empty_is_a_kill_switch() {
+        assert!(parse_capture_symbols(None).contains("BTC_USDT"));
+        assert!(parse_capture_symbols(Some("   ")).is_empty(), "empty = capture nothing");
     }
 }
