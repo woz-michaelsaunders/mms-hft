@@ -415,6 +415,21 @@ health_check() {
     return 1
   fi
 
+  # Diagnostics for the logon wait. On 2026-10-01 (v0.6.0) and 2026-10-02
+  # (v0.6.1) this reported no_logon for a release that was demonstrably
+  # serving: 16 logons, health ok. It reproduces on EVERY poller deploy and
+  # NEVER on a manual `pm2 reload` + health_check. Static analysis eliminated
+  # the cursor (none is written outside the drill, so the offset is 0), log
+  # rotation (none at either deploy), pm2 access under systemd's environment,
+  # the resolved log paths, and the grep pattern (-F, matches the real line).
+  # Record what the loop actually sees so the next deploy identifies the cause.
+  echo "health_check: out=[${out}] size=$(_lib_file_size "${out:-/dev/null}") cursor_out=${cursor_out:-0}" >&2
+  echo "health_check: err=[${err}] size=$(_lib_file_size "${err:-/dev/null}") cursor_err=${cursor_err:-0}" >&2
+  echo "health_check: LOGON_GREP=[${LOGON_GREP}] LOGON_WAIT_S=${LOGON_WAIT_S}" >&2
+  if [[ -n "$err" ]]; then
+    echo "health_check: ACKs in err (whole file): $(grep -cF -- "$LOGON_GREP" "$err" 2>/dev/null || echo 0)" >&2
+  fi
+
   local waited=0
   local logon=0
   while [[ "$waited" -lt "$LOGON_WAIT_S" ]]; do
@@ -430,10 +445,16 @@ health_check() {
     waited=$((waited + 2))
   done
   if [[ "$logon" -eq 0 ]]; then
-    echo "WARNING: no Logon ACK (35=A) received within check window — not rolling back (ambiguous: venue/network vs binary)" >&2
+    echo "ERROR: no Logon ACK (35=A) after the reload cursor — serving NOT CONFIRMED" >&2
+    echo "       (not rolling back: a venue outage and a broken binary look alike here)" >&2
+    echo "       diagnostics: err=[${err}] size=$(_lib_file_size "${err:-/dev/null}") cursor_err=${cursor_err:-0} waited=${waited}s" >&2
+    if [[ -n "$err" ]]; then
+      echo "       ACKs in err at give-up: $(grep -cF -- "$LOGON_GREP" "$err" 2>/dev/null || echo 0)" >&2
+      echo "       last err line: $(tail -c 2000 "$err" 2>/dev/null | tail -1 | cut -c1-160)" >&2
+    fi
     HEALTH_STATUS=no_logon
     export HEALTH_STATUS
-    return 0
+    return 1
   fi
   HEALTH_STATUS=ok
   export HEALTH_STATUS
