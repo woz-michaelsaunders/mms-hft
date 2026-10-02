@@ -225,8 +225,24 @@ _swap_health_rollback() {
       set -e
       return "$rb"
       ;;
-    no_logon|ok)
+    ok)
       return 0
+      ;;
+    no_logon)
+      # NOT a success. The binary IS installed, so .deployed-tag is still
+      # written by the caller -- the poller is forward-only and withholding it
+      # would redeploy the same tag every two minutes. But "installed" and
+      # "serving" are different claims, and conflating them is how v0.5.0 was
+      # recorded as deployed on 2026-09-27 while the OLD process was still
+      # running. Leave a marker the health check can surface, and exit
+      # non-zero so systemd records the unit as failed.
+      #
+      # Rollback stays off deliberately: a venue outage is indistinguishable
+      # from a broken binary here, and rolling back a healthy release during a
+      # venue blip would be worse than the thing being guarded against.
+      : > "${CWD}/.deploy-unconfirmed" 2>/dev/null || true
+      echo "ALERT: deploy installed but serving NOT CONFIRMED — marker at ${CWD}/.deploy-unconfirmed" >&2
+      return 4
       ;;
     *)
       echo "ERROR: health_check did not classify" >&2
@@ -308,11 +324,25 @@ run_poller() {
   _swap_health_rollback "$staged"
   rc=$?
   set -e
+  if [[ "$rc" -eq 4 ]]; then
+    # Installed but serving unconfirmed. Record the tag anyway: the binary IS
+    # on disk, and leaving the state file naming the previous tag would be its
+    # own lie -- and the poller is forward-only, so a withheld tag is simply
+    # never retried. Do NOT skip-list it: there is nothing to retry, it is
+    # already installed. Exit non-zero so systemd marks the unit failed and the
+    # marker is visible.
+    mkdir -p "$CWD"
+    printf '%s\n' "$candidate" >"$DEPLOYED_TAG_FILE"
+    printf '%s\n' "$sha" >"$DEPLOYED_SHA_FILE"
+    echo "deploy.sh: poller: INSTALLED ${candidate} (${sha}) but serving NOT CONFIRMED" >&2
+    exit 4
+  fi
   if [[ "$rc" -ne 0 ]]; then
     _record_skip_tag "$candidate"
     exit "$rc"
   fi
   mkdir -p "$CWD"
+  rm -f "${CWD}/.deploy-unconfirmed" 2>/dev/null || true
   printf '%s\n' "$candidate" >"$DEPLOYED_TAG_FILE"
   printf '%s\n' "$sha" >"$DEPLOYED_SHA_FILE"
   echo "deploy.sh: poller: deployed ${candidate} (${sha})"
