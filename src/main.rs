@@ -7477,8 +7477,21 @@ async fn run_preflight(cli: &Cli) -> i32 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_default_env()
+    // RUST_LOG must WIN. `from_default_env()` parses RUST_LOG into the builder
+    // and `.filter_level()` then overwrites the global filter, so the variable
+    // was read and discarded: setting RUST_LOG=warn on the production
+    // market-data instance on 2026-10-02 changed nothing and INFO lines kept
+    // flowing. Set the default FIRST, then let parse_default_env() override it.
+    //
+    // Default stays Info, so behaviour is unchanged when RUST_LOG is unset.
+    // Per-module filters work too, e.g.
+    //   RUST_LOG=warn,fix_server::algo_runtime=info
+    // which matters because this process writes 1.5-2.3 GB/hour at Info and
+    // pm2-logrotate then cycles every few minutes — blanket `warn` would hide
+    // logon/logout, so the useful setting is selective rather than global.
+    env_logger::Builder::new()
         .filter_level(log::LevelFilter::Info)
+        .parse_default_env()
         .init();
 
     let cli = match parse_cli(std::env::args().skip(1)) {
