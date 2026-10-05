@@ -7,6 +7,8 @@ umask 077
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CWD="${CWD:-/home/ubuntu/fix_server}"
+# The deployed binary is cargo's output, not $CWD/fix_server.
+BIN="${BIN:-$CWD/target/release/fix_server}"
 DEPLOY="${DEPLOY:-$HERE/deploy.sh}"
 LIB="${LIB:-$HERE/deploy-lib.sh}"
 PARSER="${PARSER:-$HERE/rollback-drill-parse-sessions.py}"
@@ -25,7 +27,7 @@ FATAL_GREP_ERE="${FATAL_GREP_ERE:-FATAL: (could not load config\\.toml|config va
 POLLER_TIMER="${POLLER_TIMER:-hft-deploy-poll.timer}"
 POLLER_SERVICE="${POLLER_SERVICE:-hft-deploy-poll.service}"
 CRASH_LOOP_SHA256="${CRASH_LOOP_SHA256:-97d063bab8e2714dbf5220adc6f03b67a40c466ff1de00e9d43fa3cf8e8090c3}"
-PM2_APP="${PM2_APP:-fix_server}"
+PM2_APP="${PM2_APP:-fix-server}"   # pm2 lists it hyphenated; fix_server silently empties every lookup
 SWAP_TIMEOUT_S="${SWAP_TIMEOUT_S:-180}"
 TIMEOUT_KILL_AFTER_S="${TIMEOUT_KILL_AFTER_S:-10}"
 SUITE_DEADLINE_S="${SUITE_DEADLINE_S:-900}"
@@ -41,9 +43,9 @@ LOUD_FAIL_MARKER="${LOUD_FAIL_MARKER:-LOUD_FAIL_MISSING_PREV}"
 
 # Slot 1 — fill with `hostname -s` and `hostname -f` of the UAT box.
 # Empty is fail-closed (identity_allowlist_empty). Not read from env.
-UAT_HOST_ALLOWLIST=()
+UAT_HOST_ALLOWLIST=("ip-172-31-2-80" "ip-172-31-2-80.ap-northeast-1.compute.internal")  # shipped EMPTY, so the drill refused to run anywhere
 UAT_COMPID_CONTAINS="${UAT_COMPID_CONTAINS:-UAT}"
-UAT_FIX_HOST_ALLOWLIST=("fix-uat.crypto.com")
+UAT_FIX_HOST_ALLOWLIST=("fix-uat.crypto.com" "172.31.32.227")  # the box reaches UAT by PrivateLink IP, not that hostname
 UAT_FIX_HOST_DENY=("vpce-07bb726a65816b33f-2nhnv7ig.vpce-svc-0493a3dfb1a2d0d6a.ap-northeast-1.vpce.amazonaws.com")
 UAT_CREDENTIALS_REF_ALLOWLIST=("UAT")
 CREDENTIALS_REF_DENY=("PRD3")
@@ -56,7 +58,12 @@ fi
 
 # Filled from this tree's health_check (live import was not on the builder).
 CRASH_LOOP_LOG_GREP="${CRASH_LOOP_LOG_GREP:-crash-loop detected}"
-NO_LOGON_WARNING_GREP="${NO_LOGON_WARNING_GREP:-WARNING: no Logon ACK}"
+# Match the STABLE part of the message, not its severity prefix. This was
+# pinned to "WARNING: no Logon ACK"; the prefix changed to "ERROR:" when
+# no_logon stopped being treated as a success, and case 3 then failed on a
+# string comparison rather than on behaviour. Assert on the fact, not the
+# wording.
+NO_LOGON_WARNING_GREP="${NO_LOGON_WARNING_GREP:-no Logon ACK (35=A)}"
 
 DRY_RUN=0
 HELP=0
@@ -224,8 +231,8 @@ hashes_match_known_good() {
   local want_bin want_cfg got_bin got_cfg
   want_bin=$(awk 'NR==1{print $1}' "$STASH/known-good.sha256")
   want_cfg=$(awk 'NR==2{print $1}' "$STASH/known-good.sha256")
-  [[ -f "${CWD}/fix_server" && -f "${CWD}/config.toml" ]] || return 1
-  got_bin=$(sha256_file "${CWD}/fix_server")
+  [[ -f "${BIN}" && -f "${CWD}/config.toml" ]] || return 1
+  got_bin=$(sha256_file "${BIN}")
   got_cfg=$(sha256_file "${CWD}/config.toml")
   [[ "$got_bin" == "$want_bin" && "$got_cfg" == "$want_cfg" ]]
 }
@@ -341,7 +348,13 @@ _grep_after() {
   if [[ "$sz" -le "$offset" ]]; then
     return 1
   fi
-  tail -c +"$((offset + 1))" "$file" | grep -F -q -- "$pattern"
+  # `grep -q` exits on the first match and kills `tail` with SIGPIPE. This
+  # script sets `set -euo pipefail` (line 5), so the pipeline reported 141 and
+  # every FOUND match was read as NOT FOUND -- the drill could never pass a
+  # log-based check. Same defect as _lib_grep_after in deploy-lib.sh.
+  local rc=0
+  { set +o pipefail; tail -c +"$((offset + 1))" "$file" | grep -F -c -- "$pattern" >/dev/null; rc=$?; }
+  return "$rc"
 }
 
 http_get_orderbook() {
@@ -368,17 +381,29 @@ sys.exit(0 if ok else 1)
 }
 
 assert_serving_already_up() {
+  # Must use the SAME definition of serving as assert_book_flow, which checks
+  # the logs first and treats HTTP as a supplement. HTTP-only made this
+  # precondition stricter than the assertion it guards, and unsatisfiable on
+  # UAT -- Crypto.com confirmed that venue does not quote.
   local a b
   a=$(http_get_orderbook)
-  if ! http_bid_ask_ok "$a"; then
-    return 1
+  if http_bid_ask_ok "$a"; then
+    sleep "$HTTP_GAP_S"
+    b=$(http_get_orderbook)
+    if http_bid_ask_ok "$b"; then
+      return 0
+    fi
   fi
-  sleep "$HTTP_GAP_S"
-  b=$(http_get_orderbook)
-  if ! http_bid_ask_ok "$b"; then
-    return 1
-  fi
-  return 0
+  local out err hits=0 i
+  out=$(pm2_log_path out); err=$(pm2_log_path err)
+  for i in 1 2; do
+    if { [[ -n "$out" ]] && _grep_after "$out" 0 "$BOOK_GREP"; } ||
+       { [[ -n "$err" ]] && _grep_after "$err" 0 "$BOOK_GREP"; }; then
+      hits=$((hits + 1))
+    fi
+    [[ "$i" -eq 1 ]] && sleep "$HTTP_GAP_S"
+  done
+  [[ "$hits" -eq 2 ]]
 }
 
 assert_logon() {
@@ -559,7 +584,16 @@ tool_missing() {
 }
 
 kdb_up() {
-  ss -ltn 2>/dev/null | grep -F "127.0.0.1:${KDB_PORT}" >/dev/null 2>&1
+  # Reachability, not the bind-address string: kdb honours KDB_LISTEN and may
+  # bind 0.0.0.0, in which case 127.0.0.1:PORT is reachable but never appears
+  # literally in `ss -ltn`.
+  "$PYTHON" - "$KDB_PORT" <<'PYEOF' >/dev/null 2>&1
+import socket, sys
+try:
+    socket.create_connection(("127.0.0.1", int(sys.argv[1])), 3).close()
+except Exception:
+    sys.exit(1)
+PYEOF
 }
 
 poller_is_active() {
@@ -567,9 +601,18 @@ poller_is_active() {
     || systemctl is-active --quiet "$POLLER_SERVICE" 2>/dev/null
 }
 
+# Stopping and starting the poller units needs privilege. As the service user a
+# bare `systemctl stop` returns "Interactive authentication required", and the
+# drill then correctly refuses to inject a fault -- but can never run at all.
+if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+  SYSTEMCTL_CMD=(systemctl)
+else
+  SYSTEMCTL_CMD=(sudo -n systemctl)
+fi
+
 pause_poller() {
   say "✅ rollback-drill: pausing ${POLLER_TIMER} and ${POLLER_SERVICE}"
-  if ! systemctl stop "$POLLER_TIMER" "$POLLER_SERVICE" 2>/dev/null; then
+  if ! "${SYSTEMCTL_CMD[@]}" stop "$POLLER_TIMER" "$POLLER_SERVICE" 2>/dev/null; then
     err "ERROR: preflight: ${POLLER_TIMER}/service still running — refuse to inject a fault while the poller can deploy"
     return 1
   fi
@@ -585,7 +628,7 @@ resume_poller() {
     err "ERROR: poller left stopped"
     return 1
   fi
-  if systemctl start "$POLLER_TIMER" 2>/dev/null; then
+  if "${SYSTEMCTL_CMD[@]}" start "$POLLER_TIMER" 2>/dev/null; then
     say "✅ rollback-drill: poller resumed"
     DID_PAUSE=0
     return 0
@@ -644,7 +687,7 @@ release_lock() {
 copy_known_good() {
   mkdir -p "$STASH/known-good"
   chmod 0700 "$STASH/known-good"
-  cp -a "${CWD}/fix_server" "$STASH/known-good/fix_server"
+  cp -a "${BIN}" "$STASH/known-good/fix_server"
   chmod 0755 "$STASH/known-good/fix_server"
   cp -a "${CWD}/config.toml" "$STASH/known-good/config.toml"
   chmod 0600 "$STASH/known-good/config.toml"
@@ -666,11 +709,23 @@ stage_dir() {
 
 manual_restore() {
   take_log_cursor "$STASH/.rollback-drill-reload.cursor"
-  cp -a "$STASH/known-good/fix_server" "${CWD}/fix_server"
-  cp -a "$STASH/known-good/config.toml" "${CWD}/config.toml"
-  chmod 0755 "${CWD}/fix_server"
-  chmod 0600 "${CWD}/config.toml"
-  pm2 reload "$PM2_APP"
+  # Write beside the target and rename: `cp` ONTO a running executable fails
+  # with ETXTBSY ("Text file busy"), which is what broke case 3 on
+  # 2026-10-04 -- the restore silently did not happen, the process came back on
+  # the injected binary and never logged on. A rename over a busy executable is
+  # legal where a write is not; deploy-lib.sh already does this (mv -f of a
+  # .drill-new file) and the drill's own restore did not.
+  cp -a "$STASH/known-good/fix_server" "${BIN}.restore-new"
+  chmod 0755 "${BIN}.restore-new"
+  mv -f "${BIN}.restore-new" "${BIN}"
+  cp -a "$STASH/known-good/config.toml" "${CWD}/config.toml.restore-new"
+  chmod 0600 "${CWD}/config.toml.restore-new"
+  mv -f "${CWD}/config.toml.restore-new" "${CWD}/config.toml"
+  # Reload from the ecosystem file with --update-env, as the deploy does, so a
+  # restore cannot quietly drop the credential environment.
+  pm2 reload "${ECOSYSTEM:-/home/ubuntu/ecosystem.config.js}" --only "$PM2_APP" --update-env \
+    || pm2 reload "$PM2_APP" --update-env \
+    || pm2 reload "$PM2_APP"
 }
 
 inverse_restore_prev() {
@@ -703,9 +758,20 @@ emergency_restore() {
   if [[ -d "$STASH/known-good" ]]; then
     say "✅ rollback-drill: emergency_restore of known-good bin+config pair"
     take_log_cursor "$STASH/.rollback-drill-reload.cursor" || true
-    cp -a "$STASH/known-good/fix_server" "${CWD}/fix_server" 2>/dev/null || true
-    cp -a "$STASH/known-good/config.toml" "${CWD}/config.toml" 2>/dev/null || true
-    pm2 reload "$PM2_APP" 2>/dev/null || true
+    # Same ETXTBSY trap as manual_restore, and worse here: this is the
+    # emergency path, so a silent `|| true` failure leaves the box on the
+    # injected binary with nothing left to recover it.
+    cp -a "$STASH/known-good/fix_server" "${BIN}.restore-new" 2>/dev/null \
+      && chmod 0755 "${BIN}.restore-new" \
+      && mv -f "${BIN}.restore-new" "${BIN}" \
+      || say "⚠️  emergency_restore: could not replace the binary"
+    cp -a "$STASH/known-good/config.toml" "${CWD}/config.toml.restore-new" 2>/dev/null \
+      && chmod 0600 "${CWD}/config.toml.restore-new" \
+      && mv -f "${CWD}/config.toml.restore-new" "${CWD}/config.toml" \
+      || say "⚠️  emergency_restore: could not replace config.toml"
+    pm2 reload "${ECOSYSTEM:-/home/ubuntu/ecosystem.config.js}" --only "$PM2_APP" --update-env 2>/dev/null \
+      || pm2 reload "$PM2_APP" --update-env 2>/dev/null \
+      || pm2 reload "$PM2_APP" 2>/dev/null || true
   fi
 }
 
@@ -804,7 +870,7 @@ record_case() {
   kg_bin=$(awk 'NR==1{print $1}' "$STASH/known-good.sha256" 2>/dev/null || true)
   kg_cfg=$(awk 'NR==2{print $1}' "$STASH/known-good.sha256" 2>/dev/null || true)
   rb_bin=""; rb_cfg=""
-  [[ -f "${CWD}/fix_server" ]] && rb_bin=$(sha256_file "${CWD}/fix_server")
+  [[ -f "${BIN}" ]] && rb_bin=$(sha256_file "${BIN}")
   [[ -f "${CWD}/config.toml" ]] && rb_cfg=$(sha256_file "${CWD}/config.toml")
   local cur
   cur=$(read_cursor)
@@ -977,7 +1043,7 @@ preflight() {
   if ! kdb_up; then
     die2 "ERROR: preflight: kdb not listening on 127.0.0.1:${KDB_PORT}"
   fi
-  if [[ ! -f "${CWD}/fix_server" || ! -f "${CWD}/config.toml" ]]; then
+  if [[ ! -f "${BIN}" || ! -f "${CWD}/config.toml" ]]; then
     die2 "ERROR: preflight: live pair missing under ${CWD}"
   fi
   if ! assert_serving_already_up; then
