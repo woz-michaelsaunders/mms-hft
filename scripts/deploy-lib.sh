@@ -89,11 +89,23 @@ _lib_grep_after() {
   if [[ "$sz" -le "$offset" ]]; then
     return 1
   fi
+  # NOTE: `grep -q` exits on the first match, which kills `tail` with SIGPIPE.
+  # Callers set `set -o pipefail` (deploy.sh line 29), so the pipeline then
+  # reports 141 and a FOUND match is read as NOT FOUND. That is the whole of
+  # the deploy "no Logon ACK" false negative: it fired on every poller deploy
+  # and never on a hand-run health_check, because an interactive shell has no
+  # pipefail. Proven:
+  #   set -o pipefail; tail -c +1 log | grep -F -q PATTERN  -> 141
+  #   set +o pipefail; tail -c +1 log | grep -F -q PATTERN  -> 0
+  # Drop -q so grep consumes its input and exits 0/1 honestly, and disable
+  # pipefail for just this pipeline so a SIGPIPE'd tail cannot mask the result.
+  local rc=0
   if [[ "$ere" == "1" ]]; then
-    tail -c +"$((offset + 1))" "$file" | grep -E -q -- "$pattern"
+    { set +o pipefail; tail -c +"$((offset + 1))" "$file" | grep -E -c -- "$pattern" >/dev/null; rc=$?; }
   else
-    tail -c +"$((offset + 1))" "$file" | grep -F -q -- "$pattern"
+    { set +o pipefail; tail -c +"$((offset + 1))" "$file" | grep -F -c -- "$pattern" >/dev/null; rc=$?; }
   fi
+  return "$rc"
 }
 
 _lib_write_cursor() {
