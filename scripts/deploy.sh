@@ -66,9 +66,24 @@ git_net() {
   git -c credential.helper="!f(){ echo username=${FORGEJO_USER}; echo password=${token}; };f" "$@"
 }
 
+# Single source of truth for the API token. This MUST agree with git_net
+# above, which falls back to FORGEJO_TOKEN_FILE: the systemd poller unit sets
+# no Environment=FORGEJO_TOKEN, so when the HTTP helpers looked at the env var
+# alone they sent every API call unauthenticated. On a private repo Forgejo
+# answers 404, so _require_release_green and _require_ci_build_green failed
+# with "HTTP 404" for releases that existed and CI that was green -- and then
+# skip-listed the tag. That is what actually stranded v0.7.0.
+_forgejo_token() {
+  local token=${FORGEJO_TOKEN:-${GITEA_TOKEN:-${GITHUB_TOKEN:-}}}
+  if [[ -z "$token" && -r "$FORGEJO_TOKEN_FILE" ]]; then
+    token=$(tr -d ' \n\r' <"$FORGEJO_TOKEN_FILE")
+  fi
+  printf '%s' "$token"
+}
+
 _http_get() {
   local url=$1
-  local token=${FORGEJO_TOKEN:-${GITEA_TOKEN:-${GITHUB_TOKEN:-}}}
+  local token; token=$(_forgejo_token)
   if [[ -n "$token" ]]; then
     curl -fsS --max-time 30 -H "Authorization: token ${token}" "$url"
   else
@@ -78,7 +93,7 @@ _http_get() {
 
 _http_code() {
   local url=$1
-  local token=${FORGEJO_TOKEN:-${GITEA_TOKEN:-${GITHUB_TOKEN:-}}}
+  local token; token=$(_forgejo_token)
   if [[ -n "$token" ]]; then
     curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: token ${token}" "$url"
   else
