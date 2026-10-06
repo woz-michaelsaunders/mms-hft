@@ -254,7 +254,11 @@ _build_and_test() {
   fi
   cp "${CWD}/config.toml" "$stage/config.toml"
   chmod 0600 "$stage/config.toml"
-  trap - RETURN
+  # Do NOT clear the RETURN trap here. It only ever removed "$work" (the clone),
+  # never "$stage", so clearing it protected nothing and leaked the clone on
+  # every SUCCESSFUL build -- the failure paths return early with the trap still
+  # armed, so only successes leaked. 16 of them had accumulated by 2026-10-06,
+  # about 650MB each, and the box was at 88% of its 48G root with 6.1G free.
   printf '%s\n' "$stage"
 }
 
