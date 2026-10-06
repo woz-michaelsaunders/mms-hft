@@ -66,9 +66,24 @@ git_net() {
   git -c credential.helper="!f(){ echo username=${FORGEJO_USER}; echo password=${token}; };f" "$@"
 }
 
+# Single source of truth for the API token. This MUST agree with git_net
+# above, which falls back to FORGEJO_TOKEN_FILE: the systemd poller unit sets
+# no Environment=FORGEJO_TOKEN, so when the HTTP helpers looked at the env var
+# alone they sent every API call unauthenticated. On a private repo Forgejo
+# answers 404, so _require_release_green and _require_ci_build_green failed
+# with "HTTP 404" for releases that existed and CI that was green -- and then
+# skip-listed the tag. That is what actually stranded v0.7.0.
+_forgejo_token() {
+  local token=${FORGEJO_TOKEN:-${GITEA_TOKEN:-${GITHUB_TOKEN:-}}}
+  if [[ -z "$token" && -r "$FORGEJO_TOKEN_FILE" ]]; then
+    token=$(tr -d ' \n\r' <"$FORGEJO_TOKEN_FILE")
+  fi
+  printf '%s' "$token"
+}
+
 _http_get() {
   local url=$1
-  local token=${FORGEJO_TOKEN:-${GITEA_TOKEN:-${GITHUB_TOKEN:-}}}
+  local token; token=$(_forgejo_token)
   if [[ -n "$token" ]]; then
     curl -fsS --max-time 30 -H "Authorization: token ${token}" "$url"
   else
@@ -78,7 +93,7 @@ _http_get() {
 
 _http_code() {
   local url=$1
-  local token=${FORGEJO_TOKEN:-${GITEA_TOKEN:-${GITHUB_TOKEN:-}}}
+  local token; token=$(_forgejo_token)
   if [[ -n "$token" ]]; then
     curl -sS -o /dev/null -w '%{http_code}' --max-time 30 -H "Authorization: token ${token}" "$url"
   else
@@ -131,11 +146,36 @@ _list_version_tags() {
     || true
 }
 
+# Resolve a tag to the COMMIT it names.
+#
+# ls-remote hands back the sha of the ref itself, which for an ANNOTATED tag is
+# the tag OBJECT, not the commit. Forgejo does not advertise the peeled
+# "refs/tags/<t>^{}" line when a pattern is given, so there is nothing to strip
+# locally -- the tag has to be dereferenced through the API.
+#
+# This matters because commit statuses hang off the commit. v0.7.0 is the
+# annotated tag object cce22f8b naming commit db217b18:
+#   /commits/cce22f8b.../status -> {"state":"","total_count":0}   (nothing)
+#   /commits/db217b18.../status -> {"state":"success","total_count":4}
+# so the CI gate read state=empty and refused a build that was green.
 _sha_for_tag() {
-  local tag=$1
-  git_net ls-remote --tags --refs "$DEPLOY_GIT_URL" "refs/tags/${tag}" \
-    | awk '{print $1}' \
-    | head -n1
+  local tag=$1 sha body obj
+  sha=$(git_net ls-remote --tags "$DEPLOY_GIT_URL" "refs/tags/${tag}" \
+    | awk '$2 ~ /\^\{\}$/ {p=$1} $2 == "refs/tags/'"${tag}"'" {t=$1} END {print (p != "" ? p : t)}')
+  [[ -z "$sha" ]] && return 0
+
+  # If $sha is a tag object, peel it to object.sha. A 404/empty body means it
+  # was already a commit, so keep it as-is.
+  body=$(_http_get "${DEPLOY_API_URL}/git/tags/${sha}" 2>/dev/null || true)
+  if [[ -n "$body" ]]; then
+    obj=$(printf '%s' "$body" \
+      | sed -n 's/.*"object"[[:space:]]*:[[:space:]]*{[^}]*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{7,40\}\)".*/\1/p' \
+      | head -n1)
+    if [[ -n "$obj" ]]; then
+      sha=$obj
+    fi
+  fi
+  printf '%s\n' "$sha"
 }
 
 _require_release_green() {
@@ -297,20 +337,32 @@ run_poller() {
 
   sha=$(_sha_for_tag "$candidate")
   if [[ -z "$sha" || ! "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
-    echo "ERROR: deploy.sh: cannot resolve SHA for ${candidate}" >&2
-    _record_skip_tag "$candidate"
-    exit 1
+    # TRANSIENT, not permanent. This is a network call to Forgejo; a 503 from
+    # the front end looks exactly like a missing tag here. Skip-listing on it
+    # strands a perfectly good release forever, because the poller is
+    # forward-only and never revisits a skipped tag.
+    #
+    # That is not hypothetical: v0.7.0 was blacklisted on 2026-10-06 by a
+    # Forgejo 503 ("remote: no available server"), and the deploy then reported
+    # "nothing to deploy" indefinitely while the release sat there.
+    echo "deploy.sh: poller: cannot resolve SHA for ${candidate} (Forgejo unreachable?) — will retry next poll" >&2
+    exit 0
   fi
 
   echo "deploy.sh: poller: candidate ${candidate} (${sha}) current=${current}"
 
+  # Also transient. The Release workflow starts when the tag is pushed and takes
+  # minutes; the poller runs every two. Neither "the release does not exist yet"
+  # nor "CI has not finished" is a permanent verdict, and a genuinely failed CI
+  # simply never goes green, so retrying costs one API call per poll and strands
+  # nothing. Only a definite failure below earns a skip.
   if ! _require_release_green "$candidate"; then
-    _record_skip_tag "$candidate"
-    exit 1
+    echo "deploy.sh: poller: ${candidate} not ready yet (release pending or unreachable) — will retry next poll"
+    exit 0
   fi
   if ! _require_ci_build_green "$sha"; then
-    _record_skip_tag "$candidate"
-    exit 1
+    echo "deploy.sh: poller: ${candidate} not ready yet (CI pending or not green) — will retry next poll"
+    exit 0
   fi
 
   local staged
