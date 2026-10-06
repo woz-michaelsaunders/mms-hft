@@ -146,11 +146,36 @@ _list_version_tags() {
     || true
 }
 
+# Resolve a tag to the COMMIT it names.
+#
+# ls-remote hands back the sha of the ref itself, which for an ANNOTATED tag is
+# the tag OBJECT, not the commit. Forgejo does not advertise the peeled
+# "refs/tags/<t>^{}" line when a pattern is given, so there is nothing to strip
+# locally -- the tag has to be dereferenced through the API.
+#
+# This matters because commit statuses hang off the commit. v0.7.0 is the
+# annotated tag object cce22f8b naming commit db217b18:
+#   /commits/cce22f8b.../status -> {"state":"","total_count":0}   (nothing)
+#   /commits/db217b18.../status -> {"state":"success","total_count":4}
+# so the CI gate read state=empty and refused a build that was green.
 _sha_for_tag() {
-  local tag=$1
-  git_net ls-remote --tags --refs "$DEPLOY_GIT_URL" "refs/tags/${tag}" \
-    | awk '{print $1}' \
-    | head -n1
+  local tag=$1 sha body obj
+  sha=$(git_net ls-remote --tags "$DEPLOY_GIT_URL" "refs/tags/${tag}" \
+    | awk '$2 ~ /\^\{\}$/ {p=$1} $2 == "refs/tags/'"${tag}"'" {t=$1} END {print (p != "" ? p : t)}')
+  [[ -z "$sha" ]] && return 0
+
+  # If $sha is a tag object, peel it to object.sha. A 404/empty body means it
+  # was already a commit, so keep it as-is.
+  body=$(_http_get "${DEPLOY_API_URL}/git/tags/${sha}" 2>/dev/null || true)
+  if [[ -n "$body" ]]; then
+    obj=$(printf '%s' "$body" \
+      | sed -n 's/.*"object"[[:space:]]*:[[:space:]]*{[^}]*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{7,40\}\)".*/\1/p' \
+      | head -n1)
+    if [[ -n "$obj" ]]; then
+      sha=$obj
+    fi
+  fi
+  printf '%s\n' "$sha"
 }
 
 _require_release_green() {
