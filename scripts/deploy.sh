@@ -34,7 +34,12 @@ source "$LIB"
 # LOUD_FAIL_MISSING_PREV — Case 4 skip detection greps this file (grep -F).
 
 CWD="${CWD:-/home/ubuntu/fix_server}"
-PM2_APP="${PM2_APP:-fix_server}"
+# pm2 lists this app HYPHENATED. With the underscore, `pm2 reload <eco> --only
+# fix_server` matches nothing and EXITS 0, so the binary is swapped on disk and
+# nothing restarts -- the exact failure that recorded v0.5.0 as deployed on
+# 2026-09-27, and v0.6.0/v0.6.1/v0.7.0 since, while the old process kept
+# running. rollback-drill.sh already carried this fix; the deploy path did not.
+PM2_APP="${PM2_APP:-fix-server}"
 DEPLOY_GIT_URL="${DEPLOY_GIT_URL:-https://git.gandetl.com/wozinga-group/HFT-Fix-API.git}"
 DEPLOY_API_URL="${DEPLOY_API_URL:-https://git.gandetl.com/api/v1/repos/wozinga-group/HFT-Fix-API}"
 DEPLOYED_TAG_FILE="${DEPLOYED_TAG_FILE:-$CWD/.deployed-tag}"

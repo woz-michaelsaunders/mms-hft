@@ -20,7 +20,7 @@ fi
 # The deployed binary is cargo's output, not $CWD/fix_server.
 : "${BIN:=$CWD/target/release/fix_server}"
 : "${ECOSYSTEM:=/home/ubuntu/ecosystem.config.js}"
-: "${PM2_APP:=fix_server}"
+: "${PM2_APP:=fix-server}"   # HYPHEN: pm2 reload --only fix_server matches nothing and exits 0
 : "${ROLLBACK_LOUD_EXIT:=3}"
 : "${CRASH_SAMPLE_GAP_S:=10}"
 : "${LOGON_WAIT_S:=30}"
@@ -50,6 +50,20 @@ for p in data:
         print(v)
         break
 ' "$PM2_APP" "$field"
+}
+
+_lib_pm2_app_exists() {
+  pm2 jlist 2>/dev/null | "$PYTHON" -c '
+import json, sys
+name = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(data, list):
+    sys.exit(1)
+sys.exit(0 if any(p.get("name") == name for p in data) else 1)
+' "$PM2_APP"
 }
 
 _lib_pm2_log_path() {
@@ -109,7 +123,13 @@ _lib_grep_after() {
 }
 
 _lib_write_cursor() {
-  [[ "${ROLLBACK_DRILL:-}" == "1" || -n "${CURSOR_FILE:-}" ]] || return 0
+  # Deploys must write a cursor too. This used to return early unless a drill
+  # was running, while health_check fell back to reading
+  # ${CWD}/.rollback-drill-reload.cursor regardless -- so a deploy's health
+  # check read a cursor left behind by the last DRILL. On 2026-10-06 that
+  # cursor said err=85186344 while the log had since rotated down to 54MB, so
+  # the check read past EOF, found nothing, and reported a false
+  # "serving NOT CONFIRMED" on a deploy whose real fault was elsewhere.
   local out err startup dest os es ss mono
   out=$(_lib_pm2_log_path out)
   err=$(_lib_pm2_log_path err)
@@ -347,12 +367,39 @@ swap_reload() {
   # the credentials moving into the environment; the binary treats a missing
   # credential as fatal and crash-looped for six hours. Re-reading the
   # ecosystem file is what keeps the deploy honest about env changes.
+  # `pm2 reload --only <name>` EXITS 0 when <name> matches no app. Measured on
+  # an isolated pm2 instance with a two-app ecosystem:
+  #   --only demo_app (no such app) -> exit 0, restarts unchanged (0,0)
+  #   --only demo-app (correct)     -> exit 0, demo-app 0->1, other untouched
+  # So the exit status cannot be trusted to mean "it restarted". Assert the app
+  # exists first, and assert afterwards that it really came back.
+  if ! _lib_pm2_app_exists; then
+    echo "ERROR: swap_reload: pm2 has no app named '${PM2_APP}' -- refusing to claim a reload" >&2
+    pm2 jlist 2>/dev/null | "$PYTHON" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d=[]
+print("       pm2 knows:", [p.get("name") for p in d] if isinstance(d,list) else d, file=sys.stderr)' || true
+    return 1
+  fi
+  local pid_before uptime_before
+  pid_before=$(_lib_pm2_env_field pm_id)
+  uptime_before=$(_lib_pm2_env_field pm_uptime)
+
   if ! pm2 reload "$ECOSYSTEM" --only "$PM2_APP" --update-env; then
     if ! pm2 reload "$PM2_APP" --update-env; then
       echo "ERROR: swap_reload: pm2 reload $PM2_APP failed" >&2
       return 1
     fi
   fi
+
+  local uptime_after
+  uptime_after=$(_lib_pm2_env_field pm_uptime)
+  if [[ -n "$uptime_before" && "$uptime_after" == "$uptime_before" ]]; then
+    echo "ERROR: swap_reload: ${PM2_APP} did not restart (pm_uptime unchanged: ${uptime_before})" >&2
+    echo "       the binary on disk was replaced but the OLD process is still serving" >&2
+    return 1
+  fi
+  echo "swap_reload: ${PM2_APP} restarted (pm_uptime ${uptime_before:-?} -> ${uptime_after:-?}, pm_id ${pid_before:-?})"
   # Persist, so the next resurrect does not lose the environment again.
   pm2 save >/dev/null 2>&1 || echo "WARN: swap_reload: pm2 save failed" >&2
   return 0
@@ -388,6 +435,25 @@ health_check() {
     else
       # shellcheck disable=SC2086
       read -r cursor_out cursor_err _ <<<"$line" || true
+    fi
+  fi
+
+  # A cursor larger than the file means the log rotated or was truncated after
+  # the cursor was taken. Reading from it returns nothing, which looks exactly
+  # like "the app never logged" -- a false negative. Start from 0 instead.
+  local _sz
+  if [[ -n "$out" && -f "$out" ]]; then
+    _sz=$(_lib_file_size "$out")
+    if [[ "${cursor_out:-0}" -gt "$_sz" ]]; then
+      echo "health_check: cursor_out ${cursor_out} > size ${_sz} (log rotated?) -- resetting to 0" >&2
+      cursor_out=0
+    fi
+  fi
+  if [[ -n "$err" && -f "$err" ]]; then
+    _sz=$(_lib_file_size "$err")
+    if [[ "${cursor_err:-0}" -gt "$_sz" ]]; then
+      echo "health_check: cursor_err ${cursor_err} > size ${_sz} (log rotated?) -- resetting to 0" >&2
+      cursor_err=0
     fi
   fi
 
