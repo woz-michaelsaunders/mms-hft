@@ -297,20 +297,32 @@ run_poller() {
 
   sha=$(_sha_for_tag "$candidate")
   if [[ -z "$sha" || ! "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
-    echo "ERROR: deploy.sh: cannot resolve SHA for ${candidate}" >&2
-    _record_skip_tag "$candidate"
-    exit 1
+    # TRANSIENT, not permanent. This is a network call to Forgejo; a 503 from
+    # the front end looks exactly like a missing tag here. Skip-listing on it
+    # strands a perfectly good release forever, because the poller is
+    # forward-only and never revisits a skipped tag.
+    #
+    # That is not hypothetical: v0.7.0 was blacklisted on 2026-10-06 by a
+    # Forgejo 503 ("remote: no available server"), and the deploy then reported
+    # "nothing to deploy" indefinitely while the release sat there.
+    echo "deploy.sh: poller: cannot resolve SHA for ${candidate} (Forgejo unreachable?) — will retry next poll" >&2
+    exit 0
   fi
 
   echo "deploy.sh: poller: candidate ${candidate} (${sha}) current=${current}"
 
+  # Also transient. The Release workflow starts when the tag is pushed and takes
+  # minutes; the poller runs every two. Neither "the release does not exist yet"
+  # nor "CI has not finished" is a permanent verdict, and a genuinely failed CI
+  # simply never goes green, so retrying costs one API call per poll and strands
+  # nothing. Only a definite failure below earns a skip.
   if ! _require_release_green "$candidate"; then
-    _record_skip_tag "$candidate"
-    exit 1
+    echo "deploy.sh: poller: ${candidate} not ready yet (release pending or unreachable) — will retry next poll"
+    exit 0
   fi
   if ! _require_ci_build_green "$sha"; then
-    _record_skip_tag "$candidate"
-    exit 1
+    echo "deploy.sh: poller: ${candidate} not ready yet (CI pending or not green) — will retry next poll"
+    exit 0
   fi
 
   local staged
