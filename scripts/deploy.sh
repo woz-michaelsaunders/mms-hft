@@ -220,11 +220,22 @@ _build_and_test() {
     return 1
   fi
   git -C "$work/repo" checkout --quiet "$sha"
+  # >&2 is load-bearing. This function communicates the staged directory to its
+  # caller on stdout (printf at the end), and `cargo test` writes its results
+  # ("running 14 tests", "test result: ok. ...") to STDOUT, not stderr. Without
+  # the redirect, staged=$(_build_and_test ...) captures the whole test log
+  # followed by the directory, and the swap then refuses it:
+  #
+  #   ERROR: swap_reload: DIR contains a newline
+  #
+  # which is what stopped v0.7.0 on 2026-10-06 after an 18-minute build that
+  # had already passed. Sending all cargo output to stderr keeps stdout clean
+  # and still puts the build log in the journal.
   if ! (
     cd "$work/repo"
     cargo test --release --locked
     cargo build --release --locked
-  ); then
+  ) >&2; then
     echo "ERROR: deploy.sh: on-box cargo test/build failed for ${sha}" >&2
     rm -rf "$stage"
     return 1
