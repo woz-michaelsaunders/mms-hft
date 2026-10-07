@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/fix_server
+Environment=KDB_PORT=5001
 ExecStart=/home/ubuntu/q/l64/q kdb/start_kdb_server.q
 Restart=always
 RestartSec=5

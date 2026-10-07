@@ -52,6 +52,10 @@ MAP=(
   "systemd/kdb-server-prod.service|/etc/systemd/system/kdb-server-prod.service"
   "systemd/hft-drift.service|/etc/systemd/system/hft-drift.service"
   "systemd/hft-drift.timer|/etc/systemd/system/hft-drift.timer"
+  # Both instances load this at startup. It is identical for both now that the
+  # listen port comes from KDB_PORT in the unit, so it can finally be compared.
+  "kdb/start_kdb_server.q|/home/ubuntu/fix_server/kdb/start_kdb_server.q"
+  "kdb/start_kdb_server.q|/home/ubuntu/fix_server_prod/kdb/start_kdb_server.q"
 )
 
 TOKEN=$(_token)
