@@ -25,6 +25,21 @@ fi
 : "${CRASH_SAMPLE_GAP_S:=10}"
 : "${LOGON_WAIT_S:=30}"
 : "${LOGON_GREP:=Logon ACK (35=A) received}"
+# fix_commands.log is the verbatim FIX audit trail, written by direct file I/O
+# rather than through the logger, so it is INDEPENDENT OF RUST_LOG. The
+# LOGON_GREP line above is emitted at INFO by the same module as the per-tick
+# noise, which is the only reason UAT had to stay at `info`: 35,373 of 40,000
+# sampled lines were INFO fix_server]. Asserting on the audit trail instead
+# lets fix-server run at `warn` like production.
+: "${COMMAND_LOG:=$CWD/fix_commands.log}"
+: "${COMMAND_LOG_GREP:=FIX IN Logon (35=A)}"
+# Inbound market data counts as proof of serving too, and is far denser: prod
+# writes ~155k of these an hour versus one logon per session. That matters
+# because the audit trail rotates at ~100MB keeping a single generation, which
+# prod reaches in about an hour -- so a rotation landing inside the 30s
+# assertion window could carry the logon line away. Market data cannot all
+# disappear the same way while the feed is up.
+: "${COMMAND_LOG_GREP_ALT:=FIX IN MarketDataIncrementalRefresh (35=X)}"
 : "${FATAL_GREP_ERE:=FATAL: (could not load config\\.toml|config validation failed)}"
 : "${STARTUP_LOG:=$CWD/startup.log}"
 : "${PYTHON:=/usr/bin/python3}"
@@ -138,6 +153,8 @@ _lib_write_cursor() {
   es=$(_lib_file_size "${err:-/dev/null}")
   ss=$(_lib_file_size "${startup:-/dev/null}")
   mono=$("$PYTHON" -c 'import time; print(int(time.monotonic()*1000))' 2>/dev/null || echo 0)
+  local cs
+  cs=$(_lib_file_size "${COMMAND_LOG:-/dev/null}")
   if [[ -n "${CURSOR_FILE:-}" ]]; then
     dest=$CURSOR_FILE
   else
@@ -145,7 +162,7 @@ _lib_write_cursor() {
   fi
   mkdir -p "$(dirname "$dest")" 2>/dev/null || true
   # Two-integer prefix keeps existing drill parsers; key=value is the LLD line.
-  printf 'out=%s err=%s startup=%s mono_ms=%s\n' "$os" "$es" "$ss" "$mono" >"$dest"
+  printf 'out=%s err=%s startup=%s mono_ms=%s cmd=%s\n' "$os" "$es" "$ss" "$mono" "$cs" >"$dest"
   chmod 0600 "$dest" 2>/dev/null || true
   if [[ -d "$CWD" && "$dest" != "${CWD}/.rollback-drill-reload.cursor" ]]; then
     cp -a "$dest" "${CWD}/.rollback-drill-reload.cursor" 2>/dev/null || true
@@ -419,7 +436,7 @@ health_check() {
   local out err
   out=$(_lib_pm2_log_path out)
   err=$(_lib_pm2_log_path err)
-  local cursor_out=0 cursor_err=0
+  local cursor_out=0 cursor_err=0 cursor_cmd=0
   local cfile=${CURSOR_FILE:-}
   if [[ -z "$cfile" && -f "${CWD}/.rollback-drill-reload.cursor" ]]; then
     cfile="${CWD}/.rollback-drill-reload.cursor"
@@ -432,6 +449,10 @@ health_check() {
       cursor_out=${cursor_out%% *}
       cursor_err=${line#*err=}
       cursor_err=${cursor_err%% *}
+      if [[ "$line" == *cmd=* ]]; then
+        cursor_cmd=${line#*cmd=}
+        cursor_cmd=${cursor_cmd%% *}
+      fi
     else
       # shellcheck disable=SC2086
       read -r cursor_out cursor_err _ <<<"$line" || true
@@ -454,6 +475,15 @@ health_check() {
     if [[ "${cursor_err:-0}" -gt "$_sz" ]]; then
       echo "health_check: cursor_err ${cursor_err} > size ${_sz} (log rotated?) -- resetting to 0" >&2
       cursor_err=0
+    fi
+  fi
+  # The audit trail has its own rotation (rotate_log_if_needed in main.rs), so
+  # it needs the same clamp.
+  if [[ -n "${COMMAND_LOG:-}" && -f "${COMMAND_LOG}" ]]; then
+    _sz=$(_lib_file_size "$COMMAND_LOG")
+    if [[ "${cursor_cmd:-0}" -gt "$_sz" ]]; then
+      echo "health_check: cursor_cmd ${cursor_cmd} > size ${_sz} (audit log rotated?) -- resetting to 0" >&2
+      cursor_cmd=0
     fi
   fi
 
@@ -504,6 +534,7 @@ health_check() {
   echo "health_check: out=[${out}] size=$(_lib_file_size "${out:-/dev/null}") cursor_out=${cursor_out:-0}" >&2
   echo "health_check: err=[${err}] size=$(_lib_file_size "${err:-/dev/null}") cursor_err=${cursor_err:-0}" >&2
   echo "health_check: LOGON_GREP=[${LOGON_GREP}] LOGON_WAIT_S=${LOGON_WAIT_S}" >&2
+  echo "health_check: cmd=[${COMMAND_LOG:-}] size=$(_lib_file_size "${COMMAND_LOG:-/dev/null}") cursor_cmd=${cursor_cmd:-0} grep=[${COMMAND_LOG_GREP}]" >&2
   if [[ -n "$err" ]]; then
     echo "health_check: ACKs in err (whole file): $(grep -cF -- "$LOGON_GREP" "$err" 2>/dev/null || echo 0)" >&2
   fi
@@ -511,6 +542,14 @@ health_check() {
   local waited=0
   local logon=0
   while [[ "$waited" -lt "$LOGON_WAIT_S" ]]; do
+    # Audit trail first: independent of RUST_LOG, so this is the check that
+    # still works once fix-server runs at `warn`.
+    if [[ -n "${COMMAND_LOG:-}" && -f "${COMMAND_LOG}" ]] \
+       && { _lib_grep_after "$COMMAND_LOG" "${cursor_cmd:-0}" "$COMMAND_LOG_GREP" 0 \
+            || _lib_grep_after "$COMMAND_LOG" "${cursor_cmd:-0}" "$COMMAND_LOG_GREP_ALT" 0; }; then
+      logon=1
+      break
+    fi
     if [[ -n "$out" ]] && _lib_grep_after "$out" "${cursor_out:-0}" "$LOGON_GREP" 0; then
       logon=1
       break
@@ -528,6 +567,8 @@ health_check() {
     echo "       diagnostics: err=[${err}] size=$(_lib_file_size "${err:-/dev/null}") cursor_err=${cursor_err:-0} waited=${waited}s" >&2
     if [[ -n "$err" ]]; then
       echo "       ACKs in err at give-up: $(grep -cF -- "$LOGON_GREP" "$err" 2>/dev/null || echo 0)" >&2
+      echo "       audit-trail logons at give-up: $(grep -cF -- "$COMMAND_LOG_GREP" "${COMMAND_LOG:-/dev/null}" 2>/dev/null || echo 0)" >&2
+      echo "       audit-trail market data at give-up: $(grep -cF -- "$COMMAND_LOG_GREP_ALT" "${COMMAND_LOG:-/dev/null}" 2>/dev/null || echo 0)" >&2
       echo "       last err line: $(tail -c 2000 "$err" 2>/dev/null | tail -1 | cut -c1-160)" >&2
     fi
     HEALTH_STATUS=no_logon
