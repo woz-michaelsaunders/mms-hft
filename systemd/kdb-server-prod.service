@@ -1,0 +1,19 @@
+[Unit]
+Description=kdb+ for PRODUCTION market data (port 5002, separate HDB from UAT)
+After=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/fix_server_prod
+Environment=HOME=/home/ubuntu
+Environment=QHOME=/home/ubuntu/q
+ExecStart=/home/ubuntu/q/l64/q kdb/start_kdb_server.q
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/ubuntu/fix_server_prod/kdb_server.log
+StandardError=append:/home/ubuntu/fix_server_prod/kdb_server.log
+
+[Install]
+WantedBy=multi-user.target

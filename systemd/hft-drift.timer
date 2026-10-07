@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the HFT drift check hourly
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=1min
+Unit=hft-drift.service
+
+[Install]
+WantedBy=timers.target
