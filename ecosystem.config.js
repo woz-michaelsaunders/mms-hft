@@ -29,7 +29,10 @@ module.exports = {
       max_restarts: 10,
       restart_delay: 3000,
       env: {
-        RUST_LOG: "info",
+        // warn, like production. The deploy health check and the rollback
+        // drill assert from fix_commands.log (direct file I/O, independent of
+        // RUST_LOG), so nothing depends on INFO output any more.
+        RUST_LOG: "warn",
         ...fixServerEnv,
       },
       log_date_format: "YYYY-MM-DD HH:mm:ss",
