@@ -1,0 +1,18 @@
+[Unit]
+Description=HFT drift check: compare operational files on the box against the repository
+Documentation=https://git.gandetl.com/wozinga-group/HFT-Fix-API
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/ubuntu
+# Read-only. Exits 1 when the box and the repo disagree, which marks the unit
+# failed and makes the divergence visible in `systemctl --failed`.
+ExecStart=/home/ubuntu/hft-deploy/check-drift.sh
+
+[Install]
+WantedBy=multi-user.target

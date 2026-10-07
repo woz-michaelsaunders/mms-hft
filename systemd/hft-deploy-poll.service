@@ -1,0 +1,22 @@
+[Unit]
+Description=HFT pull-based deploy: poll Forgejo for a new vX.Y.Z tag and deploy it
+Documentation=file:///home/ubuntu/hft-deploy/deploy.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu
+# systemd does not read the login shell: cargo (for the build) and pm2 (for the
+# restart) must be on PATH explicitly or the first real deploy fails at build.
+Environment=PATH=/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/ubuntu
+# Adopted 2026-09-27: the repo pair (scripts/deploy.sh + deploy-lib.sh) replaces
+# the hand-maintained /home/ubuntu/deploy.sh, which had diverged on four points.
+# Legacy copies archived under /home/ubuntu/deploy-legacy.*.
+ExecStart=/home/ubuntu/hft-deploy/deploy-poll.sh
+Nice=10
+# The CI gate can wait up to 30 min for CI, plus build and tests.
+TimeoutStartSec=3600

@@ -1,0 +1,15 @@
+[Unit]
+Description=HFT FIX server health check (external to pm2)
+Documentation=file:/home/ubuntu/hft-health.sh
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+# pm2/node and cargo live here; systemd's default PATH does not include them.
+Environment=PATH=/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/ubuntu
+ExecStart=/home/ubuntu/hft-health.sh
+# Never let a failing check take the box down; the alert is the output.
+SuccessExitStatus=0 1
