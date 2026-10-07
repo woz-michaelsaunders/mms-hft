@@ -536,7 +536,20 @@ impl KdbWriter {
                 warn!("kdb reconnect attempt (backoff {}ms) to {}:{}", backoff, host, port);
                 match KdbWriter::connect_ipc_with(&host, port, &stream, &connected, &probe).await {
                     Ok(()) => {
-                        info!("kdb reconnect success at {}:{}", host, port);
+                        // warn!, deliberately, to match the severity of the
+                        // messages that announce the problem: "kdb+ connection
+                        // lost", "kdb reconnect attempt" and "kdb reconnect
+                        // failed" are all warn!. Both services run at
+                        // RUST_LOG=warn, so logging the RECOVERY at info meant
+                        // an operator could see the connection break and never
+                        // see it come back -- the log would show an unresolved
+                        // outage forever. If entering a degraded state is a
+                        // warning, leaving it belongs at the same level.
+                        //
+                        // The initial connect at startup stays info!: it is
+                        // not the resolution of anything, and warning on every
+                        // normal boot would be noise.
+                        warn!("kdb reconnect success at {}:{}", host, port);
                         backoff = initial;
                     }
                     Err(e) => {
