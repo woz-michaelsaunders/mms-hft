@@ -7857,6 +7857,22 @@ async fn main() -> Result<()> {
         let market_data_for_web = Arc::clone(&md_h);
         let market_data_sessions_for_web = all_md.clone(); // (handle, name, port) list order
         let kdb_for_web = Arc::clone(&kdb_writer);
+        // Bind the API to LOOPBACK by default. It carries no authentication of
+        // its own, sits behind CorsLayer::permissive(), and includes mutating
+        // endpoints: /api/algo/enable, /api/algo/disable, /api/algo/config and
+        // /api/subscribe-all-symbols. It must not sit on a public interface.
+        //
+        // It was bound to 0.0.0.0:8080 until 2026-10-07 (HFT-058). mgmt-server
+        // reaches it over localhost, so loopback costs nothing here. Set
+        // WEB_BIND only for a deliberate, authenticated deployment.
+        let web_bind = std::env::var("WEB_BIND")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+        if !(web_bind.starts_with("127.") || web_bind.starts_with("localhost")) {
+            warn!("⚠️  WEB_BIND={} puts the UNAUTHENTICATED API beyond loopback", web_bind);
+        }
         let _web_server_handle = tokio::spawn(async move {
             if let Err(e) = order_book_web_server(
                 order_session_for_web,
@@ -7865,7 +7881,7 @@ async fn main() -> Result<()> {
                 kdb_for_web,
                 algo_for_web,
                 algo_imbalance_for_web,
-                "0.0.0.0:8080",
+                &web_bind,
             )
             .await
             {
