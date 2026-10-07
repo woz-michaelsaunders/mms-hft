@@ -26,7 +26,23 @@ loadTables: {
         p: .Q.dd[hdbPath;n];
         // key on a non-existent path returns a null in some kdb+ versions — test carefully
         if[not @[{count key x; 1b}; p; {0b}]; :[]];
-        @[{[nm;pth] value (string nm), ": load `", (1_string pth)}; (n;p); {[e] show "Could not load table: ", e}]
+        // `load `:path` BOTH reads the file AND defines the global named after
+        // it, then returns that name as a symbol. Two things therefore must not
+        // be done here:
+        //
+        //   1_string pth  stripped the leading ":", so the expression became
+        //                 `load `kdb/hdb/orderbook_levels` -> 'ERROR: /',
+        //                 swallowed by the error handler below. Nothing was
+        //                 ever restored, silently.
+        //   nm ": " load  assigns load's RETURN VALUE -- the symbol -- over the
+        //                 table it just read, leaving an atom behind.
+        //
+        // Measured on a 3-row table saved and cleared:
+        //   mytab: load `:kdb/hdb/mytab  -> count=1 type=-11  (symbol atom)
+        //   load `:kdb/hdb/mytab         -> count=3 type=98   (table)
+        //
+        // So: keep the colon, and do not assign.
+        @[{[pth] value "load `", string pth}; p; {[e] show "Could not load table: ", e}]
     } each tableNames;
     };
 
