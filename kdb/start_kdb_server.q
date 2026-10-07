@@ -2,8 +2,18 @@
 // Start kdb+ server to receive order book data via IPC
 // Usage: q start_kdb_server.q
 
-// Set port (default 5001)
-port: 5001
+// Listen port, from KDB_PORT so this file is IDENTICAL for every instance.
+//
+// It was a hardcoded literal, which forced one hand-edited copy per instance:
+// this file said 5001 while production ran 5002. Two divergent copies of a
+// script that two live services load at startup is the same drift surface that
+// lost eight fixes between 2026-09-27 and 2026-10-07, and it kept the script
+// out of scripts/check-drift.sh, because a byte comparison could not pass for
+// both instances at once.
+//
+// The port now comes from the environment, set per instance in the systemd
+// unit, so every copy matches the repository byte for byte.
+port: $[count p: getenv `KDB_PORT; "I" $ p; 5001i]
 
 // HDB (Historical Database) path for disk persistence
 // Tables are saved here periodically and reloaded on startup

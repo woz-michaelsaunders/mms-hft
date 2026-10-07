@@ -9,6 +9,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/fix_server_prod
 Environment=HOME=/home/ubuntu
 Environment=QHOME=/home/ubuntu/q
+Environment=KDB_PORT=5002
 ExecStart=/home/ubuntu/q/l64/q kdb/start_kdb_server.q
 Restart=always
 RestartSec=5
