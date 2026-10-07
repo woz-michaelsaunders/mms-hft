@@ -23,6 +23,22 @@ HTTP_GAP_S="${HTTP_GAP_S:-5}"
 HTTP_BIND_WAIT_S="${HTTP_BIND_WAIT_S:-30}"
 LOGON_GREP="${LOGON_GREP:-Logon ACK (35=A) received}"
 BOOK_GREP="${BOOK_GREP:-📊 Order Book:}"
+# Book activity, asserted from the verbatim FIX audit trail instead of the
+# logger. "📊 Order Book:" is emitted at INFO by the same module as the
+# per-tick noise, so asserting on it forces fix-server to stay at RUST_LOG=info.
+# fix_commands.log is written by direct file I/O and is independent of the log
+# level, so these two patterns keep working at `warn`.
+COMMAND_LOG="${COMMAND_LOG:-$CWD/fix_commands.log}"
+BOOK_CMD_GREP="${BOOK_CMD_GREP:-FIX IN MarketDataIncrementalRefresh (35=X)}"
+BOOK_CMD_GREP_ALT="${BOOK_CMD_GREP_ALT:-FIX IN MarketDataSnapshotFullRefresh (35=W)}"
+
+# True when the audit trail shows inbound market data after $1 bytes.
+_book_active_after() {
+  local offset=$1
+  [[ -n "$COMMAND_LOG" && -f "$COMMAND_LOG" ]] || return 1
+  _grep_after "$COMMAND_LOG" "$offset" "$BOOK_CMD_GREP" && return 0
+  _grep_after "$COMMAND_LOG" "$offset" "$BOOK_CMD_GREP_ALT"
+}
 FATAL_GREP_ERE="${FATAL_GREP_ERE:-FATAL: (could not load config\\.toml|config validation failed)}"
 POLLER_TIMER="${POLLER_TIMER:-hft-deploy-poll.timer}"
 POLLER_SERVICE="${POLLER_SERVICE:-hft-deploy-poll.service}"
@@ -397,7 +413,8 @@ assert_serving_already_up() {
   local out err hits=0 i
   out=$(pm2_log_path out); err=$(pm2_log_path err)
   for i in 1 2; do
-    if { [[ -n "$out" ]] && _grep_after "$out" 0 "$BOOK_GREP"; } ||
+    if _book_active_after 0 ||
+       { [[ -n "$out" ]] && _grep_after "$out" 0 "$BOOK_GREP"; } ||
        { [[ -n "$err" ]] && _grep_after "$err" 0 "$BOOK_GREP"; }; then
       hits=$((hits + 1))
     fi
@@ -417,6 +434,10 @@ assert_logon() {
   co=${co:-0}
   ce=${ce:-0}
   while [[ "$waited" -lt "$LOGON_ASSERT_WAIT_S" ]]; do
+    if [[ -n "$COMMAND_LOG" && -f "$COMMAND_LOG" ]] \
+       && _grep_after "$COMMAND_LOG" "$(cursor_field "$cursor" cmd)" "FIX IN Logon (35=A)"; then
+      return 0
+    fi
     if [[ -n "$out" ]] && _grep_after "$out" "$co" "$LOGON_GREP"; then
       return 0
     fi
@@ -436,8 +457,14 @@ assert_book_flow() {
   err=$(pm2_log_path err)
   co=$(cursor_field "$cursor" out)
   ce=$(cursor_field "$cursor" err)
+  local cc
+  cc=$(cursor_field "$cursor" cmd)
   local attempt=0
   while [[ "$attempt" -lt 2 ]]; do
+    # Audit trail first: works at any RUST_LOG level.
+    if _book_active_after "${cc:-0}"; then
+      return 0
+    fi
     if [[ -n "$out" ]] && _grep_after "$out" "$co" "$BOOK_GREP"; then
       return 0
     fi
