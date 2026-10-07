@@ -33,18 +33,27 @@ const LEVELS_COUNT_Q: &str = "count orderbook_levels"; // file-local; never form
 /// Typed-scalar ensureCol — byte-identical with `kdb/start_kdb_server.q`.
 /// Must use `` `long$0N `` (never `` `long$() ``) so `meta` stays `j` on a non-empty HDB.
 const Q_ENSURE_COL_SEQ_NUM: &str = concat!(
-    "ensureCol:{[t;c] if[not c in cols t; t set ![t;();0b;(enlist c)!enlist `long$0N]];};",
+    "ensureCol:{[t;c] if[not c in cols t; ![t;();0b;(enlist c)!enlist `long$0N]];};",
     "ensureCol[`orderbook_levels;`seq_num];",
     "ensureCol[`trades;`seq_num];",
     "ensureCol[`orderbook_snapshots;`seq_num];",
 );
 
-const Q_INIT_LEVELS: &str = "if[not `orderbook_levels in key `; orderbook_levels: ([] time:`timestamp$(); symbol:`symbol$(); side:`char$(); price:`float$(); size:`float$(); action:`char$(); seq_num:`long$()); ];";
-const Q_INIT_TRADES: &str = "if[not `trades in key `; trades: ([] time:`timestamp$(); symbol:`symbol$(); price:`float$(); size:`float$(); seq_num:`long$()); ];";
-const Q_INIT_SNAPSHOTS: &str = "if[not `orderbook_snapshots in key `; orderbook_snapshots: ([] time:`timestamp$(); symbol:`symbol$(); best_bid:`float$(); best_ask:`float$(); best_bid_size:`float$(); best_ask_size:`float$(); spread:`float$(); seq_num:`long$()); ];";
-const Q_INIT_SECURITIES: &str = "if[not `securities in key `; securities: ([] time:`timestamp$(); symbol:`symbol$(); security_id:`symbol$(); exchange:`symbol$(); attributes_json:()); ];";
-const Q_INIT_OWN_TRADES: &str = "if[not `own_trades in key `; own_trades: ([] time:`timestamp$(); symbol:`symbol$(); side:`char$(); last_px:`float$(); last_qty:`float$(); avg_px:`float$(); cl_ord_id:`symbol$(); order_id:`symbol$(); exec_type:`char$()); ];";
-const Q_INIT_CAPTURE_GAPS: &str = "if[not `capture_gaps in key `; capture_gaps: ([] time:`timestamp$(); symbol:`symbol$(); expected_seq:`long$(); received_seq:`long$(); gap_size:`long$()); ];";
+// NOTE: the existence guard MUST be `in key `.` (the root namespace), not
+// `in key ` `. `key ` ` returns the NAMESPACE list -- `q`Q`h`j`o -- which can
+// never contain a table name, so `not `orderbook_levels in key ` ` was always
+// true and these statements re-created every table EMPTY on each connect.
+// Measured against a live q with 1000 rows seeded:
+//   `orderbook_levels in key `  -> 0b      (count after init: 0)
+//   `orderbook_levels in key `. -> 1b      (count after init: 1000)
+// Because saveTables snapshots memory to disk every minute, each wipe reached
+// the HDB within 60s. This is the cause of the unexplained row loss (HFT-057).
+const Q_INIT_LEVELS: &str = "if[not `orderbook_levels in key `.; orderbook_levels: ([] time:`timestamp$(); symbol:`symbol$(); side:`char$(); price:`float$(); size:`float$(); action:`char$(); seq_num:`long$()); ];";
+const Q_INIT_TRADES: &str = "if[not `trades in key `.; trades: ([] time:`timestamp$(); symbol:`symbol$(); price:`float$(); size:`float$(); seq_num:`long$()); ];";
+const Q_INIT_SNAPSHOTS: &str = "if[not `orderbook_snapshots in key `.; orderbook_snapshots: ([] time:`timestamp$(); symbol:`symbol$(); best_bid:`float$(); best_ask:`float$(); best_bid_size:`float$(); best_ask_size:`float$(); spread:`float$(); seq_num:`long$()); ];";
+const Q_INIT_SECURITIES: &str = "if[not `securities in key `.; securities: ([] time:`timestamp$(); symbol:`symbol$(); security_id:`symbol$(); exchange:`symbol$(); attributes_json:()); ];";
+const Q_INIT_OWN_TRADES: &str = "if[not `own_trades in key `.; own_trades: ([] time:`timestamp$(); symbol:`symbol$(); side:`char$(); last_px:`float$(); last_qty:`float$(); avg_px:`float$(); cl_ord_id:`symbol$(); order_id:`symbol$(); exec_type:`char$()); ];";
+const Q_INIT_CAPTURE_GAPS: &str = "if[not `capture_gaps in key `.; capture_gaps: ([] time:`timestamp$(); symbol:`symbol$(); expected_seq:`long$(); received_seq:`long$(); gap_size:`long$()); ];";
 
 /// Escape a string for interpolation into a kdb `` `$"..." `` atom.
 /// Module-level (not `impl KdbWriter`); same body as the former nested helper in main.rs.

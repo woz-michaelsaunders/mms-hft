@@ -34,7 +34,7 @@ loadTables[];
 
 // Widen existing HDB tables with nullable seq_num. Typed scalar `long$0N (never `long$()).
 // Byte-identical with Q_ENSURE_COL_SEQ_NUM in src/kdb_integration.rs.
-ensureCol:{[t;c] if[not c in cols t; t set ![t;();0b;(enlist c)!enlist `long$0N]];};
+ensureCol:{[t;c] if[not c in cols t; ![t;();0b;(enlist c)!enlist `long$0N]];};
 ensureCol[`orderbook_levels;`seq_num];
 ensureCol[`trades;`seq_num];
 ensureCol[`orderbook_snapshots;`seq_num];
