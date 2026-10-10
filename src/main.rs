@@ -7734,7 +7734,14 @@ async fn main() -> Result<()> {
 
     if let Some(ref om_h) = om {
         let mut map = HashMap::new();
+        let mut limit_summary: Vec<String> = Vec::new();
         for row in &config.symbol_limits {
+            limit_summary.push(format!(
+                "{} pos<={} notional<={}",
+                row.symbol.trim(),
+                row.max_position,
+                row.max_notional
+            ));
             map.insert(
                 row.symbol.trim().to_string(),
                 SymbolLimit {
@@ -7743,6 +7750,20 @@ async fn main() -> Result<()> {
                 },
             );
         }
+        // Record the applied limits in startup.log, which is direct file I/O
+        // and therefore independent of RUST_LOG. apply_risk_config itself logs
+        // at info!, and both services run at warn, so the one fact an operator
+        // most needs to confirm -- which risk limits are actually in force --
+        // was invisible. An absent limit and a configured one looked identical.
+        startup_note(&format!(
+            "risk limits applied: symbols=[{}] session_max_drawdown={}",
+            limit_summary.join(", "),
+            config
+                .risk
+                .session_max_drawdown
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "off".to_string()),
+        ));
         om_h.apply_risk_config(map, config.risk.session_max_drawdown);
     }
 
