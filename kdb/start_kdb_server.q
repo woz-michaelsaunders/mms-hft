@@ -78,8 +78,91 @@ saveTables: {
     };
 
 // Tick counter — .z.ts fires every 30 s; save every 2 ticks (1 minute)
+// ---------------------------------------------------------------------------
+// Partitioned, append-only persistence.
+//
+// Replaces saveTables' q `save`, which serialised the WHOLE in-memory table
+// over one flat file. Production reached 60.8M rows / a 2.5GB file, so each
+// save wrote 2,500 MB -- measured 1,003 MB per 15s -- which blocked the q
+// event loop, timed out the writer's liveness probe and dropped market data.
+// Appending costs only the new rows: 0.4 MB to add 10,000 rows to a 2,000,000
+// row partition, 0.43% of a full rewrite.
+//
+// Bookkeeping is by POSITION, not by timestamp. persistedCount[t] is the
+// number of leading rows already written. An earlier version used a
+// `time > watermark` watermark and lost 150,000 of 400,000 rows in testing:
+// the rows shared a timestamp, so the strict comparison treated unwritten rows
+// as written and the trim discarded them. Positions have no ties.
+//
+// Rows are kept in memory for bufferRetain so health checks that look back
+// 5 minutes keep working, and the trim never removes more than
+// persistedCount[t] leading rows, so an unwritten row cannot be dropped.
+//
+// maxPersistRows bounds the copy per tick. On 2026-10-10 an unbounded select
+// over a 60.8M-row backlog needed ~2.5GB on a box with ~400MB free; the OOM
+// killer took q and 13 minutes of capture was lost. A bounded copy catches up
+// over successive ticks instead.
+// ---------------------------------------------------------------------------
+pdbPath: `:kdb/pdb;
+system "mkdir -p kdb/pdb";
+persistedCount: (`symbol$())!(`long$());
+bufferRetain: 00:15:00;
+maxPersistRows: 250000;
+
+persistTable: {[t]
+  tab: value t;
+  n: count tab;
+  k: persistedCount[t];
+  if[null k; k: 0];
+  if[k > n; k: 0];                                   // table was replaced under us
+  // 1. write the next slice of unwritten rows, by position
+  m: min(maxPersistRows; n - k);
+  if[m > 0;
+    chunk: tab[k + til m];
+    {[t;tb;d]
+      (.Q.dd[pdbPath;(`$string d; t; `)]) upsert .Q.en[pdbPath; select from tb where (`date$time)=d]
+    }[t;chunk;] each distinct `date$chunk`time;
+    k: k + m;
+  ];
+  // 2. trim leading rows that are BOTH written and older than the retention
+  //    window. Capped at k, so an unwritten row can never be dropped.
+  keepFrom: .z.p - bufferRetain;
+  old: sum (tab`time) < keepFrom;
+  d2: min(k; old);
+  if[d2 > 0; t set d2 _ tab; k: k - d2];
+  persistedCount[t]: k;
+  };
+
+persistTables: {
+  persistTable each `orderbook_levels`trades`orderbook_snapshots`securities`own_trades`capture_gaps;
+  };
+
+// Count rows on disk without mapping the partitioned DB into this process.
+capturedRows: {[t]
+  ds: key pdbPath;
+  ds: ds where ds <> `sym;
+  sum {[t;d] p: .Q.dd[pdbPath;(d; t; `)]; $[() ~ key p; 0; count get .Q.dd[p;`time]]}[t;] each ds
+  };
+
 saveTickCount: 0;
-saveEveryNTicks: 2;
+// How many 30s ticks between saves, from the environment so it is per instance.
+//
+// saveTables uses q `save`, which serialises the WHOLE in-memory table over a
+// single flat file. Production reached 60.7M rows / a 2.5GB orderbook_levels
+// file, so saving every 2 ticks (60s) meant rewriting 2.5GB every minute --
+// measured at 1,003 MB written per 15s. That blocked the q event loop, timed
+// out the writer's liveness probe, and dropped live market data:
+//
+//   kdb+ connection lost (peer closed or probe timeout)
+//   kdb level buffer overflow (10000 entries) - dropped 5000 oldest entries
+//
+// Raising it to 60 (30 min) on production took writes to 0 MB/30s and made the
+// process responsive again. UAT keeps the 2-tick default; its HDB is 19MB.
+//
+// Mitigation, not a fix. The real fix is to stop rewriting the whole table --
+// a date-partitioned HDB via .Q.dpft -- and to bound the in-memory table. At
+// 830k rows/hour and ~48 bytes/row this box has roughly 30 hours of memory.
+saveEveryNTicks: $[count s: getenv `KDB_SAVE_EVERY_N_TICKS; "I" $ s; 2];
 
 // Note: g# (grouped) attribute is intentionally NOT applied here.
 // On large tables (millions of rows) g# reapplication is O(n) expensive and causes
@@ -108,7 +191,7 @@ insertSnapshot: {[t;s;bb;ba;bbs;bas;sp;seq]
 .z.ts: {
     applyIndexes[];
     saveTickCount+:1;
-    if[0=saveTickCount mod saveEveryNTicks; saveTables[]]
+    if[0=saveTickCount mod saveEveryNTicks; persistTables[]]   // append-only; saveTables[] is kept for manual use only
     };
 
 // Set timer to run every 30 seconds (30000 milliseconds)

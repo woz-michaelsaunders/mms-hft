@@ -10,6 +10,8 @@ WorkingDirectory=/home/ubuntu/fix_server_prod
 Environment=HOME=/home/ubuntu
 Environment=QHOME=/home/ubuntu/q
 Environment=KDB_PORT=5002
+# 30 min between full-snapshot saves; see the comment in start_kdb_server.q
+Environment=KDB_SAVE_EVERY_N_TICKS=2
 ExecStart=/home/ubuntu/q/l64/q kdb/start_kdb_server.q
 Restart=always
 RestartSec=5
