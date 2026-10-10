@@ -39,6 +39,7 @@ MAP=(
   "scripts/rollback-drill.sh|/home/ubuntu/hft-deploy/rollback-drill.sh"
   "scripts/hft-health.sh|/home/ubuntu/hft-health.sh"
   "scripts/check-drift.sh|/home/ubuntu/hft-deploy/check-drift.sh"
+  "scripts/migrate-flat-hdb.q|/home/ubuntu/hft-deploy/migrate-flat-hdb.q"
   "ecosystem.config.js|/home/ubuntu/ecosystem.config.js"
   "mgmt-server/app.py|/home/ubuntu/mgmt-server/app.py"
   "mgmt-server/kdb_ipc.py|/home/ubuntu/mgmt-server/kdb_ipc.py"

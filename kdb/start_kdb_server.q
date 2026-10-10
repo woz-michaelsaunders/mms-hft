@@ -135,6 +135,14 @@ persistTable: {[t]
 
 persistTables: {
   persistTable each `orderbook_levels`trades`orderbook_snapshots`securities`own_trades`capture_gaps;
+  // Every table must exist in every partition or a query spanning dates
+  // fails. A table with no rows on some date creates no directory, and the
+  // whole DB then refuses to load:
+  //   './2026.10.08/securities/time. OS reports: No such file or directory'
+  // Found migrating the archive, where securities had no rows on 10.08.
+  // .Q.chk fills the gaps with empty tables; it is a directory scan, cheap
+  // next to the writes.
+  @[.Q.chk; pdbPath; {[e] -1 "WARN .Q.chk failed: ", e}];
   };
 
 // Count rows on disk without mapping the partitioned DB into this process.

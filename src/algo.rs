@@ -126,7 +126,15 @@ pub fn default_max_spread_frac() -> f64 { 0.05 }
 pub fn default_max_mid_jump_frac() -> f64 { 0.10 }
 pub fn default_min_signal_interval_ms() -> u64 { 500 }
 pub fn default_max_book_staleness_ms() -> u64 { 2000 }
-pub fn default_max_orders_session() -> u64 { 0 }
+/// Orders per process run before the circuit breaker halts placement.
+///
+/// This defaulted to 0, and 0 means UNLIMITED -- so the circuit breaker was
+/// off unless someone remembered to set it, on both UAT and production. A
+/// safety limit that defaults to absent is not a safety limit.
+///
+/// 100 is a floor, not a recommendation: enough to exercise the order path,
+/// small enough that a runaway loop stops. Set it deliberately per deployment.
+pub fn default_max_orders_session() -> u64 { 100 }
 
 impl Default for AlgoConfig {
     fn default() -> Self {
