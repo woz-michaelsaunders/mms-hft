@@ -10411,6 +10411,92 @@ mod connectivity_tests {
         Ok(())
     }
 
+    /// The OMS hard limits DEPLOYED on 2026-10-10, driven through the real
+    /// submission path against the mock gateway.
+    ///
+    /// This exists because the limits cannot be exercised against the venue:
+    /// paper_mode is permanently true so the algo never submits, there is no
+    /// order-entry API route, and the console is read-only. The mock gateway is
+    /// the only way to put a real 35=D through new_order_single_from_request,
+    /// which is where reject_if_operator_halt and reject_if_exposure_breach sit.
+    ///
+    /// Each case uses a fresh session so an accrued position from an earlier
+    /// case cannot change the next one's verdict.
+    #[tokio::test]
+    async fn e2e_deployed_limits_reject_breaches() -> Result<()> {
+        // exactly what is in both config.toml files
+        fn deployed_limits() -> HashMap<String, SymbolLimit> {
+            let mut m = HashMap::new();
+            m.insert(
+                "BTC_USDT".to_string(),
+                SymbolLimit { max_position: 0.02, max_notional: 2000.0 },
+            );
+            m
+        }
+
+        async fn armed_session(port: u16) -> Result<FIXSession> {
+            let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+            connect_and_logon(&session, port).await?;
+            session.apply_risk_config(deployed_limits(), Some(100.0));
+            Ok(session)
+        }
+
+        let orders_received = Arc::new(Mutex::new(0u64));
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig {
+                orders_received: Some(Arc::clone(&orders_received)),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        // 1. within both caps -> accepted. 0.01 BTC at 83,000 = 830 notional.
+        let s1 = armed_session(port).await?;
+        s1.new_order_single("LIM_OK", "BTC_USDT", '1', 0.01, 83_000.0, None, None, None)
+            .await
+            .expect("an order inside both caps must be accepted");
+
+        // 2. over max_position, priced low so notional cannot be the cause.
+        let s2 = armed_session(port).await?;
+        let r = s2
+            .new_order_single("LIM_POS", "BTC_USDT", '1', 0.03, 1.0, None, None, None)
+            .await;
+        assert!(r.is_err(), "0.03 BTC exceeds max_position 0.02 and must be rejected");
+
+        // 3. over max_notional while inside max_position.
+        //    0.01 BTC at 300,000 = 3,000 > 2,000.
+        let s3 = armed_session(port).await?;
+        let r = s3
+            .new_order_single("LIM_NOT", "BTC_USDT", '1', 0.01, 300_000.0, None, None, None)
+            .await;
+        assert!(r.is_err(), "3,000 notional exceeds max_notional 2,000 and must be rejected");
+
+        // 4. a symbol absent from the table must FAIL CLOSED, not default to
+        //    unlimited. Production subscribes to three symbols; anything else
+        //    reaching the order path is a bug, and must not be tradeable.
+        let s4 = armed_session(port).await?;
+        let r = s4
+            .new_order_single("LIM_UNK", "ETH_USDT", '1', 0.001, 2_000.0, None, None, None)
+            .await;
+        assert!(r.is_err(), "a symbol not in symbol_limits must be rejected");
+
+        // 5. the kill switch must block submission even when the order is
+        //    comfortably inside every limit, and allow it again after reset.
+        let s5 = armed_session(port).await?;
+        s5.trigger_operator_halt().await;
+        let r = s5
+            .new_order_single("LIM_HALT", "BTC_USDT", '1', 0.001, 83_000.0, None, None, None)
+            .await;
+        assert!(r.is_err(), "submission must be rejected while halted");
+        s5.reset_operator_halt();
+        s5.new_order_single("LIM_RESUME", "BTC_USDT", '1', 0.001, 83_000.0, None, None, None)
+            .await
+            .expect("submission must resume after reset");
+
+        Ok(())
+    }
+
     /// Operator Kill Switch: freeze, flatten every resting order with 35=F,
     /// reject further 35=D until reset, then resume submission.
     #[tokio::test]
