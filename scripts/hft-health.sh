@@ -146,6 +146,69 @@ check_dump_drift(){
   return 0
 }
 
+check_persistence_advancing(){
+  # Is kdb+ actually WRITING to the partitioned DB, or only buffering?
+  #
+  # Since 2026-10-10 capture keeps a 15-minute in-memory buffer and appends to
+  # date partitions every 60s. Nothing noticed if that append stalled: the
+  # buffer would keep filling, `count orderbook_levels` would look healthy, and
+  # the data would be lost on the next restart. The old failure mode was loud
+  # (2.5GB rewrites blocking the event loop); this one is silent.
+  #
+  # Advisory, never a heal: a stalled writer needs diagnosis, and restarting
+  # kdb+ would discard exactly the un-persisted buffer we are worried about.
+  local q=/home/ubuntu/q/l64/q
+  [ -x "$q" ] || return 0
+  [ -f /home/ubuntu/fix_server_prod/config.toml ] || return 0
+
+  # Port is injectable purely so the stall path is testable: live capture moves
+  # too fast to hold the on-disk count still, so the warning branch can only be
+  # exercised against a stub.
+  local port="${HEALTH_KDB_PORT:-5002}"
+  local tmp out
+  tmp=$(mktemp /tmp/hft-health-persist.XXXXXX.q) || return 0
+  cat > "$tmp" <<QEOF
+h: hopen \`::${port};
+show (h"capturedRows[\`orderbook_levels]"; h"count orderbook_levels");
+hclose h; exit 0;
+QEOF
+  out=$(cd /home/ubuntu/fix_server_prod && timeout 25 "$q" "$tmp" 2>/dev/null | tr -d '\n')
+  rm -f "$tmp"
+  [ -n "${out:-}" ] || { log "WARN production kdb+ (5002) did not answer capturedRows -- cannot confirm persistence"; return 0; }
+
+  # out looks like: 2577933 170984
+  local disk buf
+  disk=$(printf '%s' "$out" | tr -dc '0-9 ' | awk '{print $1}')
+  buf=$(printf '%s'  "$out" | tr -dc '0-9 ' | awk '{print $2}')
+  case "${disk:-}" in ''|*[!0-9]*) return 0 ;; esac
+  case "${buf:-}"  in ''|*[!0-9]*) return 0 ;; esac
+
+  # Require CONSECUTIVE stalls before warning. This timer runs every minute and
+  # persistence appends every 60s, so two samples can land inside one persist
+  # cycle and show no movement perfectly legitimately. Warning on a single
+  # sample made this check cry wolf on its very first run, and a check that
+  # cries wolf gets ignored -- which is worse than not having it.
+  local state=/home/ubuntu/fix_server_prod/.persist-last-disk
+  local prev="" stalls=0
+  if [ -f "$state" ]; then
+    prev=$(awk '{print $1}' "$state" 2>/dev/null | tr -dc '0-9')
+    stalls=$(awk '{print $2+0}' "$state" 2>/dev/null)
+  fi
+  case "${stalls:-}" in ''|*[!0-9]*) stalls=0 ;; esac
+
+  if [ -n "$prev" ] && [ "$disk" -eq "$prev" ] && [ "$buf" -gt 0 ]; then
+    stalls=$((stalls + 1))
+  else
+    stalls=0
+  fi
+  printf '%s %s\n' "$disk" "$stalls" > "$state"
+
+  if [ "$stalls" -ge 3 ]; then
+    log "WARN kdb+ persistence has not advanced across $stalls consecutive checks (on disk $disk, buffer $buf un-persisted) -- appends may be stalled"
+  fi
+  return 0
+}
+
 check_books_two_sided(){
   # Is PRODUCTION actually capturing two-sided market data?
   #
@@ -242,6 +305,7 @@ check_dump_drift
 check_deploy_unconfirmed
 check_expected_apps
 check_books_two_sided
+check_persistence_advancing
 
 PREV=$(cat "$STATE" 2>/dev/null | head -1 || echo unknown)
 
