@@ -1506,6 +1506,60 @@ fn command_log_msg_type_name(msg_type: char) -> &'static str {
     }
 }
 
+/// Longest ClOrdID (tag 11) this system will emit.
+///
+/// Crypto.com silently ignores an over-length ClOrdID: no ExecutionReport, no
+/// OrderCancelReject, nothing. Measured on UAT 2026-10-17 with two
+/// OrderCancelRequests for the same order, identical in every tag except the
+/// ClOrdID:
+///
+///   11=HALT_aaaaaaaabbbbbbbbccccccccdddddddd  (37 chars) -> no response, order stayed live
+///   11=CANCEL_CID_01                          (13 chars) -> 150=6 then 150=4, cancelled
+///
+/// Every ClOrdID the venue has ever answered is <= 16 characters.
+///
+/// This mattered because `HALT_` + `Uuid::simple()` and `ALGO_` +
+/// `Uuid::simple()` are both 37 characters. The operator kill switch reported
+/// `cancel_ok: 1, cancel_failed: 0` while the order remained live at the
+/// venue, and every algo order would have been dropped the same way had order
+/// entry been switched on.
+pub(crate) const MAX_CL_ORD_ID_LEN: usize = 16;
+
+/// Build a ClOrdID that the venue will actually accept: `prefix` plus as much
+/// uuid hex as fits in MAX_CL_ORD_ID_LEN. With a 5-character prefix that
+/// leaves 11 hex characters, which is 44 bits of entropy -- ample for
+/// distinguishing orders and cancels, and short enough to be answered.
+/// Refuse to emit a ClOrdID the venue will silently ignore.
+///
+/// Truncating would be worse than failing: local state would record the long
+/// id while the venue saw a shorter one, so every later cancel or amend would
+/// reference an id the venue never knew. Fail loudly at the point of
+/// emission, so no call site can reintroduce the 2026-10-17 defect by
+/// building a ClOrdID with format! directly.
+pub(crate) fn validate_cl_ord_id(id: &str) -> Result<()> {
+    if id.is_empty() {
+        bail!("ClOrdID is empty");
+    }
+    if id.len() > MAX_CL_ORD_ID_LEN {
+        bail!(
+            "ClOrdID {:?} is {} chars, over the venue limit of {}; it would be silently ignored (no ack, no reject)",
+            id, id.len(), MAX_CL_ORD_ID_LEN
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn new_cl_ord_id(prefix: &str) -> String {
+    let prefix = if prefix.len() >= MAX_CL_ORD_ID_LEN {
+        &prefix[..MAX_CL_ORD_ID_LEN]
+    } else {
+        prefix
+    };
+    let hex = uuid::Uuid::new_v4().simple().to_string();
+    let room = MAX_CL_ORD_ID_LEN - prefix.len();
+    format!("{}{}", prefix, &hex[..room.min(hex.len())])
+}
+
 fn is_om_command_log(sender_id: &str, target_id: &str) -> bool {
     sender_id.contains(".UD") || target_id.contains(".UD")
 }
@@ -2087,6 +2141,7 @@ impl FIXSession {
         let mut msg = FIXMessage::new('H', &self.sender_comp_id, &self.target_comp_id, seq_num);
 
         // Required fields for Order Status Request
+        validate_cl_ord_id(cl_ord_id)?;
         msg.set_field(tags::CL_ORD_ID, cl_ord_id);
         msg.set_field(tags::SYMBOL, symbol);
         msg.set_field(tags::TRANSACT_TIME, &FIXMessage::timestamp());
@@ -2255,7 +2310,7 @@ impl FIXSession {
 
         for order in &snapshot {
             let req = CancelOrderRequest {
-                cl_ord_id: format!("HALT_{}", uuid::Uuid::new_v4().simple()),
+                cl_ord_id: new_cl_ord_id("HALT_"),
                 orig_cl_ord_id: order.cl_ord_id.clone(),
                 symbol: order.symbol.clone(),
                 side: order.side.clone(),
@@ -2295,6 +2350,7 @@ impl FIXSession {
         let mut msg = FIXMessage::new('F', &self.sender_comp_id, &self.target_comp_id, seq_num);
 
         // Required fields for Order Cancel Request
+        validate_cl_ord_id(&cancel_request.cl_ord_id)?;
         msg.set_field(tags::CL_ORD_ID, &cancel_request.cl_ord_id);
         msg.set_field(tags::ORIG_CL_ORD_ID, &cancel_request.orig_cl_ord_id);
         msg.set_field(tags::SYMBOL, &cancel_request.symbol);
@@ -2349,6 +2405,7 @@ impl FIXSession {
         let seq_num = self.next_seq_num().await;
         let mut msg = FIXMessage::new('G', &self.sender_comp_id, &self.target_comp_id, seq_num);
 
+        validate_cl_ord_id(&request.cl_ord_id)?;
         msg.set_field(tags::CL_ORD_ID, &request.cl_ord_id);
         msg.set_field(tags::ORIG_CL_ORD_ID, &request.orig_cl_ord_id);
         msg.set_field(tags::SYMBOL, &request.symbol);
@@ -2408,6 +2465,7 @@ impl FIXSession {
         let mut msg = FIXMessage::new('D', &self.sender_comp_id, &self.target_comp_id, seq_num);
 
         // Required fields
+        validate_cl_ord_id(&order.cl_ord_id)?;
         msg.set_field(tags::CL_ORD_ID, &order.cl_ord_id);
         msg.set_field(tags::SYMBOL, &order.symbol);
         msg.set_field(tags::SIDE, &order.side.to_string());
@@ -9469,7 +9527,7 @@ mod connectivity_tests {
         // is_ready() is a cached flag and stays true across a peer-side close,
         // so prove liveness with traffic instead: an order can only be
         // acknowledged if the connection actually survived the probe.
-        let cl_ord_id = "E2E_TEST_REQ_PROBE";
+        let cl_ord_id = "E2E_REQ_PROBE";
         session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0, None, None, None).await?;
         let report = pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
@@ -9491,11 +9549,11 @@ mod connectivity_tests {
         let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
         connect_and_logon(&session, port).await?;
 
-        let cl_ord_id = "E2E_TEST_ORDER_CXL";
+        let cl_ord_id = "E2E_ORDER_CXL";
         session.new_order_single(cl_ord_id, "BTC_USDT", '1', 1.0, 100.0, None, None, None).await?;
         pump_messages(&session, Duration::from_secs(3), |msg| msg.msg_type == '8').await?;
 
-        let replace_id = "E2E_TEST_ORDER_REPL";
+        let replace_id = "E2E_ORD_REPL";
         session
             .order_cancel_replace_request(&ReplaceOrderRequest {
                 cl_ord_id: replace_id.to_string(),
@@ -9518,7 +9576,7 @@ mod connectivity_tests {
         }
 
         let cancel_req = CancelOrderRequest {
-            cl_ord_id: "E2E_TEST_ORDER_CXL2".to_string(),
+            cl_ord_id: "E2E_ORD_CXL2".to_string(),
             orig_cl_ord_id: replace_id.to_string(),
             symbol: "BTC_USDT".to_string(),
             side: "1".to_string(),
@@ -9536,11 +9594,11 @@ mod connectivity_tests {
         );
         // A fully canceled order (LeavesQty=0) is removed from the
         // open-orders store, since it's no longer open.
-        assert!(session.open_orders.snapshot().get("E2E_TEST_ORDER_CXL2").is_none());
+        assert!(session.open_orders.snapshot().get("E2E_ORD_CXL2").is_none());
 
         cleanup_processed(cl_ord_id);
         cleanup_processed(replace_id);
-        cleanup_processed("E2E_TEST_ORDER_CXL2");
+        cleanup_processed("E2E_ORD_CXL2");
         Ok(())
     }
 
@@ -10495,6 +10553,40 @@ mod connectivity_tests {
             .expect("submission must resume after reset");
 
         Ok(())
+    }
+
+    /// Every ClOrdID we emit must fit MAX_CL_ORD_ID_LEN.
+    ///
+    /// Crypto.com silently ignores an over-length tag 11 -- no ack, no reject.
+    /// On 2026-10-17 the kill switch sent a 37-character ClOrdID
+    /// ("HALT_" + Uuid::simple()), the venue never answered, and
+    /// trigger_operator_halt still reported cancel_ok: 1 while the order
+    /// stayed live. The algo had the same 37-character shape, so every algo
+    /// order would have been dropped the same way.
+    #[test]
+    fn cl_ord_ids_fit_the_venue_limit() {
+        for prefix in ["HALT_", "ALGO_", "", "X"] {
+            for _ in 0..200 {
+                let id = new_cl_ord_id(prefix);
+                assert!(
+                    id.len() <= MAX_CL_ORD_ID_LEN,
+                    "ClOrdID {:?} is {} chars, over the {} limit",
+                    id, id.len(), MAX_CL_ORD_ID_LEN
+                );
+                assert!(id.starts_with(prefix), "{:?} lost its prefix {:?}", id, prefix);
+            }
+        }
+        // a prefix longer than the limit must still produce a legal id
+        let long = new_cl_ord_id("THIS_PREFIX_IS_FAR_TOO_LONG_");
+        assert!(long.len() <= MAX_CL_ORD_ID_LEN);
+    }
+
+    /// Distinct enough that two cancels in the same session cannot collide.
+    #[test]
+    fn cl_ord_ids_are_unique() {
+        let ids: std::collections::HashSet<String> =
+            (0..5000).map(|_| new_cl_ord_id("HALT_")).collect();
+        assert_eq!(ids.len(), 5000, "ClOrdID collision within 5000 draws");
     }
 
     /// Operator Kill Switch: freeze, flatten every resting order with 35=F,

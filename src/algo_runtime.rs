@@ -197,7 +197,8 @@ pub async fn run(
 
             // Place the order via the FIX order session
             let side_char = signal.side.chars().next().unwrap_or('1');
-            let cl_ord_id = format!("ALGO_{}", uuid::Uuid::new_v4().simple());
+            // Must fit MAX_CL_ORD_ID_LEN; the venue silently drops longer ones.
+            let cl_ord_id = crate::new_cl_ord_id("ALGO_");
             match order_session
                 .new_order_single(
                     &cl_ord_id,
