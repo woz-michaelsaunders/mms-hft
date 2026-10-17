@@ -37,8 +37,41 @@ REASON=""
 
 check_process(){
   local pid
-  pid=$(pgrep -f "$LIVE/target/release/fix_server" | head -1 || true)
-  if [ -z "$pid" ]; then REASON="no fix_server process"; return 1; fi
+  # Ask pm2 which pid belongs to THIS app, rather than pattern-matching the
+  # binary path.
+  #
+  # fix-server and fix-server-prod execute the SAME binary from the same path
+  # -- /home/ubuntu/fix_server/target/release/fix_server -- and are told apart
+  # only by prod's `--config /home/ubuntu/fix_server_prod/config.toml` and its
+  # working directory. `pgrep -f "$LIVE/target/release/fix_server" | head -1`
+  # therefore matched BOTH and returned the lower pid, which is whichever has
+  # been up longer: in practice production.
+  #
+  # Measured 2026-10-17 15:50: this script reported "fix-server healthy (pid
+  # 1235300, up 4668s)" while the real fix-server was pid 1719037, 55s old,
+  # having just been restarted sixty times by the rollback drill. 1235300 was
+  # fix-server-prod.
+  #
+  # Two consequences. A dead fix-server would still satisfy this check as long
+  # as production was alive (check_expected_apps would still catch it, so the
+  # watchdog was not blind, but this check was lying). And UPTIME_SEC was
+  # production's, so MIN_UPTIME_SEC could never defer a check for a
+  # fix-server that had only just restarted -- the settle window silently did
+  # nothing.
+  pid=$(pm2 jlist 2>/dev/null | "$PYTHON_BIN" -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for p in data if isinstance(data, list) else []:
+    if p.get("name") == "fix-server":
+        v = p.get("pid")
+        if v:
+            print(v)
+        break
+' 2>/dev/null || true)
+  if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then REASON="no fix_server process"; return 1; fi
   PID=$pid
   local up
   up=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
