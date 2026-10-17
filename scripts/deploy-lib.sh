@@ -137,6 +137,112 @@ _lib_grep_after() {
   return "$rc"
 }
 
+# The OS pid of the running app. pm2 reports this at the TOP level of each
+# jlist entry, not inside pm2_env (where it is present but always null), so
+# _lib_pm2_env_field cannot read it -- that returns empty and would fail the
+# serving check closed on every deploy.
+_lib_pm2_pid() {
+  pm2 jlist 2>/dev/null | "$PYTHON" -c '
+import json, sys
+name = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(data, list):
+    sys.exit(0)
+for p in data:
+    if p.get("name") == name:
+        v = p.get("pid")
+        print("" if v is None else v)
+        break
+' "$PM2_APP"
+}
+
+# Epoch-ms at which the CURRENTLY RUNNING pm2 process started.
+#
+# This is the anchor the serving check needs. A byte offset into the audit
+# trail cannot distinguish the incoming process from the outgoing one: a pm2
+# reload is graceful, so the process being replaced keeps writing market data
+# into the same fix_commands.log for a second or more after the cursor is
+# taken, and production writes ~155k of those lines an hour.
+#
+# /proc is used rather than startup.log because it cannot be truncated out
+# from under us (hft-health.sh empties startup.log before healing) and needs
+# no parsing agreement with the application. Field 22 of /proc/PID/stat is the
+# process start in clock ticks since boot; /proc/stat btime is the boot epoch.
+_lib_proc_start_ms() {
+  local pid=$1
+  [[ -n "$pid" && "$pid" != "0" ]] || return 1
+  "$PYTHON" - "$pid" <<'PYEOF' 2>/dev/null
+import os, sys
+pid = sys.argv[1]
+try:
+    with open(f"/proc/{pid}/stat") as f:
+        after_comm = f.read().rsplit(") ", 1)[1].split()
+    ticks = int(after_comm[19])                      # field 22 overall
+    hz = os.sysconf("SC_CLK_TCK")
+    btime = 0
+    with open("/proc/stat") as f:
+        for line in f:
+            if line.startswith("btime "):
+                btime = int(line.split()[1])
+                break
+    if not btime:
+        raise SystemExit(1)
+    print(int((btime + ticks / hz) * 1000))
+except Exception:
+    raise SystemExit(1)
+PYEOF
+}
+
+# True when the audit trail shows the NEW process serving.
+#
+# $1 file, $2 byte offset to start scanning from, $3 epoch-ms the new process
+# started. Only lines whose own timestamp is at or after $3 count, so output
+# from the retired process can never satisfy the gate.
+#
+# The offset is a performance hint only (the trail reaches 100MB); correctness
+# rests entirely on the timestamp. If the file shrank the scan restarts at 0.
+_lib_audit_serving_since() {
+  local file=$1 offset=$2 since_ms=$3
+  [[ -f "$file" ]] || return 1
+  [[ -n "$since_ms" ]] || return 1
+  "$PYTHON" - "$file" "$offset" "$since_ms" "$COMMAND_LOG_GREP" "$COMMAND_LOG_GREP_ALT" <<'PYEOF'
+import datetime, os, sys
+path, offset, since_ms = sys.argv[1], int(sys.argv[2] or 0), int(sys.argv[3])
+needles = [n for n in sys.argv[4:] if n]
+try:
+    size = os.path.getsize(path)
+except OSError:
+    raise SystemExit(1)
+if offset > size:          # rotated or truncated since the cursor was taken
+    offset = 0
+found = 1
+with open(path, "r", errors="replace") as f:
+    f.seek(offset)
+    f.readline()           # the first line may be partial; the next poll gets it
+    for line in f:
+        if not line.startswith("["):
+            continue
+        end = line.find("]")
+        if end < 0:
+            continue
+        stamp = line[1:end].replace(" UTC", "").strip()
+        try:
+            ts = datetime.datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S.%f")
+        except ValueError:
+            continue
+        ts = ts.replace(tzinfo=datetime.timezone.utc)
+        if ts.timestamp() * 1000 < since_ms:
+            continue
+        if any(n in line for n in needles):
+            found = 0
+            break
+raise SystemExit(found)
+PYEOF
+}
+
 _lib_write_cursor() {
   # Deploys must write a cursor too. This used to return early unless a drill
   # was running, while health_check fell back to reading
@@ -539,31 +645,50 @@ health_check() {
     echo "health_check: ACKs in err (whole file): $(grep -cF -- "$LOGON_GREP" "$err" 2>/dev/null || echo 0)" >&2
   fi
 
+  # Anchor every piece of evidence to the process that is running NOW.
+  #
+  # Before 2026-10-17 this loop accepted anything appearing after a byte
+  # cursor, in the audit trail or in either pm2 log. All three are shared
+  # across a reload, and a reload is graceful, so the outgoing process could
+  # satisfy the gate on its way out. Measured in drill run
+  # 20261017T151306Z-1427385: case 3 deploys a config whose every host is
+  # 127.0.0.1:1 and whose process can emit no FIX traffic at all, yet
+  # deploy.sh returned exit 0 in 18s -- 9,616 bytes were already past the
+  # cursor when the check first looked, written by the process being retired.
+  # "Serving confirmed" meant nothing in that run.
+  local new_pid new_start_ms
+  new_pid=$(_lib_pm2_pid)
+  new_start_ms=$(_lib_proc_start_ms "$new_pid" || true)
+  echo "health_check: anchoring on pid=${new_pid:-?} start_ms=${new_start_ms:-UNKNOWN}" >&2
+
   local waited=0
   local logon=0
-  while [[ "$waited" -lt "$LOGON_WAIT_S" ]]; do
-    # Audit trail first: independent of RUST_LOG, so this is the check that
-    # still works once fix-server runs at `warn`.
-    if [[ -n "${COMMAND_LOG:-}" && -f "${COMMAND_LOG}" ]] \
-       && { _lib_grep_after "$COMMAND_LOG" "${cursor_cmd:-0}" "$COMMAND_LOG_GREP" 0 \
-            || _lib_grep_after "$COMMAND_LOG" "${cursor_cmd:-0}" "$COMMAND_LOG_GREP_ALT" 0; }; then
-      logon=1
-      break
-    fi
-    if [[ -n "$out" ]] && _lib_grep_after "$out" "${cursor_out:-0}" "$LOGON_GREP" 0; then
-      logon=1
-      break
-    fi
-    if [[ -n "$err" ]] && _lib_grep_after "$err" "${cursor_err:-0}" "$LOGON_GREP" 0; then
-      logon=1
-      break
-    fi
-    sleep 2
-    waited=$((waited + 2))
-  done
+  if [[ -z "$new_start_ms" ]]; then
+    # Fail closed. Without an anchor the only evidence available is evidence
+    # we have just proven can come from the wrong process, and no_logon
+    # reports rather than rolling back, so this is the safe direction.
+    echo "ERROR: health_check: cannot read the start time of pm2 pid '${new_pid:-}' — refusing to confirm serving" >&2
+  else
+    while [[ "$waited" -lt "$LOGON_WAIT_S" ]]; do
+      # The audit trail is the only source of truth here: it is written by
+      # direct file I/O, so it survives RUST_LOG=warn, and the timestamp
+      # filter ties it to this process. The pm2 logs are kept as diagnostics
+      # below but no longer decide the outcome.
+      if [[ -n "${COMMAND_LOG:-}" && -f "${COMMAND_LOG}" ]] \
+         && _lib_audit_serving_since "$COMMAND_LOG" "${cursor_cmd:-0}" "$new_start_ms"; then
+        logon=1
+        break
+      fi
+      sleep 2
+      waited=$((waited + 2))
+    done
+  fi
   if [[ "$logon" -eq 0 ]]; then
-    echo "ERROR: no Logon ACK (35=A) after the reload cursor — serving NOT CONFIRMED" >&2
+    echo "ERROR: no Logon ACK (35=A) from pid ${new_pid:-?} itself — serving NOT CONFIRMED" >&2
     echo "       (not rolling back: a venue outage and a broken binary look alike here)" >&2
+    echo "       NOTE: counts below are for the WHOLE file and include the process this" >&2
+    echo "       deploy replaced. Only evidence timestamped at or after the running" >&2
+    echo "       process started (${new_start_ms:-unknown}) confirms serving." >&2
     echo "       diagnostics: err=[${err}] size=$(_lib_file_size "${err:-/dev/null}") cursor_err=${cursor_err:-0} waited=${waited}s" >&2
     if [[ -n "$err" ]]; then
       echo "       ACKs in err at give-up: $(grep -cF -- "$LOGON_GREP" "$err" 2>/dev/null || echo 0)" >&2
