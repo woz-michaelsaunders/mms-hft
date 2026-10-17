@@ -3211,6 +3211,41 @@ impl FIXSession {
                         self.open_orders.remove_order(&cl_ord_id_owned);
                     }
 
+                    // A cancel or replace ExecutionReport identifies the order it
+                    // ACTED ON by OrigClOrdID (41). ClOrdID (11) carries the id of
+                    // the cancel/replace request itself, which was never in the
+                    // book. Keying removal off 11 alone therefore left the original
+                    // order working forever.
+                    //
+                    // Measured on UAT 2026-10-17: the venue returned
+                    //   11=HALT_d803950a633 41=KILLTEST_01 150=4 39=4 151=0
+                    // and /api/open-orders still reported KILLTEST_01 as
+                    // ord_status 0, leaves_qty 0.001. Four separate orders were
+                    // confirmed cancelled at the venue and all four stayed in the
+                    // local book.
+                    //
+                    // This matters beyond display: reject_if_exposure_breach
+                    // computes projected position from this book, so a stale entry
+                    // makes the risk cap reason about a position that does not
+                    // exist.
+                    //
+                    // Only 4 (Cancelled) and 5 (Replaced) retire the original.
+                    // 6 (Pending Cancel) must NOT: the original is still working
+                    // until the venue confirms.
+                    let orig_cl_ord_id = msg.get_field(tags::ORIG_CL_ORD_ID).unwrap_or_default();
+                    if !orig_cl_ord_id.is_empty() && orig_cl_ord_id != cl_ord_id_owned {
+                        let ord_status_39 = msg.get_field(tags::ORD_STATUS).unwrap_or_default();
+                        let retires_original = matches!(exec_type, "4" | "5")
+                            || matches!(ord_status_39, "4" | "5");
+                        if retires_original {
+                            info!(
+                                "order {} retired by {} (ExecType={} OrdStatus={}); removing from the open-order book",
+                                orig_cl_ord_id, cl_ord_id_owned, exec_type, ord_status_39
+                            );
+                            self.open_orders.remove_order(orig_cl_ord_id);
+                        }
+                    }
+
                     // Typed event mapping (AC3): ExecType (150) is authoritative, with
                     // OrdStatus (39) — distinct from the EXEC_STATUS(150) alias used
                     // above for legacy display — as a fallback for venues that only
@@ -10587,6 +10622,109 @@ mod connectivity_tests {
         let ids: std::collections::HashSet<String> =
             (0..5000).map(|_| new_cl_ord_id("HALT_")).collect();
         assert_eq!(ids.len(), 5000, "ClOrdID collision within 5000 draws");
+    }
+
+    /// A cancel confirmation must retire the ORIGINAL order, not the cancel.
+    ///
+    /// On UAT 2026-10-17 the venue cancelled four orders (39=4, leaves 0) and
+    /// /api/open-orders kept reporting all four as working, because removal
+    /// was keyed off ClOrdID (11) -- the cancel request's own id -- rather
+    /// than OrigClOrdID (41).
+    ///
+    /// This drives the real path: a 35=F to the gateway, whose 35=8 reply
+    /// carries 11=<cancel id> and 41=<original>. An earlier version of this
+    /// test injected a synthetic report with an arbitrary MsgSeqNum; the
+    /// sequencer saw a gap and dropped it before the '8' arm ever ran, so the
+    /// test exercised nothing.
+    #[tokio::test]
+    async fn cancel_confirmation_retires_the_original_order() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig::default(),
+        )
+        .await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        session
+            .new_order_single("CXLSYNC_ORD", "BTC_USDT", '1', 1.0, 100.0, None, None, None)
+            .await?;
+        pump_messages(&session, Duration::from_secs(3), |m| m.msg_type == '8').await?;
+        assert!(
+            session.open_orders.snapshot().contains_key("CXLSYNC_ORD"),
+            "the order should be working before the cancel"
+        );
+
+        session
+            .cancel_order(&CancelOrderRequest {
+                cl_ord_id: "CXLSYNC_CXL".to_string(),
+                orig_cl_ord_id: "CXLSYNC_ORD".to_string(),
+                symbol: "BTC_USDT".to_string(),
+                side: "1".to_string(),
+            })
+            .await?;
+        let confirm = pump_messages(&session, Duration::from_secs(3), |m| {
+            m.msg_type == '8' && m.get_field(tags::ORIG_CL_ORD_ID) == Some("CXLSYNC_ORD")
+        })
+        .await?
+        .expect("the gateway must answer 35=F with a cancel ExecutionReport");
+        assert_eq!(confirm.get_field(tags::ORD_STATUS), Some("4"), "OrdStatus should be Canceled");
+        assert_eq!(
+            confirm.get_field(tags::CL_ORD_ID),
+            Some("CXLSYNC_CXL"),
+            "the report is keyed on the CANCEL's id -- that is the whole bug"
+        );
+
+        let book = session.open_orders.snapshot();
+        assert!(
+            !book.contains_key("CXLSYNC_ORD"),
+            "the ORIGINAL order must be gone after 39=4; book still holds {:?}",
+            book.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !book.contains_key("CXLSYNC_CXL"),
+            "the cancel request must never become a book entry of its own"
+        );
+        Ok(())
+    }
+
+    /// Pending Cancel (39=6) must NOT retire the original: it is still working
+    /// until the venue confirms.
+    ///
+    /// The mock gateway always confirms outright, so this one report is
+    /// synthesised -- but at the sequence number the session actually expects
+    /// next, or the sequencer drops it and the assertion passes vacuously.
+    #[tokio::test]
+    async fn pending_cancel_leaves_the_original_working() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig::default(),
+        )
+        .await?;
+        let session = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&session, port).await?;
+
+        session
+            .new_order_single("PENDCXL_ORD", "BTC_USDT", '1', 1.0, 100.0, None, None, None)
+            .await?;
+        let ack = pump_messages(&session, Duration::from_secs(3), |m| m.msg_type == '8')
+            .await?
+            .expect("the gateway must acknowledge the order");
+
+        let mut er = FIXMessage::new('8', "MOCK.VENUE", "TEST.CLIENT", ack.seq_num + 1);
+        er.set_field(tags::CL_ORD_ID, "PENDCXL_CXL");
+        er.set_field(tags::ORIG_CL_ORD_ID, "PENDCXL_ORD");
+        er.set_field(tags::EXEC_STATUS, "6");   // ExecType  = Pending Cancel
+        er.set_field(tags::ORD_STATUS, "6");    // OrdStatus = Pending Cancel
+        er.set_field(tags::LEAVES_QTY, "1.0");
+        er.set_field(tags::SYMBOL, "BTC_USDT");
+        session.handle_message(&er).await?;
+
+        assert!(
+            session.open_orders.snapshot().contains_key("PENDCXL_ORD"),
+            "Pending Cancel must leave the original working"
+        );
+        Ok(())
     }
 
     /// Operator Kill Switch: freeze, flatten every resting order with 35=F,
