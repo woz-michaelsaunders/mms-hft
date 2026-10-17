@@ -1551,30 +1551,48 @@ fn command_log_msg_type_name(msg_type: char) -> &'static str {
     }
 }
 
-/// Longest ClOrdID (tag 11) this system will emit.
+/// The venue's hard limit on ClOrdID (tag 11), established empirically.
 ///
 /// Crypto.com silently ignores an over-length ClOrdID: no ExecutionReport, no
-/// OrderCancelReject, nothing. Measured on UAT 2026-10-17 with two
-/// OrderCancelRequests for the same order, identical in every tag except the
-/// ClOrdID:
+/// OrderCancelReject, nothing at all. There is no documented limit, so it was
+/// bisected against the UAT venue on 2026-10-17 with NewOrderSingles identical
+/// in every tag except the length of ClOrdID (HFT-063):
 ///
-///   11=HALT_aaaaaaaabbbbbbbbccccccccdddddddd  (37 chars) -> no response, order stayed live
-///   11=CANCEL_CID_01                          (13 chars) -> 150=6 then 150=4, cancelled
+///   16, 26, 31, 34, 35, 36 chars -> ExecutionReport returned, order working
+///   37, 38 chars                 -> no response of any kind, nothing resting
 ///
-/// Every ClOrdID the venue has ever answered is <= 16 characters.
+/// 36 and 37 were each probed twice, on separate sessions, with the same
+/// result. The cancels that cleaned up those probes carried the same 36-char
+/// id in OrigClOrdID (41) and were honoured, so 36 holds for tag 41 too.
 ///
-/// This mattered because `HALT_` + `Uuid::simple()` and `ALGO_` +
-/// `Uuid::simple()` are both 37 characters. The operator kill switch reported
-/// `cancel_ok: 1, cancel_failed: 0` while the order remained live at the
-/// venue, and every algo order would have been dropped the same way had order
-/// entry been switched on.
-pub(crate) const MAX_CL_ORD_ID_LEN: usize = 16;
+/// 36 is exactly the length of a hyphenated UUID, which is almost certainly
+/// where the venue's limit comes from -- and is why the original defect
+/// existed at all: `Uuid::simple()` is 32 characters, so `HALT_` + uuid is 37,
+/// one over. The kill switch reported `cancel_ok: 1, cancel_failed: 0` while
+/// the order remained live at the venue, and every algo order would have been
+/// dropped the same way had order entry been switched on.
+///
+/// This is measured, not specified. If Crypto.com ever publish a figure,
+/// prefer it; if they raise it, nothing here needs to change, because what we
+/// generate sits well under the limit (see GENERATED_CL_ORD_ID_LEN).
+pub(crate) const MAX_CL_ORD_ID_LEN: usize = 36;
 
-/// Build a ClOrdID that the venue will actually accept: `prefix` plus as much
-/// uuid hex as fits in MAX_CL_ORD_ID_LEN. With a 5-character prefix that
-/// leaves 11 hex characters, which is 44 bits of entropy -- ample for
-/// distinguishing orders and cancels, and short enough to be answered.
-/// Refuse to emit a ClOrdID the venue will silently ignore.
+/// Length of the ClOrdIDs this system generates for itself.
+///
+/// Deliberately far below MAX_CL_ORD_ID_LEN rather than at it. The limit is
+/// measured rather than documented, so leaving 20 characters of headroom means
+/// a venue that quietly tightens it does not take our kill switch with it. A
+/// 5-character prefix leaves 11 hex characters, 44 bits -- ample to tell
+/// orders and cancels apart, and short enough to read in a log.
+///
+/// Externally supplied ids (the file-drop intake) are held to the real limit
+/// instead, so a caller using the obvious UUID convention is not refused.
+pub(crate) const GENERATED_CL_ORD_ID_LEN: usize = 16;
+
+/// Refuse to emit a ClOrdID the venue would silently ignore.
+///
+/// Applies to every id we send, whoever supplied it, and is checked against
+/// the venue's real limit rather than our own generated length.
 ///
 /// Truncating would be worse than failing: local state would record the long
 /// id while the venue saw a shorter one, so every later cancel or amend would
@@ -1595,13 +1613,13 @@ pub(crate) fn validate_cl_ord_id(id: &str) -> Result<()> {
 }
 
 pub(crate) fn new_cl_ord_id(prefix: &str) -> String {
-    let prefix = if prefix.len() >= MAX_CL_ORD_ID_LEN {
-        &prefix[..MAX_CL_ORD_ID_LEN]
+    let prefix = if prefix.len() >= GENERATED_CL_ORD_ID_LEN {
+        &prefix[..GENERATED_CL_ORD_ID_LEN]
     } else {
         prefix
     };
     let hex = uuid::Uuid::new_v4().simple().to_string();
-    let room = MAX_CL_ORD_ID_LEN - prefix.len();
+    let room = GENERATED_CL_ORD_ID_LEN - prefix.len();
     format!("{}{}", prefix, &hex[..room.min(hex.len())])
 }
 
@@ -10860,20 +10878,38 @@ mod connectivity_tests {
     /// order would have been dropped the same way.
     #[test]
     fn cl_ord_ids_fit_the_venue_limit() {
+        assert!(
+            GENERATED_CL_ORD_ID_LEN < MAX_CL_ORD_ID_LEN,
+            "what we generate must keep headroom under a limit that is measured, not documented"
+        );
         for prefix in ["HALT_", "ALGO_", "", "X"] {
             for _ in 0..200 {
                 let id = new_cl_ord_id(prefix);
                 assert!(
-                    id.len() <= MAX_CL_ORD_ID_LEN,
-                    "ClOrdID {:?} is {} chars, over the {} limit",
-                    id, id.len(), MAX_CL_ORD_ID_LEN
+                    id.len() <= GENERATED_CL_ORD_ID_LEN,
+                    "generated ClOrdID {:?} is {} chars, over the {} we generate",
+                    id, id.len(), GENERATED_CL_ORD_ID_LEN
                 );
+                validate_cl_ord_id(&id)
+                    .unwrap_or_else(|e| panic!("we generated an id we would refuse to send: {}", e));
                 assert!(id.starts_with(prefix), "{:?} lost its prefix {:?}", id, prefix);
             }
         }
         // a prefix longer than the limit must still produce a legal id
         let long = new_cl_ord_id("THIS_PREFIX_IS_FAR_TOO_LONG_");
-        assert!(long.len() <= MAX_CL_ORD_ID_LEN);
+        assert!(long.len() <= GENERATED_CL_ORD_ID_LEN);
+
+        // An externally supplied id is held to the VENUE's limit, not ours:
+        // 36 is a hyphenated UUID and must be accepted, 37 is the length that
+        // the venue silently ignored on 2026-10-17 and must be refused.
+        let uuid_shaped = uuid::Uuid::new_v4().hyphenated().to_string();
+        assert_eq!(uuid_shaped.len(), 36);
+        validate_cl_ord_id(&uuid_shaped)
+            .expect("a hyphenated UUID is 36 chars and the venue answers it");
+        assert!(
+            validate_cl_ord_id(&"X".repeat(37)).is_err(),
+            "37 chars is the measured cutoff and must be refused before emission"
+        );
     }
 
     /// Distinct enough that two cancels in the same session cannot collide.
