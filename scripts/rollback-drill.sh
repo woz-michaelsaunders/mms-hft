@@ -42,6 +42,21 @@ _book_active_after() {
 FATAL_GREP_ERE="${FATAL_GREP_ERE:-FATAL: (could not load config\\.toml|config validation failed)}"
 POLLER_TIMER="${POLLER_TIMER:-hft-deploy-poll.timer}"
 POLLER_SERVICE="${POLLER_SERVICE:-hft-deploy-poll.service}"
+# The self-healing watchdog must stand down for the duration too. It samples
+# pm2 restart counts and reloads fix-server when it thinks the app is
+# crash-looping -- and this drill restarts fix-server deliberately, repeatedly,
+# which is indistinguishable from a crash loop at that level.
+#
+# Measured 2026-10-17 (run 20261017T150729Z-1401887): at 15:08:24 the watchdog
+# logged "crash-looping (restart count 23 -> 24 in 8s)" and healed, reloading
+# fix-server from the ecosystem 5s into case 3's deploy. That restored the
+# known-good config under the deploy's feet and took pm2 restart_time 24 -> 25
+# inside deploy.sh's own 10s crash-loop sampling window, so deploy.sh rolled
+# back and case 3 failed auto_rollback_unexpected. The same run had passed an
+# hour earlier; whether the watchdog catches the pattern is pure timing, which
+# is why this has to be an interlock and not a wider sampling gap.
+HEALTH_TIMER="${HEALTH_TIMER:-hft-health.timer}"
+HEALTH_SERVICE="${HEALTH_SERVICE:-hft-health.service}"
 CRASH_LOOP_SHA256="${CRASH_LOOP_SHA256:-97d063bab8e2714dbf5220adc6f03b67a40c466ff1de00e9d43fa3cf8e8090c3}"
 PM2_APP="${PM2_APP:-fix-server}"   # pm2 lists it hyphenated; fix_server silently empties every lookup
 SWAP_TIMEOUT_S="${SWAP_TIMEOUT_S:-180}"
@@ -643,6 +658,12 @@ pause_poller() {
     err "ERROR: preflight: ${POLLER_TIMER}/service still running — refuse to inject a fault while the poller can deploy"
     return 1
   fi
+  say "✅ rollback-drill: pausing ${HEALTH_TIMER} and ${HEALTH_SERVICE}"
+  if ! "${SYSTEMCTL_CMD[@]}" stop "$HEALTH_TIMER" "$HEALTH_SERVICE" 2>/dev/null; then
+    err "ERROR: preflight: ${HEALTH_TIMER}/service still running — refuse to inject a fault while the watchdog can heal"
+    "${SYSTEMCTL_CMD[@]}" start "$POLLER_TIMER" 2>/dev/null || true
+    return 1
+  fi
   DID_PAUSE=1
   return 0
 }
@@ -655,13 +676,22 @@ resume_poller() {
     err "ERROR: poller left stopped"
     return 1
   fi
-  if "${SYSTEMCTL_CMD[@]}" start "$POLLER_TIMER" 2>/dev/null; then
-    say "✅ rollback-drill: poller resumed"
-    DID_PAUSE=0
-    return 0
+  local rc=0
+  if ! "${SYSTEMCTL_CMD[@]}" start "$POLLER_TIMER" 2>/dev/null; then
+    err "ERROR: poller left stopped"
+    rc=1
   fi
-  err "ERROR: poller left stopped"
-  return 1
+  # Resume the watchdog even if the poller failed to come back: leaving the
+  # box with nothing watching it is the worse of the two failures.
+  if ! "${SYSTEMCTL_CMD[@]}" start "$HEALTH_TIMER" 2>/dev/null; then
+    err "ERROR: ${HEALTH_TIMER} left stopped — the box is unwatched, start it by hand"
+    rc=1
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    say "✅ rollback-drill: poller and health watchdog resumed"
+    DID_PAUSE=0
+  fi
+  return "$rc"
 }
 
 lock_probe() {
@@ -1346,6 +1376,17 @@ run_case4() {
   if [[ "$staged_real" != "$stash_real"/* ]]; then
     die2 "ERROR: staged dir is not under stash"
   fi
+  # Cases 1-3 each restamp this here; case 4 did not, so in a full-suite run
+  # its downtime was measured from the start of CASE 3 and silently included
+  # that whole case -- deploy, the 30s no-logon wait, and the restore.
+  #
+  # Measured 2026-10-17 (run 20261017T142152Z-1160765): case 3 reported
+  # downtime 49802ms and case 4 reported 58116ms from the SAME origin. The
+  # difference, 8314ms, is case 4's real recovery -- against 8363ms measured
+  # on 2026-10-04, when case 4 happened to be run with --case 4 alone and so
+  # stamped T_LAST_GOOD at suite start a few seconds earlier. The 7x "slowdown"
+  # between those two runs was entirely this bug.
+  T_LAST_GOOD=$(now_ms)
   INJECTED=1
   local cap=$STASH/case4.deploy-raw
   local dexit=0

@@ -269,6 +269,29 @@ EOF
   return 0
 }
 
+# True while a deploy or the rollback drill is mid-flight.
+#
+# Both restart fix-server on purpose, repeatedly, which is indistinguishable
+# from a crash loop at the level this script samples. Healing on top of one is
+# not a slower recovery -- it is two things reloading the same app at once.
+#
+# Measured 2026-10-17 (drill run 20261017T150729Z-1401887): this watchdog saw
+# "restart count 23 -> 24 in 8s" during the drill's case 3, healed, and
+# reloaded fix-server from the ecosystem 5s into deploy.sh's run. That put the
+# known-good config back under the deploy's feet and moved pm2 restart_time
+# inside deploy.sh's own crash-loop sampling window, so deploy.sh diagnosed a
+# crash loop that did not exist and rolled back a deploy that was behaving
+# exactly as designed.
+#
+# The drill now stops this timer for its duration, but that only covers the
+# drill. This covers the real deploy path, where the poller runs deploy.sh
+# unattended every two minutes and no one is watching.
+deploy_in_flight(){
+  systemctl is-active --quiet hft-deploy-poll.service 2>/dev/null && return 0
+  [ -e /home/ubuntu/rollback-drill.lock ] && return 0
+  return 1
+}
+
 heal_budget_ok(){
   local now cutoff n
   now=$(date +%s); cutoff=$(( now - 3600 ))
@@ -317,6 +340,11 @@ fi
 
 printf 'unhealthy\n%s\n%s\n' "$(ts)" "$REASON" > "$STATE"
 log "UNHEALTHY: $REASON"
+
+if deploy_in_flight; then
+  log "NOT healing: a deploy or drill is in flight -- its restarts are deliberate and it does its own rollback ($REASON)"
+  exit 1
+fi
 
 if heal_budget_ok; then
   if heal; then
