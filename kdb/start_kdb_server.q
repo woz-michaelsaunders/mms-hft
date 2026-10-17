@@ -133,6 +133,42 @@ persistTable: {[t]
   persistedCount[t]: k;
   };
 
+// Drop partitions older than the retention window.
+//
+// Added 2026-10-17 after the root filesystem reached 100%: pdb had grown to
+// 10GB at 2-3GB/day with nothing pruning it, which produced 105,077 ENOSPC
+// errors, crash-looped kdb-server-prod 7,120 times, and cost roughly two days
+// of capture (2026.10.15 collapsed to 278k rows, 10.16 produced no partition
+// at all). Capture that fills its own disk is capture that stops.
+//
+// Deletes whole days, so it is deliberately narrow:
+//   - only entries under pdbPath whose name parses as a date
+//   - never `sym, never anything unparseable
+//   - older than OR EQUAL to (today - retainDays). Using strict < keeps the
+//     boundary day and yields retainDays+1 days on disk; the first test of
+//     this kept 8 days for retainDays=7.
+//   - no-op when retainDays <= 0
+retainDays: $[count rd: getenv `KDB_RETAIN_DAYS; "I" $ rd; 7];
+
+pruneOldPartitions: {
+  if[retainDays <= 0; :()];
+  cutoff: .z.d - retainDays;
+  ds: key pdbPath;
+  ds: ds where not ds in `sym`.;
+  // keep only names that really are dates; anything else is left alone
+  parsed: @[{"D" $ string x}; ; 0Nd] each ds;
+  keep: not null parsed;
+  ds: ds where keep; parsed: parsed where keep;
+  old: ds where parsed <= cutoff;
+  if[0 = count old; :()];
+  {[d]
+    p: .Q.dd[pdbPath; d];
+    show "pruning partition ", (string d), " (older than ", (string .z.d - retainDays), ")";
+    system "rm -rf ", 1 _ string p;
+  } each old;
+  show "retention: dropped ", (string count old), " partition(s), keeping ", string retainDays;
+  };
+
 persistTables: {
   persistTable each `orderbook_levels`trades`orderbook_snapshots`securities`own_trades`capture_gaps;
   // Every table must exist in every partition or a query spanning dates
@@ -143,6 +179,7 @@ persistTables: {
   // .Q.chk fills the gaps with empty tables; it is a directory scan, cheap
   // next to the writes.
   @[.Q.chk; pdbPath; {[e] -1 "WARN .Q.chk failed: ", e}];
+  @[pruneOldPartitions; ::; {[e] -1 "WARN pruneOldPartitions failed: ", e}];
   };
 
 // Count rows on disk without mapping the partitioned DB into this process.

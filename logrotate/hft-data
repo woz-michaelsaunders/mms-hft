@@ -1,0 +1,35 @@
+# Production kdb+ server log. The existing fix-server config covers
+# /home/ubuntu/fix_server/*.log and /tmp/kdb_server.log, but production's lives
+# at /home/ubuntu/fix_server_prod/kdb_server.log and was rotated by nothing. It
+# reached 1.2GB and helped fill the root filesystem on 2026-10-17. Scoped to
+# kdb_server.log only: fix_commands.log is rotated by the app itself
+# (rotate_log_if_needed), and two rotators on one file is a recipe for trouble.
+# crash-looped kdb-server-prod 7,120 times and cost two days of capture.
+/home/ubuntu/fix_server_prod/kdb_server.log {
+    su ubuntu ubuntu
+    hourly
+    rotate 3
+    maxsize 100M
+    missingok
+    notifempty
+    copytruncate
+    compress
+}
+
+# Backtest CSVs. Unbounded and never rotated: ticks.csv reached 7.2GB and
+# snapshots.csv 3.6GB.
+#
+# NOT copytruncate. append_snapshot_to_csv_with_sizes writes the header only
+# when `!path.exists()`, so truncating in place leaves a headerless file that
+# the backtest loader would misread. Plain rotation renames the file away; the
+# next append opens with create(true), sees no file, and writes a fresh header.
+# The app opens per call and holds no handle, so renaming is safe.
+/home/ubuntu/fix_server/data/*.csv /home/ubuntu/fix_server_prod/data/*.csv {
+    su ubuntu ubuntu
+    hourly
+    rotate 3
+    maxsize 500M
+    missingok
+    notifempty
+    compress
+}
