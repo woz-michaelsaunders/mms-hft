@@ -1009,6 +1009,47 @@ pub struct CancelOrderRequest {
     pub side: String,                // Tag 54: Side ("1"=BUY, "2"=SELL) - stored as String for JSON compatibility
 }
 
+/// One refused order-entry attempt, kept so an operator can ask the running
+/// service "was my order rejected, and why" instead of grepping a log.
+///
+/// Written 2026-10-17 after HFT-062. The exposure gate's `warn!` was never the
+/// problem -- it fires correctly at RUST_LOG=warn, as re-measured live. The
+/// problem was that a rejection existed ONLY as a log line, so when two orders
+/// vanished it took four experiments to establish whether risk had blocked
+/// them, the intake was broken, or the file was never picked up. For a risk
+/// control the evidence that it fired is part of the control.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RejectionRecord {
+    pub ts: String,
+    /// Which gate refused it: exposure_gate, operator_halt, duplicate_cl_ord_id,
+    /// session_not_ready, cl_ord_id_invalid.
+    pub gate: String,
+    pub cl_ord_id: String,
+    pub symbol: String,
+    /// Short machine-readable tag (position, notional, unknown_symbol, ...).
+    pub reason: String,
+    /// The exact single line that was logged, so the API and the log agree.
+    pub detail: String,
+}
+
+/// How many rejections to keep. A rejection is rare and small; 256 covers a
+/// full session of them without unbounded growth.
+const REJECTION_RING_CAP: usize = 256;
+
+/// Level-independent rejection trail, modelled on startup_note.
+///
+/// A risk rejection must not become invisible because someone set RUST_LOG to
+/// `error`. This writes the same line to rejections.log regardless of level.
+fn rejection_note(line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true).append(true).open("rejections.log")
+    {
+        let _ = f.write_all(format!("{}\n", line).as_bytes());
+        let _ = f.flush();
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct OperatorHaltTriggerResult {
     pub halted: bool,            // always true after trigger_operator_halt
@@ -1427,6 +1468,10 @@ pub struct FIXSession {
     positions: Arc<PositionsStore>,
     /// OMS hard per-symbol caps. Empty map ⇒ exposure gate off (EL-018).
     symbol_limits: Arc<ArcSwap<HashMap<String, SymbolLimit>>>,
+    /// Recent refused order-entry attempts (newest last), capped at
+    /// REJECTION_RING_CAP. A std Mutex deliberately: every gate that writes
+    /// here is a sync fn and the critical section never awaits.
+    rejections: Arc<std::sync::Mutex<VecDeque<RejectionRecord>>>,
     /// Session drawdown threshold as f64 bits. `0.0` ⇒ guard off.
     session_max_drawdown_bits: AtomicU64,
     /// Peak Σ realized_pnl as f64 bits. Rebased on `reset_operator_halt`.
@@ -1772,6 +1817,7 @@ impl FIXSession {
             operator_halt: Arc::new(AtomicBool::new(false)),
             positions,
             symbol_limits: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            rejections: Arc::new(std::sync::Mutex::new(VecDeque::new())),
             session_max_drawdown_bits: AtomicU64::new(0.0f64.to_bits()),
             drawdown_peak_bits: AtomicU64::new(peak_bits),
             order_update_tx: Arc::new(Mutex::new(None)),
@@ -2223,6 +2269,47 @@ impl FIXSession {
         );
     }
 
+    /// The one place an order-entry refusal is recorded.
+    ///
+    /// Every gate goes through here so the log line, the level-independent
+    /// trail and the /api/rejections ring can never disagree about what
+    /// happened -- and so a test can assert the trace exists, not merely that
+    /// the order was refused.
+    fn record_rejection(&self, gate: &str, cl_ord_id: &str, symbol: &str, reason: &str, extra: &str) {
+        let line = format!(
+            "order_rejected gate={} reason={} cl_ord_id={} symbol={}{}{}",
+            gate,
+            reason,
+            cl_ord_id,
+            symbol,
+            if extra.is_empty() { "" } else { " " },
+            extra,
+        );
+        warn!("{}", line);
+        rejection_note(&line);
+        if let Ok(mut ring) = self.rejections.lock() {
+            ring.push_back(RejectionRecord {
+                ts: chrono::Utc::now().to_rfc3339(),
+                gate: gate.to_string(),
+                cl_ord_id: cl_ord_id.to_string(),
+                symbol: symbol.to_string(),
+                reason: reason.to_string(),
+                detail: line,
+            });
+            while ring.len() > REJECTION_RING_CAP {
+                ring.pop_front();
+            }
+        }
+    }
+
+    /// Newest-last snapshot of recent rejections, for /api/rejections.
+    pub fn recent_rejections(&self) -> Vec<RejectionRecord> {
+        self.rejections
+            .lock()
+            .map(|r| r.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     fn reject_if_exposure_breach(&self, order: &OrderRequest) -> Result<()> {
         let limits = self.symbol_limits.load();
         let net = self.positions.net_qty_of(&order.symbol);
@@ -2249,18 +2336,15 @@ impl FIXSession {
                 } else {
                     "n/a".into()
                 };
-                warn!(
-                    "exposure_gate=reject reason={} cl_ord_id={} symbol={} side={} qty={} net_qty={} projected={} max_position={} notional={} max_notional={}",
+                self.record_rejection(
+                    "exposure_gate",
+                    &order.cl_ord_id,
+                    &order.symbol,
                     exposure_reject_reason_tag(r),
-                    order.cl_ord_id,
-                    order.symbol,
-                    order.side,
-                    order.qty,
-                    net,
-                    projected,
-                    max_pos,
-                    notional,
-                    max_not,
+                    &format!(
+                        "side={} qty={} net_qty={} projected={} max_position={} notional={} max_notional={}",
+                        order.side, order.qty, net, projected, max_pos, notional, max_not,
+                    ),
                 );
                 Err(anyhow!(exposure_reject_str(r)))
             }
@@ -2434,9 +2518,12 @@ impl FIXSession {
     /// Create order from OrderRequest struct (supports all FIX order fields)
     pub async fn new_order_single_from_request(&self, order: &OrderRequest) -> Result<()> {
         if let Err(e) = self.reject_if_operator_halt() {
-            warn!(
-                "operator_halt=true rejected 35=D cl_ord_id={} symbol={}",
-                order.cl_ord_id, order.symbol
+            self.record_rejection(
+                "operator_halt",
+                &order.cl_ord_id,
+                &order.symbol,
+                "halted",
+                "operator_halt=true 35=D refused",
             );
             return Err(e);
         }
@@ -2445,7 +2532,19 @@ impl FIXSession {
             return Err(e);
         }
 
+        // Below here the order is refused for a session/intake reason rather
+        // than a risk one. These used to return a bare Err: the consumer logged
+        // "Failed to send order", which says an order did not go out but not
+        // which of the gates stopped it. They are recorded for the same reason
+        // the risk gates are -- an operator needs to tell them apart.
         if !self.is_ready().await {
+            self.record_rejection(
+                "session_not_ready",
+                &order.cl_ord_id,
+                &order.symbol,
+                "not_ready",
+                "the OM session is not logged on",
+            );
             return Err(anyhow!("Session not ready"));
         }
 
@@ -2458,6 +2557,13 @@ impl FIXSession {
         let already_known = self.open_orders.snapshot().contains_key(&order.cl_ord_id)
             || self.order_times.lock().await.contains_key(&order.cl_ord_id);
         if already_known {
+            self.record_rejection(
+                "duplicate_cl_ord_id",
+                &order.cl_ord_id,
+                &order.symbol,
+                "duplicate",
+                "this ClOrdID is already open or in flight",
+            );
             return Err(anyhow!("Duplicate ClOrdID rejected: {}", order.cl_ord_id));
         }
 
@@ -2465,7 +2571,16 @@ impl FIXSession {
         let mut msg = FIXMessage::new('D', &self.sender_comp_id, &self.target_comp_id, seq_num);
 
         // Required fields
-        validate_cl_ord_id(&order.cl_ord_id)?;
+        if let Err(e) = validate_cl_ord_id(&order.cl_ord_id) {
+            self.record_rejection(
+                "cl_ord_id_invalid",
+                &order.cl_ord_id,
+                &order.symbol,
+                "bad_cl_ord_id",
+                &format!("len={} max={}", order.cl_ord_id.len(), MAX_CL_ORD_ID_LEN),
+            );
+            return Err(e);
+        }
         msg.set_field(tags::CL_ORD_ID, &order.cl_ord_id);
         msg.set_field(tags::SYMBOL, &order.symbol);
         msg.set_field(tags::SIDE, &order.side.to_string());
@@ -6134,6 +6249,20 @@ async fn order_book_web_server(
     }
     
     // API endpoint to get open orders (for console)
+    /// Recent refused order-entry attempts, newest last.
+    ///
+    /// The answer to "did risk block my order, or is the intake broken?"
+    /// without box access or a log grep (HFT-062).
+    async fn get_rejections_api(
+        axum::extract::State(state): axum::extract::State<AppState>,
+    ) -> Result<Json<serde_json::Value>, StatusCode> {
+        let rejections = state.order_session.recent_rejections();
+        Ok(Json(serde_json::json!({
+            "count": rejections.len(),
+            "rejections": rejections,
+        })))
+    }
+
     async fn get_open_orders_api(
         axum::extract::State(state): axum::extract::State<AppState>,
     ) -> Result<Json<serde_json::Value>, StatusCode> {
@@ -6986,6 +7115,7 @@ async fn order_book_web_server(
         .route("/api/orderbook/:symbol", get(get_order_book_api))
         .route("/api/symbols", get(list_symbols_api))
         .route("/api/open-orders", get(get_open_orders_api))
+        .route("/api/rejections", get(get_rejections_api))
         .route("/api/market-data-status", get(get_all_market_data_status_api))
         .route("/api/subscribe-all-symbols/:port", post(subscribe_all_symbols_api))
         .route("/api/history/:symbol", get(get_history_api))
@@ -10556,6 +10686,16 @@ mod connectivity_tests {
             .new_order_single("LIM_POS", "BTC_USDT", '1', 0.03, 1.0, None, None, None)
             .await;
         assert!(r.is_err(), "0.03 BTC exceeds max_position 0.02 and must be rejected");
+        let t = s2.recent_rejections();
+        assert_eq!(t.len(), 1, "the rejection must be recorded, not only returned");
+        assert_eq!(t[0].gate, "exposure_gate");
+        assert_eq!(t[0].reason, "position");
+        assert_eq!(t[0].cl_ord_id, "LIM_POS");
+        assert!(
+            t[0].detail.contains("projected=0.03") && t[0].detail.contains("max_position=0.02"),
+            "the trace must name the breached limit and the projected value: {}",
+            t[0].detail
+        );
 
         // 3. over max_notional while inside max_position.
         //    0.01 BTC at 300,000 = 3,000 > 2,000.
@@ -10564,6 +10704,14 @@ mod connectivity_tests {
             .new_order_single("LIM_NOT", "BTC_USDT", '1', 0.01, 300_000.0, None, None, None)
             .await;
         assert!(r.is_err(), "3,000 notional exceeds max_notional 2,000 and must be rejected");
+        let t = s3.recent_rejections();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].reason, "notional");
+        assert!(
+            t[0].detail.contains("notional=3000") && t[0].detail.contains("max_notional=2000"),
+            "trace: {}",
+            t[0].detail
+        );
 
         // 4. a symbol absent from the table must FAIL CLOSED, not default to
         //    unlimited. Production subscribes to three symbols; anything else
@@ -10573,6 +10721,14 @@ mod connectivity_tests {
             .new_order_single("LIM_UNK", "ETH_USDT", '1', 0.001, 2_000.0, None, None, None)
             .await;
         assert!(r.is_err(), "a symbol not in symbol_limits must be rejected");
+        let t = s4.recent_rejections();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].symbol, "ETH_USDT");
+        assert!(
+            t[0].detail.contains("max_position=n/a"),
+            "a fail-closed rejection must say the symbol had no limits: {}",
+            t[0].detail
+        );
 
         // 5. the kill switch must block submission even when the order is
         //    comfortably inside every limit, and allow it again after reset.
@@ -10582,11 +10738,115 @@ mod connectivity_tests {
             .new_order_single("LIM_HALT", "BTC_USDT", '1', 0.001, 83_000.0, None, None, None)
             .await;
         assert!(r.is_err(), "submission must be rejected while halted");
+        let t = s5.recent_rejections();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].gate, "operator_halt", "the halt must be distinguishable from a risk breach");
+        assert_eq!(t[0].cl_ord_id, "LIM_HALT");
         s5.reset_operator_halt();
         s5.new_order_single("LIM_RESUME", "BTC_USDT", '1', 0.001, 83_000.0, None, None, None)
             .await
             .expect("submission must resume after reset");
+        assert_eq!(
+            s5.recent_rejections().len(),
+            1,
+            "an accepted order must not add a rejection"
+        );
 
+        Ok(())
+    }
+
+    /// Every refusal an operator can hit leaves a trace that names the gate.
+    ///
+    /// HFT-062. The failure this guards against is not "the order went out
+    /// anyway" -- it is being unable to tell, afterwards, WHICH of risk, the
+    /// intake or the session refused it. On 2026-10-17 two orders vanished and
+    /// it took four experiments to establish where they had gone; the gates
+    /// that refuse for session or intake reasons used to return a bare Err.
+    ///
+    /// Asserting on the recorded line (the same string that is logged and
+    /// served by /api/rejections) is deliberate: a test that only asserted
+    /// `is_err()` would still pass if every trace were deleted.
+    #[tokio::test]
+    async fn every_rejection_gate_leaves_a_trace() -> Result<()> {
+        let port = mock_gateway::start_mock_gateway(
+            "127.0.0.1:0",
+            mock_gateway::MockGatewayConfig::default(),
+        )
+        .await?;
+
+        // 1. refused before logon: the session gate, not a risk gate.
+        let cold = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        assert!(
+            cold.new_order_single("TRACE_COLD", "BTC_USDT", '1', 0.001, 100.0, None, None, None)
+                .await
+                .is_err(),
+            "an order before logon must be refused"
+        );
+        let t = cold.recent_rejections();
+        assert_eq!(t.len(), 1, "a pre-logon refusal must be recorded too");
+        assert_eq!(t[0].gate, "session_not_ready");
+        assert_eq!(t[0].cl_ord_id, "TRACE_COLD");
+
+        // 2. duplicate ClOrdID: the intake gate.
+        let s = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&s, port).await?;
+        s.new_order_single("TRACE_DUP", "BTC_USDT", '1', 0.001, 100.0, None, None, None)
+            .await
+            .expect("the first submission must be accepted");
+        assert!(
+            s.new_order_single("TRACE_DUP", "BTC_USDT", '1', 0.001, 100.0, None, None, None)
+                .await
+                .is_err(),
+            "the second submission of the same ClOrdID must be refused"
+        );
+        let t = s.recent_rejections();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].gate, "duplicate_cl_ord_id");
+
+        // 3. an over-length ClOrdID: refused here rather than silently dropped
+        //    by the venue (see cl_ord_ids_fit_the_venue_limit).
+        let s2 = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        connect_and_logon(&s2, port).await?;
+        let too_long = "X".repeat(MAX_CL_ORD_ID_LEN + 1);
+        assert!(
+            s2.new_order_single(&too_long, "BTC_USDT", '1', 0.001, 100.0, None, None, None)
+                .await
+                .is_err(),
+            "an over-length ClOrdID must be refused before it reaches the venue"
+        );
+        let t = s2.recent_rejections();
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].gate, "cl_ord_id_invalid");
+        assert!(
+            t[0].detail.contains(&format!("max={}", MAX_CL_ORD_ID_LEN)),
+            "trace: {}",
+            t[0].detail
+        );
+
+        // Every trace, whatever the gate, is one greppable line that names the
+        // gate and the order.
+        for r in [&cold.recent_rejections()[0], &s.recent_rejections()[0], &s2.recent_rejections()[0]] {
+            assert!(r.detail.starts_with("order_rejected gate="), "trace: {}", r.detail);
+            assert!(r.detail.contains(&format!("cl_ord_id={}", r.cl_ord_id)), "trace: {}", r.detail);
+            assert!(!r.ts.is_empty(), "a trace must be timestamped");
+        }
+        Ok(())
+    }
+
+    /// The ring is bounded: a stuck client cannot grow it without limit.
+    #[tokio::test]
+    async fn the_rejection_ring_is_bounded_and_keeps_the_newest() -> Result<()> {
+        let s = FIXSession::new("TEST.CLIENT", "MOCK.VENUE");
+        for i in 0..(REJECTION_RING_CAP + 25) {
+            s.record_rejection("exposure_gate", &format!("R{}", i), "BTC_USDT", "position", "");
+        }
+        let t = s.recent_rejections();
+        assert_eq!(t.len(), REJECTION_RING_CAP, "the ring must stay capped");
+        assert_eq!(
+            t.last().unwrap().cl_ord_id,
+            format!("R{}", REJECTION_RING_CAP + 24),
+            "the newest rejection must survive, not be the one dropped"
+        );
         Ok(())
     }
 

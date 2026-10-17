@@ -33,3 +33,20 @@
     notifempty
     compress
 }
+
+# Rejection trail (HFT-062). Appended by rejection_note, which deliberately
+# ignores RUST_LOG so a risk rejection can never be silenced by a log level.
+# That also means nothing else bounds it, and this box hit 100% full on
+# 2026-10-17.
+#
+# NOT copytruncate: rejection_note opens with append(true).create(true) per
+# call and holds no handle, so a plain rename is safe and loses nothing.
+/home/ubuntu/fix_server/rejections.log /home/ubuntu/fix_server_prod/rejections.log {
+    su ubuntu ubuntu
+    weekly
+    rotate 8
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+}
