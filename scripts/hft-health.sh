@@ -80,16 +80,41 @@ for p in data if isinstance(data, list) else []:
 }
 
 check_startup_fatal(){
-  # startup_note() writes FATAL on a config or credential failure.
-  if [ -f "$LIVE/startup.log" ] && tail -40 "$LIVE/startup.log" | grep -qi "FATAL"; then
-    # only counts if it is from the CURRENT process generation
-    local last_fatal last_ok
-    last_fatal=$(grep -i FATAL "$LIVE/startup.log" | tail -1 | awk '{print $1}')
-    last_ok=$(grep -i "startup complete" "$LIVE/startup.log" | tail -1 | awk '{print $1}')
-    if [ -z "$last_ok" ] || [[ "$last_fatal" > "$last_ok" ]]; then
-      REASON="startup FATAL: $(grep -i FATAL "$LIVE/startup.log" | tail -1 | sed 's/.*FATAL: //' | cut -c1-120)"
-      return 1
-    fi
+  # startup_note() writes FATAL on a config or credential failure, and tags
+  # every line with the pid that wrote it. Scope the check to the process that
+  # is running NOW.
+  #
+  # This used to decide "current generation" by comparing the newest FATAL's
+  # timestamp against the newest "startup complete". That loses a race the
+  # deploy path runs into constantly: while a new process is in its ~3s
+  # startup, the newest FATAL in the file still belongs to the generation
+  # before it and no "startup complete" has been written yet, so a process
+  # that is about to come up perfectly reads as fatally broken.
+  #
+  # Measured 2026-10-17 19:29, straight after a rollback drill (whose case 1
+  # deliberately deploys an unparseable config.toml):
+  #
+  #   19:29:49.737 pid=3205031 startup complete
+  #   19:29:50.604 pid=3205455 FATAL: could not load config.toml
+  #   19:29:53.626 pid=3205619 FATAL: could not load config.toml
+  #   19:29:56.649 pid=3205994 starting          <- healthy, still booting
+  #   19:29:58     UNHEALTHY -> HEAL             <- 1.4s into that startup
+  #   19:29:59.108 pid=3206363 starting          <- the heal's needless reload
+  #
+  # It had happened after the previous drill too (15:47:38). Each spurious
+  # heal is an avoidable restart of a working process AND a charge against
+  # MAX_HEALS_PER_HOUR=2, so two drills in an hour would leave a real outage
+  # in that window with no self-heal left.
+  #
+  # Scoping by pid is better than widening MIN_UPTIME_SEC here: a genuine
+  # config FATAL is still caught on the first tick rather than after a settle
+  # delay, because the FATAL carries the running pid. A process that FATALs
+  # and exits is caught by check_not_flapping and check_expected_apps.
+  [ -n "${PID:-}" ] || return 0
+  [ -f "$LIVE/startup.log" ] || return 0
+  if grep -qF "pid=$PID FATAL" "$LIVE/startup.log" 2>/dev/null; then
+    REASON="startup FATAL: $(grep -F "pid=$PID FATAL" "$LIVE/startup.log" | tail -1 | sed 's/.*FATAL: //' | cut -c1-120)"
+    return 1
   fi
   return 0
 }
